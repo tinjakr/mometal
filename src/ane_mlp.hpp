@@ -3,7 +3,6 @@
 #include "metal_ctx.hpp"
 
 #include <atomic>
-#include <condition_variable>
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -21,24 +20,33 @@ namespace mi {
 class AneMlpEngine {
 public:
     static constexpr int MAX_SLOTS = 2;       // Half A (slot 0) and Half B (slot 1)
-    static constexpr int MAX_SUBS  = 2;       // 2 x 256 = 512 tokens/half (1024/chunk -> stays inside M4 Max 48MB L2!)
-    static constexpr int MAX_PIECES = 2;      // 1 (full hf4) or 2 (halves p0+p1)
-    static constexpr int PACKED_WIDTH = 5184; // 5120 normed/r + 1 scale r + 63 zero pad
-    static constexpr int HIDDEN_WIDTH = 5120;
+    static constexpr int MAX_SUBS  = 2;       // 2 x 256 = 512 tokens/half
+    static constexpr int MAX_PIECES = 2;      // 1 (full 4-bit MLP) or 2 (halves)
+
+    // Detect Apple Neural Engine architecture string (e.g. "h13g" M1, "h14g" M2, "h15g" M3, "h16g" M4, "h17g" M5)
+    static std::string detect_ane_arch();
 
     AneMlpEngine(MetalContext& ctx, const std::string& models_dir, int num_layers,
-                 const std::string& tag = "auto");
+                 int hidden_width = 5120, const std::string& tag = "auto",
+                 bool defer_warmup = false);
     ~AneMlpEngine();
 
     AneMlpEngine(const AneMlpEngine&) = delete;
     AneMlpEngine& operator=(const AneMlpEngine&) = delete;
 
+    // 4-deep async warmup across all 4 (slot, sub) IOSurfaces (can overlap with safetensors mmap!)
+    void start_warmup_async();
+    void wait_warmup();
+
     bool ready() const { return ready_; }
     int num_layers() const { return num_layers_; }
     int num_pieces() const { return num_pieces_; }
     int block_rows() const { return block_rows_; } // typically 256
+    int hidden_width() const { return hidden_width_; }
+    int packed_width() const { return packed_width_; }
     double load_time_ms() const { return load_time_ms_; }
     const std::string& tag() const { return tag_; }
+    const std::string& ane_arch() const { return ane_arch_; }
 
     // Zero-copy Metal textures backed by the ANE IOSurfaces
     id input_texture(int slot, int sub) const;
@@ -47,7 +55,12 @@ public:
     // Optional SmoothQuant inv1 buffer (f32[5120]) for layer L; nil if inv1 == 1.0 everywhere
     id inv1_buffer(int layer) const;
 
-    // Async execution on the dedicated ANE worker thread (runs n_subs consecutive 256-row calls)
+    // Cross-slot async ANE hardware-ring submission (zero worker thread, zero mutex/CV!)
+    void submit_slot(int layer, int slot, int n_subs);
+    bool is_slot_done(int slot) const;
+    void wait_slot(int slot);
+
+    // Convenience wrappers operating on the most recently submitted slot
     void submit(int layer, int slot, int n_subs);
     void wait();
 
@@ -78,7 +91,10 @@ private:
     int num_layers_ = 0;
     int num_pieces_ = 1;
     int block_rows_ = 256;
+    int hidden_width_ = 5120;
+    int packed_width_ = 5184;
     std::string tag_;
+    std::string ane_arch_;
     bool ready_ = false;
     double load_time_ms_ = 0.0;
 
@@ -87,21 +103,22 @@ private:
     IoSurfaceBinding out_io_[MAX_SLOTS][MAX_SUBS][MAX_PIECES];
     std::vector<LayerData> layers_;
 
-    // Dedicated ANE worker thread with minimal-latency mutex/cv handshake
-    std::thread worker_;
-    std::mutex mtx_;
-    std::condition_variable cv_work_;
-    std::condition_variable cv_done_;
-    bool stop_ = false;
-    bool has_job_ = false;
-    int job_layer_ = 0;
-    int job_slot_ = 0;
-    int job_nsubs_ = 1;
-    std::string job_error_;
+    // Per-slot persistent CoreML async completion tracking (zero worker thread, zero per-call allocs!)
+    id grp_[MAX_SLOTS] = {nil, nil}; // dispatch_group_t under ARC
+    std::atomic<int> slot_rem_[MAX_SLOTS];
+    std::atomic<bool> slot_done_[MAX_SLOTS];
+    std::mutex err_mtx_;
+    std::string slot_err_[MAX_SLOTS];
+    int last_slot_ = 0;
+
+    // 4-deep async startup warmup thread
+    std::thread warmup_thread_;
+    bool warmup_started_ = false;
+    std::string warmup_err_;
 
     IoSurfaceBinding create_iosurface_io(int rows, int cols);
     void destroy_iosurface_io(IoSurfaceBinding& b);
-    void worker_loop();
+    void run_warmup_4deep();
 };
 
 } // namespace mi

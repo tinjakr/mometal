@@ -479,6 +479,8 @@ struct FullAttnParams {
     float scale;        // 1/sqrt(D)
     uint  num_splits;
     int   rope_offset;  // M-RoPE delta after images (0 for pure text!)
+    uint  win_sink;     // 0 = dense; >0 = windowed attention sink tiles (e.g. 4 = 128 tok)
+    uint  win_recent;   // 0 = dense; >win_sink = first recent tile (e.g. total_tiles - 124)
 };
 
 kernel void qwen_full_attn_q_prep(
@@ -531,6 +533,129 @@ kernel void qwen_full_attn_q_prep(
     #pragma unroll
     for (uint i = 0; i < 8u; i++) {
         qdst[i * 32u + lane] = v[i];
+    }
+}
+
+// Fused Q-prep + FP16 packed [Hq, M_pad, 256] output for hierarchical FA-2 (eliminates qwen_pack_q_pf_h pass & barrier!)
+kernel void qwen_full_attn_q_prep_hier(
+    const device float*  q_proj  [[buffer(0)]],
+    const device ushort* q_norm  [[buffer(1)]],
+    device half*         q_h_out [[buffer(2)]],
+    device float*        gate_out[[buffer(3)]],
+    constant FullAttnParams& p   [[buffer(4)]],
+    uint2 tgid                   [[threadgroup_position_in_grid]],
+    uint  lane                   [[thread_index_in_simdgroup]]
+) {
+    uint M_pad = (p.M + 63u) & ~63u;
+    uint h = tgid.x;
+    uint t = tgid.y;
+    if (h >= p.Hq || t >= M_pad) return;
+
+    device half* qhdst = q_h_out + ((ulong)h * M_pad + t) * p.D;
+    if (t >= p.M) {
+        #pragma unroll
+        for (uint i = 0; i < 8u; i++) qhdst[i * 32u + lane] = 0.0h;
+        return;
+    }
+
+    const device float* src = q_proj + ((ulong)t * p.Hq + h) * (2u * p.D);
+    device float* gdst = gate_out + ((ulong)t * p.Hq + h) * p.D;
+
+    float v[8];
+    float sq = 0.0f;
+    #pragma unroll
+    for (uint i = 0; i < 8u; i++) {
+        uint idx = i * 32u + lane;
+        float x = src[idx];
+        v[i] = x;
+        sq = fma(x, x, sq);
+        gdst[idx] = src[p.D + idx];
+    }
+    float inv_rms = rsqrt(simd_sum(sq) / float(p.D) + p.eps);
+
+    #pragma unroll
+    for (uint i = 0; i < 8u; i++) {
+        uint idx = i * 32u + lane;
+        v[i] = v[i] * inv_rms * bf16_to_f32(q_norm[idx]);
+    }
+
+    uint half_rot = p.rotary_dim >> 1;
+    if (lane < half_rot) {
+        float freq = 1.0f / pow(p.rope_theta, float(2u * lane) / float(p.rotary_dim));
+        float angle = float(int(p.pos + t) + p.rope_offset) * freq;
+        float c = cos(angle);
+        float s = sin(angle);
+        float x0 = v[0];
+        float x1 = v[1];
+        v[0] = fma(x0, c, -x1 * s);
+        v[1] = fma(x1, c,  x0 * s);
+    }
+
+    #pragma unroll
+    for (uint i = 0; i < 8u; i++) {
+        qhdst[i * 32u + lane] = half(v[i]);
+    }
+}
+
+kernel void qwen_full_attn_q_prep_mrope_hier(
+    const device float*  q_proj  [[buffer(0)]],
+    const device ushort* q_norm  [[buffer(1)]],
+    device half*         q_h_out [[buffer(2)]],
+    device float*        gate_out[[buffer(3)]],
+    constant FullAttnParams& p   [[buffer(4)]],
+    const device int*    pos3d   [[buffer(5)]],
+    uint2 tgid                   [[threadgroup_position_in_grid]],
+    uint  lane                   [[thread_index_in_simdgroup]]
+) {
+    uint M_pad = (p.M + 63u) & ~63u;
+    uint h = tgid.x;
+    uint t = tgid.y;
+    if (h >= p.Hq || t >= M_pad) return;
+
+    device half* qhdst = q_h_out + ((ulong)h * M_pad + t) * p.D;
+    if (t >= p.M) {
+        #pragma unroll
+        for (uint i = 0; i < 8u; i++) qhdst[i * 32u + lane] = 0.0h;
+        return;
+    }
+
+    const device float* src = q_proj + ((ulong)t * p.Hq + h) * (2u * p.D);
+    device float* gdst = gate_out + ((ulong)t * p.Hq + h) * p.D;
+
+    float v[8];
+    float sq = 0.0f;
+    #pragma unroll
+    for (uint i = 0; i < 8u; i++) {
+        uint idx = i * 32u + lane;
+        float x = src[idx];
+        v[i] = x;
+        sq = fma(x, x, sq);
+        gdst[idx] = src[p.D + idx];
+    }
+    float inv_rms = rsqrt(simd_sum(sq) / float(p.D) + p.eps);
+
+    #pragma unroll
+    for (uint i = 0; i < 8u; i++) {
+        uint idx = i * 32u + lane;
+        v[i] = v[i] * inv_rms * bf16_to_f32(q_norm[idx]);
+    }
+
+    uint half_rot = p.rotary_dim >> 1;
+    if (lane < half_rot) {
+        float freq = 1.0f / pow(p.rope_theta, float(2u * lane) / float(p.rotary_dim));
+        uint axis = lane % 3u;
+        float angle = float(pos3d[t * 3u + axis]) * freq;
+        float c = cos(angle);
+        float s = sin(angle);
+        float x0 = v[0];
+        float x1 = v[1];
+        v[0] = fma(x0, c, -x1 * s);
+        v[1] = fma(x1, c,  x0 * s);
+    }
+
+    #pragma unroll
+    for (uint i = 0; i < 8u; i++) {
+        qhdst[i * 32u + lane] = half(v[i]);
     }
 }
 
@@ -1493,7 +1618,7 @@ kernel void qwen_gqa_verify_splitk_p1(
     const device float* q_in     [[buffer(0)]],
     const device half*  k_cache  [[buffer(1)]],
     const device half*  v_cache  [[buffer(2)]],
-    device float*       part_o   [[buffer(3)]], // [M, Hq, num_splits, D]
+    device half*        part_o   [[buffer(3)]], // [M, Hq, num_splits, D] FP16
     device float*       part_m   [[buffer(4)]], // [M, Hq, num_splits] (log2 space)
     device float*       part_l   [[buffer(5)]], // [M, Hq, num_splits]
     constant FullAttnParams& p   [[buffer(6)]],
@@ -1752,97 +1877,110 @@ kernel void qwen_gqa_verify_splitk_p1(
         }
     }
 
-    // Write partial unnormalized O directly from registers!
+    // Write partial unnormalized O directly from registers (FP16 -> 2x lower DRAM traffic!)
     uint row = sg_m + fm;
     uint lh  = row >> 3;
     uint t   = row & 7u;
     uint h   = (lh == 0u) ? h0 : h1;
     if (t < p.M && (lh == 0u || h1_ok)) {
         ulong slot = ((ulong)t * p.Hq + h) * p.num_splits + s;
-        device float* po = part_o + slot * p.D;
+        device half* po = part_o + slot * p.D;
         #pragma clang loop unroll(full)
         for (uint j = 0; j < 8u; j++) {
             uint c0 = sg_d + 8u * j + fn;
-            po[c0]           = O0[j].thread_elements()[0];
-            po[c0 + 1u]      = O0[j].thread_elements()[1];
-            po[128u + c0]    = O1[j].thread_elements()[0];
-            po[128u + c0 + 1u] = O1[j].thread_elements()[1];
+            *(device half2*)(po + c0)        = half2(half(O0[j].thread_elements()[0]), half(O0[j].thread_elements()[1]));
+            *(device half2*)(po + 128u + c0) = half2(half(O1[j].thread_elements()[0]), half(O1[j].thread_elements()[1]));
         }
     }
 }
 
+// 4-SG (128-thread) FP16 part_o Split-K Pass 2: 2 elems/thread, 1 exp2()/thread, coalesced half2 reads!
 template<typename OutT>
 inline void qwen_gqa_verify_splitk_p2_impl(
-    const device float* part_o,
+    const device half*  part_o,
     const device float* part_m,
     const device float* part_l,
     const device float* gate_in,
     device OutT*        out,
     constant FullAttnParams& p,
     uint2 tgid,
-    uint  lane
+    uint  tid,
+    uint  lane,
+    uint  sg,
+    threadgroup float (&sW)[128],
+    threadgroup float (&sRed)[4]
 ) {
     uint h = tgid.x;
     uint t = tgid.y;
     if (h >= p.Hq || t >= p.M) return;
 
     ulong base_slot = ((ulong)t * p.Hq + h) * p.num_splits;
-    float m_global = -INFINITY;
-    for (uint s = 0; s < p.num_splits; s++) {
-        float m = part_m[base_slot + s];
-        if (m > m_global) m_global = m;
-    }
+    float m_val = (tid < p.num_splits) ? part_m[base_slot + tid] : -INFINITY;
+    float l_val = (tid < p.num_splits) ? part_l[base_slot + tid] : 0.0f;
 
-    float acc[8] = {0,0,0,0,0,0,0,0};
-    float l_global = 0.0f;
-    for (uint s = 0; s < p.num_splits; s++) {
-        ulong slot = base_slot + s;
-        float l = part_l[slot];
-        if (l == 0.0f) continue;
-        float w = exp2(part_m[slot] - m_global);
-        l_global += l * w;
-        const device float* po = part_o + slot * p.D;
-        #pragma unroll
-        for (uint i = 0; i < 8u; i++) {
-            acc[i] = fma(po[i * 32u + lane], w, acc[i]);
-        }
-    }
+    float m_sg = simd_max(m_val);
+    if (lane == 0u) sRed[sg] = m_sg;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float m_global = max(max(sRed[0], sRed[1]), max(sRed[2], sRed[3]));
 
+    float w_val = (tid < p.num_splits && l_val > 0.0f && m_global != -INFINITY)
+        ? exp2(m_val - m_global)
+        : 0.0f;
+    sW[tid] = w_val;
+    float l_sg = simd_sum(l_val * w_val);
+    if (lane == 0u) sRed[sg] = l_sg;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float l_global = sRed[0] + sRed[1] + sRed[2] + sRed[3];
     float inv_l = (l_global > 0.0f) ? (1.0f / l_global) : 0.0f;
+
     ulong q_off = ((ulong)t * p.Hq + h) * p.D;
     const device float* gp = gate_in + q_off;
     device OutT* op = out + q_off;
-    #pragma unroll
-    for (uint i = 0; i < 8u; i++) {
-        uint idx = i * 32u + lane;
-        op[idx] = OutT((acc[i] * inv_l) * sigmoid_f32(gp[idx]));
+
+    for (uint d = tid * 2u; d < p.D; d += 256u) {
+        float2 acc = float2(0.0f);
+        for (uint s = 0u; s < p.num_splits; s++) {
+            float w = sW[s];
+            if (w == 0.0f) continue;
+            float2 pv = float2(*(const device half2*)(part_o + (base_slot + s) * p.D + d));
+            acc = fma(pv, float2(w), acc);
+        }
+        float2 gv = *(const device float2*)(gp + d);
+        op[d]      = OutT((acc.x * inv_l) * sigmoid_f32(gv.x));
+        op[d + 1u] = OutT((acc.y * inv_l) * sigmoid_f32(gv.y));
     }
 }
 
 kernel void qwen_gqa_verify_splitk_p2(
-    const device float* part_o   [[buffer(0)]],
+    const device half*  part_o   [[buffer(0)]],
     const device float* part_m   [[buffer(1)]],
     const device float* part_l   [[buffer(2)]],
     const device float* gate_in  [[buffer(3)]],
     device float*       out      [[buffer(4)]],
     constant FullAttnParams& p   [[buffer(5)]],
     uint2 tgid                   [[threadgroup_position_in_grid]],
-    uint  lane                   [[thread_index_in_simdgroup]]
+    uint  tid                    [[thread_index_in_threadgroup]],
+    uint  lane                   [[thread_index_in_simdgroup]],
+    uint  sg                     [[simdgroup_index_in_threadgroup]]
 ) {
-    qwen_gqa_verify_splitk_p2_impl<float>(part_o, part_m, part_l, gate_in, out, p, tgid, lane);
+    threadgroup float sW[128], sRed[4];
+    qwen_gqa_verify_splitk_p2_impl<float>(part_o, part_m, part_l, gate_in, out, p, tgid, tid, lane, sg, sW, sRed);
 }
 
 kernel void qwen_gqa_verify_splitk_p2_f16(
-    const device float* part_o   [[buffer(0)]],
+    const device half*  part_o   [[buffer(0)]],
     const device float* part_m   [[buffer(1)]],
     const device float* part_l   [[buffer(2)]],
     const device float* gate_in  [[buffer(3)]],
     device half*        out      [[buffer(4)]],
     constant FullAttnParams& p   [[buffer(5)]],
     uint2 tgid                   [[threadgroup_position_in_grid]],
-    uint  lane                   [[thread_index_in_simdgroup]]
+    uint  tid                    [[thread_index_in_threadgroup]],
+    uint  lane                   [[thread_index_in_simdgroup]],
+    uint  sg                     [[simdgroup_index_in_threadgroup]]
 ) {
-    qwen_gqa_verify_splitk_p2_impl<half>(part_o, part_m, part_l, gate_in, out, p, tgid, lane);
+    threadgroup float sW[128], sRed[4];
+    qwen_gqa_verify_splitk_p2_impl<half>(part_o, part_m, part_l, gate_in, out, p, tgid, tid, lane, sg, sW, sRed);
 }
 
 // ============================================================================
@@ -2041,62 +2179,108 @@ kernel void qwen_rmsnorm_ane_pack(
     }
 
     const device float* hp = hid + (ulong)row * p.D;
-
-    // D = 5120, tg_size = 256 -> exactly 20 elements per thread in registers!
-    float vals[20];
-    float sq = 0.0f;
-    #pragma clang loop unroll(full)
-    for (uint k = 0; k < 20u; k++) {
-        uint idx = k * 256u + tid;
-        float v = hp[idx];
-        vals[k] = v;
-        sq = fma(v, v, sq);
-    }
-    sq = simd_sum(sq);
-
     threadgroup float smem_sq[32];
     threadgroup float smem_max[32];
     uint sg = tid >> 5, lane = tid & 31u, nsg = tg_size >> 5;
-    if (lane == 0u) smem_sq[sg] = sq;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (sg == 0u) {
-        float tot = simd_sum((lane < nsg) ? smem_sq[lane] : 0.0f);
-        if (lane == 0u) smem_sq[0] = rsqrt(tot / float(p.D) + p.eps);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float inv_rms = smem_sq[0];
 
-    float amax = 0.0f;
-    #pragma clang loop unroll(full)
-    for (uint k = 0; k < 20u; k++) {
-        uint idx = k * 256u + tid;
-        float w = bf16_to_f32(norm_w[idx]);
-        float s = p.has_inv1 ? inv1[idx] : 1.0f;
-        float v = vals[k] * inv_rms * w * s;
-        vals[k] = v;
-        amax = max(amax, fabs(v));
-    }
-    amax = simd_max(amax);
-    if (lane == 0u) smem_max[sg] = amax;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (sg == 0u) {
-        float tot = simd_max((lane < nsg) ? smem_max[lane] : 0.0f);
-        if (lane == 0u) smem_max[0] = tot + 1e-4f;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float r_scale = smem_max[0];
-    float inv_r = 1.0f / r_scale;
+    if (p.D <= 5120u && tg_size == 256u) {
+        // Fast register-cached path for D <= 5120 (0.5B..27B, bounds-safe for any D!)
+        uint n_k = (p.D + 255u) >> 8;
+        float vals[20];
+        float sq = 0.0f;
+        for (uint k = 0; k < n_k; k++) {
+            uint idx = k * 256u + tid;
+            float v = (idx < p.D) ? hp[idx] : 0.0f;
+            vals[k] = v;
+            sq = fma(v, v, sq);
+        }
+        sq = simd_sum(sq);
+        if (lane == 0u) smem_sq[sg] = sq;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0u) {
+            float tot = simd_sum((lane < nsg) ? smem_sq[lane] : 0.0f);
+            if (lane == 0u) smem_sq[0] = rsqrt(tot / float(p.D) + p.eps);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float inv_rms = smem_sq[0];
 
-    #pragma clang loop unroll(full)
-    for (uint k = 0; k < 20u; k++) {
-        uint idx = k * 256u + tid;
-        ane_in.write(half4(half(vals[k] * inv_r), 0.0h, 0.0h, 0.0h), uint2(idx, row));
+        float amax = 0.0f;
+        for (uint k = 0; k < n_k; k++) {
+            uint idx = k * 256u + tid;
+            if (idx < p.D) {
+                float w = bf16_to_f32(norm_w[idx]);
+                float s = p.has_inv1 ? inv1[idx] : 1.0f;
+                float v = vals[k] * inv_rms * w * s;
+                vals[k] = v;
+                amax = max(amax, fabs(v));
+            }
+        }
+        amax = simd_max(amax);
+        if (lane == 0u) smem_max[sg] = amax;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0u) {
+            float tot = simd_max((lane < nsg) ? smem_max[lane] : 0.0f);
+            if (lane == 0u) smem_max[0] = tot + 1e-4f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float r_scale = smem_max[0];
+        float inv_r = 1.0f / r_scale;
+
+        for (uint k = 0; k < n_k; k++) {
+            uint idx = k * 256u + tid;
+            if (idx < p.D) {
+                ane_in.write(half4(half(vals[k] * inv_r), 0.0h, 0.0h, 0.0h), uint2(idx, row));
+            }
+        }
+        if (tid == 0u) {
+            ane_in.write(half4(half(r_scale), 0.0h, 0.0h, 0.0h), uint2(p.D, row));
+        }
+    } else {
+        // General path for D > 5120 (e.g. 32B/72B)
+        float sq = 0.0f;
+        for (uint idx = tid; idx < p.D; idx += tg_size) {
+            float v = hp[idx];
+            sq = fma(v, v, sq);
+        }
+        sq = simd_sum(sq);
+        if (lane == 0u) smem_sq[sg] = sq;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0u) {
+            float tot = simd_sum((lane < nsg) ? smem_sq[lane] : 0.0f);
+            if (lane == 0u) smem_sq[0] = rsqrt(tot / float(p.D) + p.eps);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float inv_rms = smem_sq[0];
+
+        float amax = 0.0f;
+        for (uint idx = tid; idx < p.D; idx += tg_size) {
+            float w = bf16_to_f32(norm_w[idx]);
+            float s = p.has_inv1 ? inv1[idx] : 1.0f;
+            amax = max(amax, fabs(hp[idx] * inv_rms * w * s));
+        }
+        amax = simd_max(amax);
+        if (lane == 0u) smem_max[sg] = amax;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0u) {
+            float tot = simd_max((lane < nsg) ? smem_max[lane] : 0.0f);
+            if (lane == 0u) smem_max[0] = tot + 1e-4f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float r_scale = smem_max[0];
+        float inv_r = 1.0f / r_scale;
+
+        for (uint idx = tid; idx < p.D; idx += tg_size) {
+            float w = bf16_to_f32(norm_w[idx]);
+            float s = p.has_inv1 ? inv1[idx] : 1.0f;
+            float v = hp[idx] * inv_rms * w * s;
+            ane_in.write(half4(half(v * inv_r), 0.0h, 0.0h, 0.0h), uint2(idx, row));
+        }
+        if (tid == 0u) {
+            ane_in.write(half4(half(r_scale), 0.0h, 0.0h, 0.0h), uint2(p.D, row));
+        }
     }
-    if (tid == 0u) {
-        ane_in.write(half4(half(r_scale), 0.0h, 0.0h, 0.0h), uint2(p.D, row));
-    }
-    if (tid < (p.PW - p.D - 1u)) {
-        ane_in.write(half4(0.0h), uint2(p.D + 1u + tid, row));
+    for (uint j = tid; j < (p.PW - p.D - 1u); j += tg_size) {
+        ane_in.write(half4(0.0h), uint2(p.D + 1u + j, row));
     }
 }
 
@@ -2148,36 +2332,62 @@ kernel void qwen_ane_add_and_rmsnorm(
     device float* hp = hid + (ulong)row * p.D;
     device float* np = normed + (ulong)row * p.D;
 
-    // D = 5120, tg_size = 256 -> 20 exact elements per thread in registers!
-    float vals[20];
-    float sq = 0.0f;
-    #pragma clang loop unroll(full)
-    for (uint k = 0; k < 20u; k++) {
-        uint idx = k * 256u + tid;
-        float av = float(ane_out0.read(uint2(idx, row)).x);
-        if (p.num_pieces > 1u) av += float(ane_out1.read(uint2(idx, row)).x);
-        float h = hp[idx] + av;
-        hp[idx] = h;
-        vals[k] = h;
-        sq = fma(h, h, sq);
-    }
-    sq = simd_sum(sq);
-
     threadgroup float smem[32];
     uint sg = tid >> 5, lane = tid & 31u, nsg = tg_size >> 5;
-    if (lane == 0u) smem[sg] = sq;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (sg == 0u) {
-        float tot = simd_sum((lane < nsg) ? smem[lane] : 0.0f);
-        if (lane == 0u) smem[0] = rsqrt(tot / float(p.D) + p.eps);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float inv_rms = smem[0];
 
-    #pragma clang loop unroll(full)
-    for (uint k = 0; k < 20u; k++) {
-        uint idx = k * 256u + tid;
-        np[idx] = vals[k] * inv_rms * bf16_to_f32(norm_w[idx]);
+    if (p.D <= 5120u && tg_size == 256u) {
+        uint n_k = (p.D + 255u) >> 8;
+        float vals[20];
+        float sq = 0.0f;
+        for (uint k = 0; k < n_k; k++) {
+            uint idx = k * 256u + tid;
+            if (idx < p.D) {
+                float av = float(ane_out0.read(uint2(idx, row)).x);
+                if (p.num_pieces > 1u) av += float(ane_out1.read(uint2(idx, row)).x);
+                float h = hp[idx] + av;
+                hp[idx] = h;
+                vals[k] = h;
+                sq = fma(h, h, sq);
+            }
+        }
+        sq = simd_sum(sq);
+        if (lane == 0u) smem[sg] = sq;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0u) {
+            float tot = simd_sum((lane < nsg) ? smem[lane] : 0.0f);
+            if (lane == 0u) smem[0] = rsqrt(tot / float(p.D) + p.eps);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float inv_rms = smem[0];
+
+        for (uint k = 0; k < n_k; k++) {
+            uint idx = k * 256u + tid;
+            if (idx < p.D) {
+                np[idx] = vals[k] * inv_rms * bf16_to_f32(norm_w[idx]);
+            }
+        }
+    } else {
+        float sq = 0.0f;
+        for (uint idx = tid; idx < p.D; idx += tg_size) {
+            float av = float(ane_out0.read(uint2(idx, row)).x);
+            if (p.num_pieces > 1u) av += float(ane_out1.read(uint2(idx, row)).x);
+            float h = hp[idx] + av;
+            hp[idx] = h;
+            sq = fma(h, h, sq);
+        }
+        sq = simd_sum(sq);
+        if (lane == 0u) smem[sg] = sq;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0u) {
+            float tot = simd_sum((lane < nsg) ? smem[lane] : 0.0f);
+            if (lane == 0u) smem[0] = rsqrt(tot / float(p.D) + p.eps);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float inv_rms = smem[0];
+
+        for (uint idx = tid; idx < p.D; idx += tg_size) {
+            np[idx] = hp[idx] * inv_rms * bf16_to_f32(norm_w[idx]);
+        }
     }
 }
 
@@ -2197,35 +2407,62 @@ kernel void qwen_ane_add_and_rmsnorm_f16(
     device float* hp = hid + (ulong)row * p.D;
     device half*  np = normed + (ulong)row * p.D;
 
-    float vals[20];
-    float sq = 0.0f;
-    #pragma clang loop unroll(full)
-    for (uint k = 0; k < 20u; k++) {
-        uint idx = k * 256u + tid;
-        float av = float(ane_out0.read(uint2(idx, row)).x);
-        if (p.num_pieces > 1u) av += float(ane_out1.read(uint2(idx, row)).x);
-        float h = hp[idx] + av;
-        hp[idx] = h;
-        vals[k] = h;
-        sq = fma(h, h, sq);
-    }
-    sq = simd_sum(sq);
-
     threadgroup float smem[32];
     uint sg = tid >> 5, lane = tid & 31u, nsg = tg_size >> 5;
-    if (lane == 0u) smem[sg] = sq;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (sg == 0u) {
-        float tot = simd_sum((lane < nsg) ? smem[lane] : 0.0f);
-        if (lane == 0u) smem[0] = rsqrt(tot / float(p.D) + p.eps);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float inv_rms = smem[0];
 
-    #pragma clang loop unroll(full)
-    for (uint k = 0; k < 20u; k++) {
-        uint idx = k * 256u + tid;
-        np[idx] = half(vals[k] * inv_rms * bf16_to_f32(norm_w[idx]));
+    if (p.D <= 5120u && tg_size == 256u) {
+        uint n_k = (p.D + 255u) >> 8;
+        float vals[20];
+        float sq = 0.0f;
+        for (uint k = 0; k < n_k; k++) {
+            uint idx = k * 256u + tid;
+            if (idx < p.D) {
+                float av = float(ane_out0.read(uint2(idx, row)).x);
+                if (p.num_pieces > 1u) av += float(ane_out1.read(uint2(idx, row)).x);
+                float h = hp[idx] + av;
+                hp[idx] = h;
+                vals[k] = h;
+                sq = fma(h, h, sq);
+            }
+        }
+        sq = simd_sum(sq);
+        if (lane == 0u) smem[sg] = sq;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0u) {
+            float tot = simd_sum((lane < nsg) ? smem[lane] : 0.0f);
+            if (lane == 0u) smem[0] = rsqrt(tot / float(p.D) + p.eps);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float inv_rms = smem[0];
+
+        for (uint k = 0; k < n_k; k++) {
+            uint idx = k * 256u + tid;
+            if (idx < p.D) {
+                np[idx] = half(vals[k] * inv_rms * bf16_to_f32(norm_w[idx]));
+            }
+        }
+    } else {
+        float sq = 0.0f;
+        for (uint idx = tid; idx < p.D; idx += tg_size) {
+            float av = float(ane_out0.read(uint2(idx, row)).x);
+            if (p.num_pieces > 1u) av += float(ane_out1.read(uint2(idx, row)).x);
+            float h = hp[idx] + av;
+            hp[idx] = h;
+            sq = fma(h, h, sq);
+        }
+        sq = simd_sum(sq);
+        if (lane == 0u) smem[sg] = sq;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0u) {
+            float tot = simd_sum((lane < nsg) ? smem[lane] : 0.0f);
+            if (lane == 0u) smem[0] = rsqrt(tot / float(p.D) + p.eps);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float inv_rms = smem[0];
+
+        for (uint idx = tid; idx < p.D; idx += tg_size) {
+            np[idx] = half(hp[idx] * inv_rms * bf16_to_f32(norm_w[idx]));
+        }
     }
 }
 
@@ -2247,8 +2484,8 @@ inline void qwen_full_attn_kv_prep_quant_impl(
     const device ushort* k_norm,
     device uchar*        k_cache,
     device uchar*        v_cache,
-    device float2*       k_sb,
-    device float2*       v_sb,
+    device half2*        k_sb,
+    device half2*        v_sb,
     constant FullAttnParams& p,
     const device int*    pos3d,
     uint2 tgid,
@@ -2262,10 +2499,10 @@ inline void qwen_full_attn_kv_prep_quant_impl(
     const device float* vsrc = v_proj + ((ulong)t * p.Hkv + h) * p.D;
     constexpr uint BYTES_PER_HEAD = (KV_BITS == 8) ? 256u : 128u;
     ulong head_idx = (ulong)(p.pos + t) * p.Hkv + h;
-    device uchar*  kdst = k_cache + head_idx * BYTES_PER_HEAD;
-    device uchar*  vdst = v_cache + head_idx * BYTES_PER_HEAD;
-    device float2* ksbd = k_sb + head_idx * 4ul;
-    device float2* vsbd = v_sb + head_idx * 4ul;
+    device uchar* kdst = k_cache + head_idx * BYTES_PER_HEAD;
+    device uchar* vdst = v_cache + head_idx * BYTES_PER_HEAD;
+    device half2* ksbd = k_sb + head_idx * 4ul;
+    device half2* vsbd = v_sb + head_idx * 4ul;
 
     float kv[8];
     float vv[8];
@@ -2307,17 +2544,20 @@ inline void qwen_full_attn_kv_prep_quant_impl(
     constexpr float QMAX = (KV_BITS == 8) ? 255.0f : 15.0f;
     #pragma unroll
     for (uint g = 0; g < 4u; g++) {
-        // Quantize K group g (64 elements: kv[2*g] & kv[2*g+1] across 32 lanes) using exact FP32 scale+min!
+        // Quantize K group g (64 elements) against exact stored half2(scale, min) for zero systematic rounding drift!
         float ka = kv[2u * g];
         float kb = kv[2u * g + 1u];
         float kmn = simd_min(min(ka, kb));
         float kmx = simd_max(max(ka, kb));
-        float krng = kmx - kmn;
-        float fs_k = (krng > 1e-12f) ? (krng / QMAX) : 0.0f;
-        float inv_k = (krng > 1e-12f) ? (QMAX / krng) : 0.0f;
-        if (lane == 0u) ksbd[g] = float2(fs_k, kmn);
-        uint qk0 = uint(clamp(rint((ka - kmn) * inv_k), 0.0f, QMAX));
-        uint qk1 = uint(clamp(rint((kb - kmn) * inv_k), 0.0f, QMAX));
+        half kmn_h = half(kmn);
+        float kmn_q = float(kmn_h);
+        float krng = max(0.0f, kmx - kmn_q);
+        half fs_kh = half((krng > 1e-12f) ? (krng / QMAX) : 0.0f);
+        float fs_kq = float(fs_kh);
+        float inv_k = (fs_kq > 0.0f) ? (1.0f / fs_kq) : 0.0f;
+        if (lane == 0u) ksbd[g] = half2(fs_kh, kmn_h);
+        uint qk0 = uint(clamp(rint((ka - kmn_q) * inv_k), 0.0f, QMAX));
+        uint qk1 = uint(clamp(rint((kb - kmn_q) * inv_k), 0.0f, QMAX));
         if (KV_BITS == 8) {
             kdst[(2u * g) * 32u + lane]      = uchar(qk0);
             kdst[(2u * g + 1u) * 32u + lane] = uchar(qk1);
@@ -2330,12 +2570,15 @@ inline void qwen_full_attn_kv_prep_quant_impl(
         float vb = vv[2u * g + 1u];
         float vmn = simd_min(min(va, vb));
         float vmx = simd_max(max(va, vb));
-        float vrng = vmx - vmn;
-        float fs_v = (vrng > 1e-12f) ? (vrng / QMAX) : 0.0f;
-        float inv_v = (vrng > 1e-12f) ? (QMAX / vrng) : 0.0f;
-        if (lane == 0u) vsbd[g] = float2(fs_v, vmn);
-        uint qv0 = uint(clamp(rint((va - vmn) * inv_v), 0.0f, QMAX));
-        uint qv1 = uint(clamp(rint((vb - vmn) * inv_v), 0.0f, QMAX));
+        half vmn_h = half(vmn);
+        float vmn_q = float(vmn_h);
+        float vrng = max(0.0f, vmx - vmn_q);
+        half fs_vh = half((vrng > 1e-12f) ? (vrng / QMAX) : 0.0f);
+        float fs_vq = float(fs_vh);
+        float inv_v = (fs_vq > 0.0f) ? (1.0f / fs_vq) : 0.0f;
+        if (lane == 0u) vsbd[g] = half2(fs_vh, vmn_h);
+        uint qv0 = uint(clamp(rint((va - vmn_q) * inv_v), 0.0f, QMAX));
+        uint qv1 = uint(clamp(rint((vb - vmn_q) * inv_v), 0.0f, QMAX));
         if (KV_BITS == 8) {
             vdst[(2u * g) * 32u + lane]      = uchar(qv0);
             vdst[(2u * g + 1u) * 32u + lane] = uchar(qv1);
@@ -2348,8 +2591,8 @@ inline void qwen_full_attn_kv_prep_quant_impl(
 kernel void qwen_full_attn_kv_prep_q8(
     const device float* k_proj [[buffer(0)]], const device float* v_proj [[buffer(1)]],
     const device ushort* k_norm [[buffer(2)]], device uchar* k_cache [[buffer(3)]],
-    device uchar* v_cache [[buffer(4)]], device float2* k_sb [[buffer(5)]],
-    device float2* v_sb [[buffer(6)]], constant FullAttnParams& p [[buffer(7)]],
+    device uchar* v_cache [[buffer(4)]], device half2* k_sb [[buffer(5)]],
+    device half2* v_sb [[buffer(6)]], constant FullAttnParams& p [[buffer(7)]],
     uint2 tgid [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]
 ) {
     qwen_full_attn_kv_prep_quant_impl<8, false>(k_proj, v_proj, k_norm, k_cache, v_cache, k_sb, v_sb, p, nullptr, tgid, lane);
@@ -2358,8 +2601,8 @@ kernel void qwen_full_attn_kv_prep_q8(
 kernel void qwen_full_attn_kv_prep_q8_mrope(
     const device float* k_proj [[buffer(0)]], const device float* v_proj [[buffer(1)]],
     const device ushort* k_norm [[buffer(2)]], device uchar* k_cache [[buffer(3)]],
-    device uchar* v_cache [[buffer(4)]], device float2* k_sb [[buffer(5)]],
-    device float2* v_sb [[buffer(6)]], constant FullAttnParams& p [[buffer(7)]],
+    device uchar* v_cache [[buffer(4)]], device half2* k_sb [[buffer(5)]],
+    device half2* v_sb [[buffer(6)]], constant FullAttnParams& p [[buffer(7)]],
     const device int* pos3d [[buffer(8)]],
     uint2 tgid [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]
 ) {
@@ -2369,8 +2612,8 @@ kernel void qwen_full_attn_kv_prep_q8_mrope(
 kernel void qwen_full_attn_kv_prep_q4(
     const device float* k_proj [[buffer(0)]], const device float* v_proj [[buffer(1)]],
     const device ushort* k_norm [[buffer(2)]], device uchar* k_cache [[buffer(3)]],
-    device uchar* v_cache [[buffer(4)]], device float2* k_sb [[buffer(5)]],
-    device float2* v_sb [[buffer(6)]], constant FullAttnParams& p [[buffer(7)]],
+    device uchar* v_cache [[buffer(4)]], device half2* k_sb [[buffer(5)]],
+    device half2* v_sb [[buffer(6)]], constant FullAttnParams& p [[buffer(7)]],
     uint2 tgid [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]
 ) {
     qwen_full_attn_kv_prep_quant_impl<4, false>(k_proj, v_proj, k_norm, k_cache, v_cache, k_sb, v_sb, p, nullptr, tgid, lane);
@@ -2379,8 +2622,8 @@ kernel void qwen_full_attn_kv_prep_q4(
 kernel void qwen_full_attn_kv_prep_q4_mrope(
     const device float* k_proj [[buffer(0)]], const device float* v_proj [[buffer(1)]],
     const device ushort* k_norm [[buffer(2)]], device uchar* k_cache [[buffer(3)]],
-    device uchar* v_cache [[buffer(4)]], device float2* k_sb [[buffer(5)]],
-    device float2* v_sb [[buffer(6)]], constant FullAttnParams& p [[buffer(7)]],
+    device uchar* v_cache [[buffer(4)]], device half2* k_sb [[buffer(5)]],
+    device half2* v_sb [[buffer(6)]], constant FullAttnParams& p [[buffer(7)]],
     const device int* pos3d [[buffer(8)]],
     uint2 tgid [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]
 ) {
@@ -2391,7 +2634,7 @@ kernel void qwen_full_attn_kv_prep_q4_mrope(
 template<int KV_BITS>
 inline void load_kv_tile_quant(
     const device uchar* kv_cache,
-    const device float2* kv_sb,
+    const device half2* kv_sb,
     threadgroup half (&sKV)[32][132],
     uint kb, uint tile_k, uint d_half, uint hkv, uint Hkv, uint tid
 ) {
@@ -2401,31 +2644,40 @@ inline void load_kv_tile_quant(
         if (KV_BITS == 8) {
             uint kc  = (tid & 3u) * 32u;
             uint grp = d_half * 2u + ((tid & 3u) >> 1);
-            float2 sb = kv_sb[head_idx * 4ul + grp];
+            float2 sb = float2(kv_sb[head_idx * 4ul + grp]);
             float4 fs = float4(sb.x);
             float4 fb = float4(sb.y);
-            const device uchar4* qp = (const device uchar4*)(kv_cache + head_idx * 256ul + d_half * 128u + kc);
-            threadgroup half4* dst  = (threadgroup half4*)(&sKV[kr][kc]);
-            #pragma clang loop unroll(full)
-            for (uint i = 0; i < 8u; i++) {
-                dst[i] = half4(fma(float4(qp[i]), fs, fb));
-            }
+            const device uint4* qp = (const device uint4*)(kv_cache + head_idx * 256ul + d_half * 128u + kc);
+            threadgroup half4* dst = (threadgroup half4*)(&sKV[kr][kc]);
+            uint4 u0 = qp[0], u1 = qp[1];
+            dst[0] = half4(fma(float4(as_type<uchar4>(u0.x)), fs, fb));
+            dst[1] = half4(fma(float4(as_type<uchar4>(u0.y)), fs, fb));
+            dst[2] = half4(fma(float4(as_type<uchar4>(u0.z)), fs, fb));
+            dst[3] = half4(fma(float4(as_type<uchar4>(u0.w)), fs, fb));
+            dst[4] = half4(fma(float4(as_type<uchar4>(u1.x)), fs, fb));
+            dst[5] = half4(fma(float4(as_type<uchar4>(u1.y)), fs, fb));
+            dst[6] = half4(fma(float4(as_type<uchar4>(u1.z)), fs, fb));
+            dst[7] = half4(fma(float4(as_type<uchar4>(u1.w)), fs, fb));
         } else {
             uint g_loc = (tid & 3u) >> 1;
             uint sub16 = (tid & 1u) * 16u;
             uint grp   = d_half * 2u + g_loc;
-            float2 sb  = kv_sb[head_idx * 4ul + grp];
+            float2 sb  = float2(kv_sb[head_idx * 4ul + grp]);
             float4 fs  = float4(sb.x);
             float4 fb  = float4(sb.y);
-            const device uchar4* qp = (const device uchar4*)(kv_cache + head_idx * 128ul + grp * 32u + sub16);
+            const device uint4* qp = (const device uint4*)(kv_cache + head_idx * 128ul + grp * 32u + sub16);
             threadgroup half4* dst_lo = (threadgroup half4*)(&sKV[kr][g_loc * 64u + sub16]);
             threadgroup half4* dst_hi = (threadgroup half4*)(&sKV[kr][g_loc * 64u + 32u + sub16]);
-            #pragma clang loop unroll(full)
-            for (uint i = 0; i < 4u; i++) {
-                uchar4 u = qp[i];
-                dst_lo[i] = half4(fma(float4(u & uchar4(0x0Fu)), fs, fb));
-                dst_hi[i] = half4(fma(float4(u >> uchar4(4u)),   fs, fb));
-            }
+            uint4 u = qp[0];
+            uchar4 b0 = as_type<uchar4>(u.x), b1 = as_type<uchar4>(u.y), b2 = as_type<uchar4>(u.z), b3 = as_type<uchar4>(u.w);
+            dst_lo[0] = half4(fma(float4(b0 & uchar4(0x0Fu)), fs, fb));
+            dst_hi[0] = half4(fma(float4(b0 >> uchar4(4u)),   fs, fb));
+            dst_lo[1] = half4(fma(float4(b1 & uchar4(0x0Fu)), fs, fb));
+            dst_hi[1] = half4(fma(float4(b1 >> uchar4(4u)),   fs, fb));
+            dst_lo[2] = half4(fma(float4(b2 & uchar4(0x0Fu)), fs, fb));
+            dst_hi[2] = half4(fma(float4(b2 >> uchar4(4u)),   fs, fb));
+            dst_lo[3] = half4(fma(float4(b3 & uchar4(0x0Fu)), fs, fb));
+            dst_hi[3] = half4(fma(float4(b3 >> uchar4(4u)),   fs, fb));
         }
     } else {
         uint kc = (tid & 3u) * 32u;
@@ -2441,8 +2693,8 @@ inline void qwen_gqa_attn_gated_quant_impl(
     const device float* gate_in,
     const device uchar* k_cache,
     const device uchar* v_cache,
-    const device float2* k_sb,
-    const device float2* v_sb,
+    const device half2* k_sb,
+    const device half2* v_sb,
     device OutT*        out,
     constant FullAttnParams& p,
     uint2 tgid, uint lane
@@ -2469,12 +2721,13 @@ inline void qwen_gqa_attn_gated_quant_impl(
     for (uint kpos = 0; kpos < limit; kpos++) {
         ulong head_idx = (ulong)kpos * p.Hkv + hkv;
         const device uchar* kp = k_cache + head_idx * BYTES_PER_HEAD;
-        const device float2* ksb = k_sb + head_idx * 4ul;
+        const device half2* ksb = k_sb + head_idx * 4ul;
         float dot = 0.0f;
         #pragma unroll
         for (uint g = 0; g < 4u; g++) {
-            float sc = float(ksb[g].x);
-            float mn = float(ksb[g].y);
+            float2 s = float2(ksb[g]);
+            float sc = s.x;
+            float mn = s.y;
             float k0, k1;
             if (KV_BITS == 8) {
                 k0 = fma(float(kp[(2u * g) * 32u + lane]), sc, mn);
@@ -2494,11 +2747,12 @@ inline void qwen_gqa_attn_gated_quant_impl(
         m_max = m_new;
 
         const device uchar* vp = v_cache + head_idx * BYTES_PER_HEAD;
-        const device float2* vsb = v_sb + head_idx * 4ul;
+        const device half2* vsb = v_sb + head_idx * 4ul;
         #pragma unroll
         for (uint g = 0; g < 4u; g++) {
-            float sc = float(vsb[g].x);
-            float mn = float(vsb[g].y);
+            float2 s = float2(vsb[g]);
+            float sc = s.x;
+            float mn = s.y;
             float v0, v1;
             if (KV_BITS == 8) {
                 v0 = fma(float(vp[(2u * g) * 32u + lane]), sc, mn);
@@ -2524,7 +2778,7 @@ inline void qwen_gqa_attn_gated_quant_impl(
 kernel void qwen_gqa_attn_gated_q8(
     const device float* q [[buffer(0)]], const device float* g [[buffer(1)]],
     const device uchar* kc [[buffer(2)]], const device uchar* vc [[buffer(3)]],
-    const device float2* ksb [[buffer(4)]], const device float2* vsb [[buffer(5)]],
+    const device half2* ksb [[buffer(4)]], const device half2* vsb [[buffer(5)]],
     device float* out [[buffer(6)]], constant FullAttnParams& p [[buffer(7)]],
     uint2 tgid [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]
 ) { qwen_gqa_attn_gated_quant_impl<8, float>(q, g, kc, vc, ksb, vsb, out, p, tgid, lane); }
@@ -2532,7 +2786,7 @@ kernel void qwen_gqa_attn_gated_q8(
 kernel void qwen_gqa_attn_gated_q8_f16(
     const device float* q [[buffer(0)]], const device float* g [[buffer(1)]],
     const device uchar* kc [[buffer(2)]], const device uchar* vc [[buffer(3)]],
-    const device float2* ksb [[buffer(4)]], const device float2* vsb [[buffer(5)]],
+    const device half2* ksb [[buffer(4)]], const device half2* vsb [[buffer(5)]],
     device half* out [[buffer(6)]], constant FullAttnParams& p [[buffer(7)]],
     uint2 tgid [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]
 ) { qwen_gqa_attn_gated_quant_impl<8, half>(q, g, kc, vc, ksb, vsb, out, p, tgid, lane); }
@@ -2540,7 +2794,7 @@ kernel void qwen_gqa_attn_gated_q8_f16(
 kernel void qwen_gqa_attn_gated_q4(
     const device float* q [[buffer(0)]], const device float* g [[buffer(1)]],
     const device uchar* kc [[buffer(2)]], const device uchar* vc [[buffer(3)]],
-    const device float2* ksb [[buffer(4)]], const device float2* vsb [[buffer(5)]],
+    const device half2* ksb [[buffer(4)]], const device half2* vsb [[buffer(5)]],
     device float* out [[buffer(6)]], constant FullAttnParams& p [[buffer(7)]],
     uint2 tgid [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]
 ) { qwen_gqa_attn_gated_quant_impl<4, float>(q, g, kc, vc, ksb, vsb, out, p, tgid, lane); }
@@ -2548,7 +2802,7 @@ kernel void qwen_gqa_attn_gated_q4(
 kernel void qwen_gqa_attn_gated_q4_f16(
     const device float* q [[buffer(0)]], const device float* g [[buffer(1)]],
     const device uchar* kc [[buffer(2)]], const device uchar* vc [[buffer(3)]],
-    const device float2* ksb [[buffer(4)]], const device float2* vsb [[buffer(5)]],
+    const device half2* ksb [[buffer(4)]], const device half2* vsb [[buffer(5)]],
     device half* out [[buffer(6)]], constant FullAttnParams& p [[buffer(7)]],
     uint2 tgid [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]
 ) { qwen_gqa_attn_gated_quant_impl<4, half>(q, g, kc, vc, ksb, vsb, out, p, tgid, lane); }
@@ -2559,8 +2813,8 @@ inline void qwen_gqa_prefill_flash_quant_impl(
     const device float* gate_in,
     const device uchar* k_cache,
     const device uchar* v_cache,
-    const device float2* k_sb,
-    const device float2* v_sb,
+    const device half2* k_sb,
+    const device half2* v_sb,
     device OutT*        out,
     constant FullAttnParams& p,
     uint2 tgid, uint tid, uint lane, uint sg,
@@ -2752,7 +3006,7 @@ inline void qwen_gqa_prefill_flash_quant_impl(
 kernel void qwen_gqa_prefill_flash_q8(
     const device float* q [[buffer(0)]], const device float* g [[buffer(1)]],
     const device uchar* kc [[buffer(2)]], const device uchar* vc [[buffer(3)]],
-    const device float2* ksb [[buffer(4)]], const device float2* vsb [[buffer(5)]],
+    const device half2* ksb [[buffer(4)]], const device half2* vsb [[buffer(5)]],
     device float* out [[buffer(6)]], constant FullAttnParams& p [[buffer(7)]],
     uint2 tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]
@@ -2765,7 +3019,7 @@ kernel void qwen_gqa_prefill_flash_q8(
 kernel void qwen_gqa_prefill_flash_q8_f16(
     const device float* q [[buffer(0)]], const device float* g [[buffer(1)]],
     const device uchar* kc [[buffer(2)]], const device uchar* vc [[buffer(3)]],
-    const device float2* ksb [[buffer(4)]], const device float2* vsb [[buffer(5)]],
+    const device half2* ksb [[buffer(4)]], const device half2* vsb [[buffer(5)]],
     device half* out [[buffer(6)]], constant FullAttnParams& p [[buffer(7)]],
     uint2 tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]
@@ -2778,7 +3032,7 @@ kernel void qwen_gqa_prefill_flash_q8_f16(
 kernel void qwen_gqa_prefill_flash_q4(
     const device float* q [[buffer(0)]], const device float* g [[buffer(1)]],
     const device uchar* kc [[buffer(2)]], const device uchar* vc [[buffer(3)]],
-    const device float2* ksb [[buffer(4)]], const device float2* vsb [[buffer(5)]],
+    const device half2* ksb [[buffer(4)]], const device half2* vsb [[buffer(5)]],
     device float* out [[buffer(6)]], constant FullAttnParams& p [[buffer(7)]],
     uint2 tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]
@@ -2791,7 +3045,7 @@ kernel void qwen_gqa_prefill_flash_q4(
 kernel void qwen_gqa_prefill_flash_q4_f16(
     const device float* q [[buffer(0)]], const device float* g [[buffer(1)]],
     const device uchar* kc [[buffer(2)]], const device uchar* vc [[buffer(3)]],
-    const device float2* ksb [[buffer(4)]], const device float2* vsb [[buffer(5)]],
+    const device half2* ksb [[buffer(4)]], const device half2* vsb [[buffer(5)]],
     device half* out [[buffer(6)]], constant FullAttnParams& p [[buffer(7)]],
     uint2 tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]
@@ -2806,8 +3060,8 @@ inline void qwen_gqa_decode_splitk_p1_quant_impl(
     const device float* q_in,
     const device uchar* k_cache,
     const device uchar* v_cache,
-    const device float2* k_sb,
-    const device float2* v_sb,
+    const device half2* k_sb,
+    const device half2* v_sb,
     device float*       part_o,
     device float*       part_m,
     device float*       part_l,
@@ -2836,11 +3090,12 @@ inline void qwen_gqa_decode_splitk_p1_quant_impl(
     for (uint kpos = start; kpos < end; kpos++) {
         ulong head_idx = (ulong)kpos * p.Hkv + hkv;
         const device uchar* kp = k_cache + head_idx * BYTES_PER_HEAD;
-        const device float2* ksb = k_sb + head_idx * 4ul;
+        const device half2* ksb = k_sb + head_idx * 4ul;
         float dot = 0.0f;
         #pragma unroll
         for (uint g = 0; g < 4u; g++) {
-            float sc = float(ksb[g].x), mn = float(ksb[g].y);
+            float2 sb = float2(ksb[g]);
+            float sc = sb.x, mn = sb.y;
             float k0, k1;
             if (KV_BITS == 8) {
                 k0 = fma(float(kp[(2u * g) * 32u + lane]), sc, mn);
@@ -2860,10 +3115,11 @@ inline void qwen_gqa_decode_splitk_p1_quant_impl(
         m_max = m_new;
 
         const device uchar* vp = v_cache + head_idx * BYTES_PER_HEAD;
-        const device float2* vsb = v_sb + head_idx * 4ul;
+        const device half2* vsb = v_sb + head_idx * 4ul;
         #pragma unroll
         for (uint g = 0; g < 4u; g++) {
-            float sc = float(vsb[g].x), mn = float(vsb[g].y);
+            float2 sb = float2(vsb[g]);
+            float sc = sb.x, mn = sb.y;
             float v0, v1;
             if (KV_BITS == 8) {
                 v0 = fma(float(vp[(2u * g) * 32u + lane]), sc, mn);
@@ -2887,14 +3143,14 @@ inline void qwen_gqa_decode_splitk_p1_quant_impl(
 
 kernel void qwen_gqa_decode_splitk_p1_q8(
     const device float* q [[buffer(0)]], const device uchar* kc [[buffer(1)]], const device uchar* vc [[buffer(2)]],
-    const device float2* ksb [[buffer(3)]], const device float2* vsb [[buffer(4)]],
+    const device half2* ksb [[buffer(3)]], const device half2* vsb [[buffer(4)]],
     device float* po [[buffer(5)]], device float* pm [[buffer(6)]], device float* pl [[buffer(7)]],
     constant FullAttnParams& p [[buffer(8)]], uint2 tgid [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]
 ) { qwen_gqa_decode_splitk_p1_quant_impl<8>(q, kc, vc, ksb, vsb, po, pm, pl, p, tgid, lane); }
 
 kernel void qwen_gqa_decode_splitk_p1_q4(
     const device float* q [[buffer(0)]], const device uchar* kc [[buffer(1)]], const device uchar* vc [[buffer(2)]],
-    const device float2* ksb [[buffer(3)]], const device float2* vsb [[buffer(4)]],
+    const device half2* ksb [[buffer(3)]], const device half2* vsb [[buffer(4)]],
     device float* po [[buffer(5)]], device float* pm [[buffer(6)]], device float* pl [[buffer(7)]],
     constant FullAttnParams& p [[buffer(8)]], uint2 tgid [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]
 ) { qwen_gqa_decode_splitk_p1_quant_impl<4>(q, kc, vc, ksb, vsb, po, pm, pl, p, tgid, lane); }
@@ -2904,9 +3160,9 @@ inline void qwen_gqa_verify_splitk_p1_quant_impl(
     const device float* q_in,
     const device uchar* k_cache,
     const device uchar* v_cache,
-    const device float2* k_sb,
-    const device float2* v_sb,
-    device float*       part_o,
+    const device half2* k_sb,
+    const device half2* v_sb,
+    device half*        part_o,
     device float*       part_m,
     device float*       part_l,
     constant FullAttnParams& p,
@@ -3118,23 +3374,20 @@ inline void qwen_gqa_verify_splitk_p1_quant_impl(
     uint h  = (lh == 0u) ? h0 : h1;
     if (t < p.M && (lh == 0u || h1_ok)) {
         ulong slot = ((ulong)t * p.Hq + h) * p.num_splits + s;
-        device float* po = part_o + slot * p.D;
+        device half* po = part_o + slot * p.D;
         #pragma clang loop unroll(full)
         for (uint j = 0; j < 8u; j++) {
             uint c0 = sg_d + 8u * j + fn;
-            po[c0]      = O0[j].thread_elements()[0];
-            po[c0 + 1u] = O0[j].thread_elements()[1];
-            uint c1 = 128u + c0;
-            po[c1]      = O1[j].thread_elements()[0];
-            po[c1 + 1u] = O1[j].thread_elements()[1];
+            *(device half2*)(po + c0)        = half2(half(O0[j].thread_elements()[0]), half(O0[j].thread_elements()[1]));
+            *(device half2*)(po + 128u + c0) = half2(half(O1[j].thread_elements()[0]), half(O1[j].thread_elements()[1]));
         }
     }
 }
 
 kernel void qwen_gqa_verify_splitk_p1_q8(
     const device float* q [[buffer(0)]], const device uchar* kc [[buffer(1)]], const device uchar* vc [[buffer(2)]],
-    const device float2* ksb [[buffer(3)]], const device float2* vsb [[buffer(4)]],
-    device float* po [[buffer(5)]], device float* pm [[buffer(6)]], device float* pl [[buffer(7)]],
+    const device half2* ksb [[buffer(3)]], const device half2* vsb [[buffer(4)]],
+    device half* po [[buffer(5)]], device float* pm [[buffer(6)]], device float* pl [[buffer(7)]],
     constant FullAttnParams& p [[buffer(8)]],
     uint2 tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]
@@ -3146,8 +3399,8 @@ kernel void qwen_gqa_verify_splitk_p1_q8(
 
 kernel void qwen_gqa_verify_splitk_p1_q4(
     const device float* q [[buffer(0)]], const device uchar* kc [[buffer(1)]], const device uchar* vc [[buffer(2)]],
-    const device float2* ksb [[buffer(3)]], const device float2* vsb [[buffer(4)]],
-    device float* po [[buffer(5)]], device float* pm [[buffer(6)]], device float* pl [[buffer(7)]],
+    const device half2* ksb [[buffer(3)]], const device half2* vsb [[buffer(4)]],
+    device half* po [[buffer(5)]], device float* pm [[buffer(6)]], device float* pl [[buffer(7)]],
     constant FullAttnParams& p [[buffer(8)]],
     uint2 tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]
@@ -3164,8 +3417,8 @@ inline void qwen_gqa_prefill_flash_pair_quant_impl(
     const device float* gate_in,
     const device uchar* k_cache,
     const device uchar* v_cache,
-    const device float2* k_sb,
-    const device float2* v_sb,
+    const device half2* k_sb,
+    const device half2* v_sb,
     device half*        out,
     constant FullAttnParams& p,
     uint2 tgid, uint tid, uint lane, uint sg,
@@ -3366,7 +3619,7 @@ inline void qwen_gqa_prefill_flash_pair_quant_impl(
 kernel void qwen_gqa_prefill_flash_pair_q8_f16(
     const device float* q [[buffer(0)]], const device float* g [[buffer(1)]],
     const device uchar* kc [[buffer(2)]], const device uchar* vc [[buffer(3)]],
-    const device float2* ksb [[buffer(4)]], const device float2* vsb [[buffer(5)]],
+    const device half2* ksb [[buffer(4)]], const device half2* vsb [[buffer(5)]],
     device half* out [[buffer(6)]], constant FullAttnParams& p [[buffer(7)]],
     uint2 tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]
@@ -3379,7 +3632,7 @@ kernel void qwen_gqa_prefill_flash_pair_q8_f16(
 kernel void qwen_gqa_prefill_flash_pair_q4_f16(
     const device float* q [[buffer(0)]], const device float* g [[buffer(1)]],
     const device uchar* kc [[buffer(2)]], const device uchar* vc [[buffer(3)]],
-    const device float2* ksb [[buffer(4)]], const device float2* vsb [[buffer(5)]],
+    const device half2* ksb [[buffer(4)]], const device half2* vsb [[buffer(5)]],
     device half* out [[buffer(6)]], constant FullAttnParams& p [[buffer(7)]],
     uint2 tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]
@@ -3982,20 +4235,23 @@ kernel void qwen_gdn_recurrence_lazy(
     }
 }
 
-kernel void qwen_gdn_recurrence_tree_lazy(
-    const device float*        q_in     [[buffer(0)]],
-    const device float*        k_in     [[buffer(1)]],
-    const device float*        qkv_conv [[buffer(2)]],
-    const device float*        g_in     [[buffer(3)]],
-    const device float*        beta_in  [[buffer(4)]],
-    device ushort*             state_io [[buffer(5)]],
-    device float*              y_out    [[buffer(6)]],
-    constant GdnRecParams&     p        [[buffer(7)]],
-    constant PathReplayParams& pr       [[buffer(8)]],
-    constant TreeParams&       tp       [[buffer(9)]],
-    uint3 gid                           [[thread_position_in_grid]],
-    uint  tid                           [[thread_index_in_threadgroup]],
-    uint  lane                          [[thread_index_in_simdgroup]]
+// Templated Lazy Fused GDN Tree Recurrence: 1 slot (4 KB -> 4 TGs/core!), 2 slots (8 KB -> 4 TGs/core!), 4 slots (16 KB)
+template<uint MAX_SLOTS>
+inline void qwen_gdn_recurrence_tree_lazy_impl(
+    const device float*        q_in,
+    const device float*        k_in,
+    const device float*        qkv_conv,
+    const device float*        g_in,
+    const device float*        beta_in,
+    device ushort*             state_io,
+    device float*              y_out,
+    constant GdnRecParams&     p,
+    constant PathReplayParams& pr,
+    constant TreeParams&       tp,
+    uint3 gid,
+    uint  tid,
+    uint  lane,
+    threadgroup ushort4 (&s_stack)[MAX_SLOTS][4][128]
 ) {
     uint dv0 = gid.y * 4u;
     uint hv  = gid.z;
@@ -4004,8 +4260,6 @@ kernel void qwen_gdn_recurrence_tree_lazy(
     uint hk = hv / (p.Hv / p.Hk);
     uint v_offset = 2u * p.Hk * p.Dk + hv * p.Dv + dv0;
     uint base_k = lane * 4u;
-
-    threadgroup ushort4 s_stack[4][4][128];
 
     ulong st_base = ((ulong)hv * p.Dv + dv0) * p.Dk + base_k;
     float4 s0 = bf16x4_to_f32x4(*((const device ushort4*)(state_io + st_base + 0u * p.Dk)));
@@ -4050,10 +4304,11 @@ kernel void qwen_gdn_recurrence_tree_lazy(
     for (uint t = 0u; t < p.M; t++) {
         int ld = tp.gdn_load[t];
         if (ld >= 0) {
-            s0 = bf16x4_to_f32x4(s_stack[ld][0][tid]);
-            s1 = bf16x4_to_f32x4(s_stack[ld][1][tid]);
-            s2 = bf16x4_to_f32x4(s_stack[ld][2][tid]);
-            s3 = bf16x4_to_f32x4(s_stack[ld][3][tid]);
+            uint uld = (MAX_SLOTS == 1u) ? 0u : uint(ld);
+            s0 = bf16x4_to_f32x4(s_stack[uld][0][tid]);
+            s1 = bf16x4_to_f32x4(s_stack[uld][1][tid]);
+            s2 = bf16x4_to_f32x4(s_stack[uld][2][tid]);
+            s3 = bf16x4_to_f32x4(s_stack[uld][3][tid]);
         }
 
         uint st_t  = 8u + t;
@@ -4085,12 +4340,52 @@ kernel void qwen_gdn_recurrence_tree_lazy(
 
         int sv = tp.gdn_save[t];
         if (sv >= 0) {
-            s_stack[sv][0][tid] = f32x4_to_bf16x4(s0);
-            s_stack[sv][1][tid] = f32x4_to_bf16x4(s1);
-            s_stack[sv][2][tid] = f32x4_to_bf16x4(s2);
-            s_stack[sv][3][tid] = f32x4_to_bf16x4(s3);
+            uint usv = (MAX_SLOTS == 1u) ? 0u : uint(sv);
+            s_stack[usv][0][tid] = f32x4_to_bf16x4(s0);
+            s_stack[usv][1][tid] = f32x4_to_bf16x4(s1);
+            s_stack[usv][2][tid] = f32x4_to_bf16x4(s2);
+            s_stack[usv][3][tid] = f32x4_to_bf16x4(s3);
         }
     }
+}
+
+kernel void qwen_gdn_recurrence_tree_lazy_s1(
+    const device float* q_in [[buffer(0)]], const device float* k_in [[buffer(1)]],
+    const device float* qkv_conv [[buffer(2)]], const device float* g_in [[buffer(3)]],
+    const device float* beta_in [[buffer(4)]], device ushort* state_io [[buffer(5)]],
+    device float* y_out [[buffer(6)]], constant GdnRecParams& p [[buffer(7)]],
+    constant PathReplayParams& pr [[buffer(8)]], constant TreeParams& tp [[buffer(9)]],
+    uint3 gid [[thread_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    threadgroup ushort4 s_stack[1][4][128];
+    qwen_gdn_recurrence_tree_lazy_impl<1u>(q_in, k_in, qkv_conv, g_in, beta_in, state_io, y_out, p, pr, tp, gid, tid, lane, s_stack);
+}
+
+kernel void qwen_gdn_recurrence_tree_lazy_s2(
+    const device float* q_in [[buffer(0)]], const device float* k_in [[buffer(1)]],
+    const device float* qkv_conv [[buffer(2)]], const device float* g_in [[buffer(3)]],
+    const device float* beta_in [[buffer(4)]], device ushort* state_io [[buffer(5)]],
+    device float* y_out [[buffer(6)]], constant GdnRecParams& p [[buffer(7)]],
+    constant PathReplayParams& pr [[buffer(8)]], constant TreeParams& tp [[buffer(9)]],
+    uint3 gid [[thread_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    threadgroup ushort4 s_stack[2][4][128];
+    qwen_gdn_recurrence_tree_lazy_impl<2u>(q_in, k_in, qkv_conv, g_in, beta_in, state_io, y_out, p, pr, tp, gid, tid, lane, s_stack);
+}
+
+kernel void qwen_gdn_recurrence_tree_lazy(
+    const device float* q_in [[buffer(0)]], const device float* k_in [[buffer(1)]],
+    const device float* qkv_conv [[buffer(2)]], const device float* g_in [[buffer(3)]],
+    const device float* beta_in [[buffer(4)]], device ushort* state_io [[buffer(5)]],
+    device float* y_out [[buffer(6)]], constant GdnRecParams& p [[buffer(7)]],
+    constant PathReplayParams& pr [[buffer(8)]], constant TreeParams& tp [[buffer(9)]],
+    uint3 gid [[thread_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    threadgroup ushort4 s_stack[4][4][128];
+    qwen_gdn_recurrence_tree_lazy_impl<4u>(q_in, k_in, qkv_conv, g_in, beta_in, state_io, y_out, p, pr, tp, gid, tid, lane, s_stack);
 }
 
 kernel void qwen_full_attn_q_prep_tree(
@@ -4211,8 +4506,8 @@ inline void qwen_full_attn_kv_prep_quant_tree_impl(
     const device ushort* k_norm,
     device uchar*        k_cache,
     device uchar*        v_cache,
-    device float2*       k_sb,
-    device float2*       v_sb,
+    device half2*        k_sb,
+    device half2*        v_sb,
     constant FullAttnParams& p,
     constant TreeParams& tp,
     uint2 tgid,
@@ -4226,10 +4521,10 @@ inline void qwen_full_attn_kv_prep_quant_tree_impl(
     const device float* vsrc = v_proj + ((ulong)t * p.Hkv + h) * p.D;
     constexpr uint BYTES_PER_HEAD = (KV_BITS == 8) ? 256u : 128u;
     ulong head_idx = (ulong)(p.pos + t) * p.Hkv + h;
-    device uchar*  kdst = k_cache + head_idx * BYTES_PER_HEAD;
-    device uchar*  vdst = v_cache + head_idx * BYTES_PER_HEAD;
-    device float2* ksbd = k_sb + head_idx * 4ul;
-    device float2* vsbd = v_sb + head_idx * 4ul;
+    device uchar* kdst = k_cache + head_idx * BYTES_PER_HEAD;
+    device uchar* vdst = v_cache + head_idx * BYTES_PER_HEAD;
+    device half2* ksbd = k_sb + head_idx * 4ul;
+    device half2* vsbd = v_sb + head_idx * 4ul;
 
     float kv[8], vv[8];
     float sq = 0.0f;
@@ -4266,12 +4561,15 @@ inline void qwen_full_attn_kv_prep_quant_tree_impl(
     for (uint g = 0; g < 4u; g++) {
         float ka = kv[2u * g], kb = kv[2u * g + 1u];
         float kmn = simd_min(min(ka, kb)), kmx = simd_max(max(ka, kb));
-        float krng = kmx - kmn;
-        float fs_k = (krng > 1e-12f) ? (krng / QMAX) : 0.0f;
-        float inv_k = (krng > 1e-12f) ? (QMAX / krng) : 0.0f;
-        if (lane == 0u) ksbd[g] = float2(fs_k, kmn);
-        uint qk0 = uint(clamp(rint((ka - kmn) * inv_k), 0.0f, QMAX));
-        uint qk1 = uint(clamp(rint((kb - kmn) * inv_k), 0.0f, QMAX));
+        half kmn_h = half(kmn);
+        float kmn_q = float(kmn_h);
+        float krng = max(0.0f, kmx - kmn_q);
+        half fs_kh = half((krng > 1e-12f) ? (krng / QMAX) : 0.0f);
+        float fs_kq = float(fs_kh);
+        float inv_k = (fs_kq > 0.0f) ? (1.0f / fs_kq) : 0.0f;
+        if (lane == 0u) ksbd[g] = half2(fs_kh, kmn_h);
+        uint qk0 = uint(clamp(rint((ka - kmn_q) * inv_k), 0.0f, QMAX));
+        uint qk1 = uint(clamp(rint((kb - kmn_q) * inv_k), 0.0f, QMAX));
         if (KV_BITS == 8) {
             kdst[(2u * g) * 32u + lane]      = uchar(qk0);
             kdst[(2u * g + 1u) * 32u + lane] = uchar(qk1);
@@ -4281,12 +4579,15 @@ inline void qwen_full_attn_kv_prep_quant_tree_impl(
 
         float va = vv[2u * g], vb = vv[2u * g + 1u];
         float vmn = simd_min(min(va, vb)), vmx = simd_max(max(va, vb));
-        float vrng = vmx - vmn;
-        float fs_v = (vrng > 1e-12f) ? (vrng / QMAX) : 0.0f;
-        float inv_v = (vrng > 1e-12f) ? (QMAX / vrng) : 0.0f;
-        if (lane == 0u) vsbd[g] = float2(fs_v, vmn);
-        uint qv0 = uint(clamp(rint((va - vmn) * inv_v), 0.0f, QMAX));
-        uint qv1 = uint(clamp(rint((vb - vmn) * inv_v), 0.0f, QMAX));
+        half vmn_h = half(vmn);
+        float vmn_q = float(vmn_h);
+        float vrng = max(0.0f, vmx - vmn_q);
+        half fs_vh = half((vrng > 1e-12f) ? (vrng / QMAX) : 0.0f);
+        float fs_vq = float(fs_vh);
+        float inv_v = (fs_vq > 0.0f) ? (1.0f / fs_vq) : 0.0f;
+        if (lane == 0u) vsbd[g] = half2(fs_vh, vmn_h);
+        uint qv0 = uint(clamp(rint((va - vmn_q) * inv_v), 0.0f, QMAX));
+        uint qv1 = uint(clamp(rint((vb - vmn_q) * inv_v), 0.0f, QMAX));
         if (KV_BITS == 8) {
             vdst[(2u * g) * 32u + lane]      = uchar(qv0);
             vdst[(2u * g + 1u) * 32u + lane] = uchar(qv1);
@@ -4299,8 +4600,8 @@ inline void qwen_full_attn_kv_prep_quant_tree_impl(
 kernel void qwen_full_attn_kv_prep_q8_tree(
     const device float* k_proj [[buffer(0)]], const device float* v_proj [[buffer(1)]],
     const device ushort* k_norm [[buffer(2)]], device uchar* k_cache [[buffer(3)]],
-    device uchar* v_cache [[buffer(4)]], device float2* k_sb [[buffer(5)]],
-    device float2* v_sb [[buffer(6)]], constant FullAttnParams& p [[buffer(7)]],
+    device uchar* v_cache [[buffer(4)]], device half2* k_sb [[buffer(5)]],
+    device half2* v_sb [[buffer(6)]], constant FullAttnParams& p [[buffer(7)]],
     constant TreeParams& tp [[buffer(8)]],
     uint2 tgid [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]
 ) {
@@ -4310,8 +4611,8 @@ kernel void qwen_full_attn_kv_prep_q8_tree(
 kernel void qwen_full_attn_kv_prep_q4_tree(
     const device float* k_proj [[buffer(0)]], const device float* v_proj [[buffer(1)]],
     const device ushort* k_norm [[buffer(2)]], device uchar* k_cache [[buffer(3)]],
-    device uchar* v_cache [[buffer(4)]], device float2* k_sb [[buffer(5)]],
-    device float2* v_sb [[buffer(6)]], constant FullAttnParams& p [[buffer(7)]],
+    device uchar* v_cache [[buffer(4)]], device half2* k_sb [[buffer(5)]],
+    device half2* v_sb [[buffer(6)]], constant FullAttnParams& p [[buffer(7)]],
     constant TreeParams& tp [[buffer(8)]],
     uint2 tgid [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]
 ) {
@@ -4381,8 +4682,8 @@ inline void qwen_gqa_attn_gated_quant_tree_f16_impl(
     const device float* gate_in,
     const device uchar* k_cache,
     const device uchar* v_cache,
-    const device float2* k_sb,
-    const device float2* v_sb,
+    const device half2* k_sb,
+    const device half2* v_sb,
     device half*        out,
     constant FullAttnParams& p,
     constant TreeParams& tp,
@@ -4411,11 +4712,12 @@ inline void qwen_gqa_attn_gated_quant_tree_f16_impl(
         if (kpos >= tp.mask_base_pos && (((tmask >> (kpos - tp.mask_base_pos)) & 1u) == 0u)) continue;
         ulong head_idx = (ulong)kpos * p.Hkv + hkv;
         const device uchar* kp = k_cache + head_idx * BYTES_PER_HEAD;
-        const device float2* ksb = k_sb + head_idx * 4ul;
+        const device half2* ksb = k_sb + head_idx * 4ul;
         float dot = 0.0f;
         #pragma unroll
         for (uint g = 0; g < 4u; g++) {
-            float sc = float(ksb[g].x), mn = float(ksb[g].y);
+            float2 sb = float2(ksb[g]);
+            float sc = sb.x, mn = sb.y;
             float k0, k1;
             if (KV_BITS == 8) {
                 k0 = fma(float(kp[(2u * g) * 32u + lane]), sc, mn);
@@ -4435,10 +4737,11 @@ inline void qwen_gqa_attn_gated_quant_tree_f16_impl(
         m_max = m_new;
 
         const device uchar* vp = v_cache + head_idx * BYTES_PER_HEAD;
-        const device float2* vsb = v_sb + head_idx * 4ul;
+        const device half2* vsb = v_sb + head_idx * 4ul;
         #pragma unroll
         for (uint g = 0; g < 4u; g++) {
-            float sc = float(vsb[g].x), mn = float(vsb[g].y);
+            float2 sb = float2(vsb[g]);
+            float sc = sb.x, mn = sb.y;
             float v0, v1;
             if (KV_BITS == 8) {
                 v0 = fma(float(vp[(2u * g) * 32u + lane]), sc, mn);
@@ -4464,7 +4767,7 @@ inline void qwen_gqa_attn_gated_quant_tree_f16_impl(
 kernel void qwen_gqa_attn_gated_q8_tree_f16(
     const device float* q [[buffer(0)]], const device float* g [[buffer(1)]],
     const device uchar* kc [[buffer(2)]], const device uchar* vc [[buffer(3)]],
-    const device float2* ksb [[buffer(4)]], const device float2* vsb [[buffer(5)]],
+    const device half2* ksb [[buffer(4)]], const device half2* vsb [[buffer(5)]],
     device half* out [[buffer(6)]], constant FullAttnParams& p [[buffer(7)]],
     constant TreeParams& tp [[buffer(8)]],
     uint2 tgid [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]
@@ -4473,7 +4776,7 @@ kernel void qwen_gqa_attn_gated_q8_tree_f16(
 kernel void qwen_gqa_attn_gated_q4_tree_f16(
     const device float* q [[buffer(0)]], const device float* g [[buffer(1)]],
     const device uchar* kc [[buffer(2)]], const device uchar* vc [[buffer(3)]],
-    const device float2* ksb [[buffer(4)]], const device float2* vsb [[buffer(5)]],
+    const device half2* ksb [[buffer(4)]], const device half2* vsb [[buffer(5)]],
     device half* out [[buffer(6)]], constant FullAttnParams& p [[buffer(7)]],
     constant TreeParams& tp [[buffer(8)]],
     uint2 tgid [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]
@@ -4484,7 +4787,7 @@ kernel void qwen_gqa_verify_splitk_p1_tree(
     const device float* q_in     [[buffer(0)]],
     const device half*  k_cache  [[buffer(1)]],
     const device half*  v_cache  [[buffer(2)]],
-    device float*       part_o   [[buffer(3)]],
+    device half*        part_o   [[buffer(3)]],
     device float*       part_m   [[buffer(4)]],
     device float*       part_l   [[buffer(5)]],
     constant FullAttnParams& p   [[buffer(6)]],
@@ -4737,14 +5040,12 @@ kernel void qwen_gqa_verify_splitk_p1_tree(
     uint h   = (lh == 0u) ? h0 : h1;
     if (t < p.M && (lh == 0u || h1_ok)) {
         ulong slot = ((ulong)t * p.Hq + h) * p.num_splits + s;
-        device float* po = part_o + slot * p.D;
+        device half* po = part_o + slot * p.D;
         #pragma clang loop unroll(full)
         for (uint j = 0; j < 8u; j++) {
             uint c0 = sg_d + 8u * j + fn;
-            po[c0]           = O0[j].thread_elements()[0];
-            po[c0 + 1u]      = O0[j].thread_elements()[1];
-            po[128u + c0]    = O1[j].thread_elements()[0];
-            po[128u + c0 + 1u] = O1[j].thread_elements()[1];
+            *(device half2*)(po + c0)        = half2(half(O0[j].thread_elements()[0]), half(O0[j].thread_elements()[1]));
+            *(device half2*)(po + 128u + c0) = half2(half(O1[j].thread_elements()[0]), half(O1[j].thread_elements()[1]));
         }
     }
 }
@@ -4754,9 +5055,9 @@ inline void qwen_gqa_verify_splitk_p1_quant_tree_impl(
     const device float* q_in,
     const device uchar* k_cache,
     const device uchar* v_cache,
-    const device float2* k_sb,
-    const device float2* v_sb,
-    device float*       part_o,
+    const device half2* k_sb,
+    const device half2* v_sb,
+    device half*        part_o,
     device float*       part_m,
     device float*       part_l,
     constant FullAttnParams& p,
@@ -4970,23 +5271,20 @@ inline void qwen_gqa_verify_splitk_p1_quant_tree_impl(
     uint h  = (lh == 0u) ? h0 : h1;
     if (t < p.M && (lh == 0u || h1_ok)) {
         ulong slot = ((ulong)t * p.Hq + h) * p.num_splits + s;
-        device float* po = part_o + slot * p.D;
+        device half* po = part_o + slot * p.D;
         #pragma clang loop unroll(full)
         for (uint j = 0; j < 8u; j++) {
             uint c0 = sg_d + 8u * j + fn;
-            po[c0]      = O0[j].thread_elements()[0];
-            po[c0 + 1u] = O0[j].thread_elements()[1];
-            uint c1 = 128u + c0;
-            po[c1]      = O1[j].thread_elements()[0];
-            po[c1 + 1u] = O1[j].thread_elements()[1];
+            *(device half2*)(po + c0)        = half2(half(O0[j].thread_elements()[0]), half(O0[j].thread_elements()[1]));
+            *(device half2*)(po + 128u + c0) = half2(half(O1[j].thread_elements()[0]), half(O1[j].thread_elements()[1]));
         }
     }
 }
 
 kernel void qwen_gqa_verify_splitk_p1_q8_tree(
     const device float* q [[buffer(0)]], const device uchar* kc [[buffer(1)]], const device uchar* vc [[buffer(2)]],
-    const device float2* ksb [[buffer(3)]], const device float2* vsb [[buffer(4)]],
-    device float* po [[buffer(5)]], device float* pm [[buffer(6)]], device float* pl [[buffer(7)]],
+    const device half2* ksb [[buffer(3)]], const device half2* vsb [[buffer(4)]],
+    device half* po [[buffer(5)]], device float* pm [[buffer(6)]], device float* pl [[buffer(7)]],
     constant FullAttnParams& p [[buffer(8)]], constant TreeParams& tp [[buffer(9)]],
     uint3 tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]
@@ -4998,8 +5296,8 @@ kernel void qwen_gqa_verify_splitk_p1_q8_tree(
 
 kernel void qwen_gqa_verify_splitk_p1_q4_tree(
     const device float* q [[buffer(0)]], const device uchar* kc [[buffer(1)]], const device uchar* vc [[buffer(2)]],
-    const device float2* ksb [[buffer(3)]], const device float2* vsb [[buffer(4)]],
-    device float* po [[buffer(5)]], device float* pm [[buffer(6)]], device float* pl [[buffer(7)]],
+    const device half2* ksb [[buffer(3)]], const device half2* vsb [[buffer(4)]],
+    device half* po [[buffer(5)]], device float* pm [[buffer(6)]], device float* pl [[buffer(7)]],
     constant FullAttnParams& p [[buffer(8)]], constant TreeParams& tp [[buffer(9)]],
     uint3 tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]
@@ -5032,8 +5330,8 @@ kernel void qwen_kv_compact_f16(
 kernel void qwen_kv_compact_q(
     device uchar*  k_cache [[buffer(0)]],
     device uchar*  v_cache [[buffer(1)]],
-    device float2* k_sb    [[buffer(2)]],
-    device float2* v_sb    [[buffer(3)]],
+    device half2*  k_sb    [[buffer(2)]],
+    device half2*  v_sb    [[buffer(3)]],
     constant PathReplayParams& pr [[buffer(4)]],
     uint tid [[thread_position_in_grid]]
 ) {
@@ -5236,11 +5534,11 @@ kernel void qwen_rmsnorm_dual_scatter_f16(
 // ============================================================================
 
 // Helper: load [BK=32, 256] full-D half tile from FP16 / Q8 / Q4 KV cache using 128 threads (32 rows x 4 groups of 64)
-// Bank-conflict-free stride STR=264 eliminates SRAM bank conflicts on transposed AMX simdgroup_load!
+// Coalesced 128-bit uint4 loads (4x fewer LSU instructions!) + exact FP32 affine dequant from half2(scale, bias)!
 template<int KV_BITS, uint STR = 264u>
 inline void load_kv_tile32_full256(
     const device uchar*  kv_cache,
-    const device float2* kv_sb,
+    const device half2*  kv_sb,
     threadgroup half (&sKV)[32][STR],
     uint kb, uint tile_k, uint hkv, uint Hkv, uint tid
 ) {
@@ -5250,29 +5548,94 @@ inline void load_kv_tile32_full256(
     if (kr < tile_k) {
         ulong head_idx = (ulong)(kb + kr) * Hkv + hkv;
         if (KV_BITS == 16) {
-            const device half4* hp = (const device half4*)((const device half*)kv_cache + head_idx * 256ul + grp * 64u);
+            const device uint4* hp = (const device uint4*)(kv_cache + head_idx * 512ul + grp * 128u);
+            threadgroup uint4* dst_u4 = (threadgroup uint4*)(&sKV[kr][grp * 64u]);
             #pragma clang loop unroll(full)
-            for (uint i = 0; i < 16u; i++) dst[i] = hp[i];
+            for (uint i = 0u; i < 8u; i++) dst_u4[i] = hp[i];
         } else if (KV_BITS == 8) {
-            float2 sb = kv_sb[head_idx * 4ul + grp];
+            float2 sb = float2(kv_sb[head_idx * 4ul + grp]);
             float4 fs = float4(sb.x), fb = float4(sb.y);
-            const device uchar4* qp = (const device uchar4*)(kv_cache + head_idx * 256ul + grp * 64u);
+            const device uint4* qp = (const device uint4*)(kv_cache + head_idx * 256ul + grp * 64u);
             #pragma clang loop unroll(full)
-            for (uint i = 0; i < 16u; i++) dst[i] = half4(fma(float4(qp[i]), fs, fb));
+            for (uint i = 0u; i < 4u; i++) {
+                uint4 u = qp[i];
+                dst[i * 4u + 0u] = half4(fma(float4(as_type<uchar4>(u.x)), fs, fb));
+                dst[i * 4u + 1u] = half4(fma(float4(as_type<uchar4>(u.y)), fs, fb));
+                dst[i * 4u + 2u] = half4(fma(float4(as_type<uchar4>(u.z)), fs, fb));
+                dst[i * 4u + 3u] = half4(fma(float4(as_type<uchar4>(u.w)), fs, fb));
+            }
         } else {
-            float2 sb = kv_sb[head_idx * 4ul + grp];
+            float2 sb = float2(kv_sb[head_idx * 4ul + grp]);
             float4 fs = float4(sb.x), fb = float4(sb.y);
-            const device uchar4* qp = (const device uchar4*)(kv_cache + head_idx * 128ul + grp * 32u);
+            const device uint4* qp = (const device uint4*)(kv_cache + head_idx * 128ul + grp * 32u);
             #pragma clang loop unroll(full)
-            for (uint i = 0; i < 8u; i++) {
-                uchar4 u = qp[i];
-                dst[i]      = half4(fma(float4(u & uchar4(0x0Fu)), fs, fb));
-                dst[8u + i] = half4(fma(float4(u >> uchar4(4u)),   fs, fb));
+            for (uint i = 0u; i < 2u; i++) {
+                uint4 u = qp[i];
+                uchar4 b0 = as_type<uchar4>(u.x), b1 = as_type<uchar4>(u.y), b2 = as_type<uchar4>(u.z), b3 = as_type<uchar4>(u.w);
+                dst[i * 4u + 0u]      = half4(fma(float4(b0 & uchar4(0x0Fu)), fs, fb));
+                dst[i * 4u + 1u]      = half4(fma(float4(b1 & uchar4(0x0Fu)), fs, fb));
+                dst[i * 4u + 2u]      = half4(fma(float4(b2 & uchar4(0x0Fu)), fs, fb));
+                dst[i * 4u + 3u]      = half4(fma(float4(b3 & uchar4(0x0Fu)), fs, fb));
+                dst[8u + i * 4u + 0u] = half4(fma(float4(b0 >> uchar4(4u)),   fs, fb));
+                dst[8u + i * 4u + 1u] = half4(fma(float4(b1 >> uchar4(4u)),   fs, fb));
+                dst[8u + i * 4u + 2u] = half4(fma(float4(b2 >> uchar4(4u)),   fs, fb));
+                dst[8u + i * 4u + 3u] = half4(fma(float4(b3 >> uchar4(4u)),   fs, fb));
             }
         }
     } else {
         #pragma clang loop unroll(full)
-        for (uint i = 0; i < 16u; i++) dst[i] = half4(0.0h);
+        for (uint i = 0u; i < 16u; i++) dst[i] = half4(0.0h);
+    }
+}
+
+// Helper: load [BK=32, 128] half tile into sKV_raw (stride 132) using first 128 threads (zero-spill streaming uchar4!)
+template<int KV_BITS>
+inline void load_kv_tile32_half128(
+    const device uchar*  kv_cache,
+    const device half2*  kv_sb,
+    threadgroup half*    sKV_raw,
+    uint kb, uint tile_k, uint d_half, uint hkv, uint Hkv, uint tid
+) {
+    if (tid >= 128u) return;
+    uint kr = tid >> 2;
+    if (kr < tile_k) {
+        ulong head_idx = (ulong)(kb + kr) * Hkv + hkv;
+        if (KV_BITS == 16) {
+            uint kc = (tid & 3u) * 32u;
+            const device half4* hp = (const device half4*)((const device half*)kv_cache + head_idx * 256ul + d_half * 128u + kc);
+            threadgroup half4* dst = (threadgroup half4*)(sKV_raw + kr * 132u + kc);
+            #pragma clang loop unroll(full)
+            for (uint i = 0u; i < 8u; i++) dst[i] = hp[i];
+        } else if (KV_BITS == 8) {
+            uint kc  = (tid & 3u) * 32u;
+            uint grp = d_half * 2u + ((tid & 3u) >> 1);
+            float2 sb = float2(kv_sb[head_idx * 4ul + grp]);
+            float4 fs = float4(sb.x), fb = float4(sb.y);
+            const device uchar4* qp = (const device uchar4*)(kv_cache + head_idx * 256ul + d_half * 128u + kc);
+            threadgroup half4* dst  = (threadgroup half4*)(sKV_raw + kr * 132u + kc);
+            #pragma clang loop unroll(full)
+            for (uint i = 0u; i < 8u; i++) dst[i] = half4(fma(float4(qp[i]), fs, fb));
+        } else {
+            uint g_loc = (tid & 3u) >> 1;
+            uint sub16 = (tid & 1u) * 16u;
+            uint grp   = d_half * 2u + g_loc;
+            float2 sb = float2(kv_sb[head_idx * 4ul + grp]);
+            float4 fs = float4(sb.x), fb = float4(sb.y);
+            const device uchar4* qp = (const device uchar4*)(kv_cache + head_idx * 128ul + grp * 32u + sub16);
+            threadgroup half4* dst_lo = (threadgroup half4*)(sKV_raw + kr * 132u + g_loc * 64u + sub16);
+            threadgroup half4* dst_hi = (threadgroup half4*)(sKV_raw + kr * 132u + g_loc * 64u + 32u + sub16);
+            #pragma clang loop unroll(full)
+            for (uint i = 0u; i < 4u; i++) {
+                uchar4 u = qp[i];
+                dst_lo[i] = half4(fma(float4(u & uchar4(0x0Fu)), fs, fb));
+                dst_hi[i] = half4(fma(float4(u >> uchar4(4u)),   fs, fb));
+            }
+        }
+    } else {
+        uint kc = (tid & 3u) * 32u;
+        threadgroup half4* dst = (threadgroup half4*)(sKV_raw + kr * 132u + kc);
+        #pragma clang loop unroll(full)
+        for (uint i = 0u; i < 8u; i++) dst[i] = half4(0.0h);
     }
 }
 
@@ -5282,9 +5645,9 @@ inline void qwen_gqa6_m1_splitk_p1_impl(
     const device float*  q_in,
     const device uchar*  k_cache,
     const device uchar*  v_cache,
-    const device float2* k_sb,
-    const device float2* v_sb,
-    device float*        part_o,
+    const device half2*  k_sb,
+    const device half2*  v_sb,
+    device half*         part_o,
     device float*        part_m,
     device float*        part_l,
     constant FullAttnParams& p,
@@ -5302,6 +5665,8 @@ inline void qwen_gqa6_m1_splitk_p1_impl(
     uint s   = tgid.y;
     if (hkv >= p.Hkv || s >= p.num_splits) return;
 
+    uint total_tiles = (p.kv_len + BK - 1u) / BK;
+    bool use_win = (!IS_SPARSE) && (p.win_recent > p.win_sink) && (p.win_recent < total_tiles);
     uint iter_start, iter_end;
     if (IS_SPARSE) {
         uint n_active        = active_counts[hkv];
@@ -5309,7 +5674,7 @@ inline void qwen_gqa6_m1_splitk_p1_impl(
         iter_start           = s * pages_per_split;
         iter_end             = min(n_active, (s + 1u) * pages_per_split);
     } else {
-        uint num_k_tiles     = (p.kv_len + BK - 1u) / BK;
+        uint num_k_tiles     = use_win ? (p.win_sink + (total_tiles - p.win_recent)) : total_tiles;
         uint tiles_per_split = (num_k_tiles + p.num_splits - 1u) / p.num_splits;
         iter_start           = s * tiles_per_split;
         iter_end             = min(num_k_tiles, (s + 1u) * tiles_per_split);
@@ -5353,7 +5718,8 @@ inline void qwen_gqa6_m1_splitk_p1_impl(
     const float scale_log2 = p.scale * 1.4426950408889634f;
 
     for (uint it = iter_start; it < iter_end; ++it) {
-        uint kb = IS_SPARSE ? (active_pages[(ulong)hkv * 1024ul + it] * BK) : (it * BK);
+        uint tile_idx = use_win ? ((it < p.win_sink) ? it : (p.win_recent + (it - p.win_sink))) : it;
+        uint kb = IS_SPARSE ? (active_pages[(ulong)hkv * 1024ul + it] * BK) : (tile_idx * BK);
         uint tile_k = min(BK, p.kv_len - kb);
         load_kv_tile32_full256<KV_BITS, STR>(k_cache, k_sb, sKV, kb, tile_k, hkv, p.Hkv, tid);
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -5434,12 +5800,11 @@ inline void qwen_gqa6_m1_splitk_p1_impl(
 
     if (fm < 6u) {
         ulong slot = (ulong)(hkv * 6u + fm) * p.num_splits + s;
-        device float* po = part_o + slot * 256ul + sg * 64u;
+        device half* po = part_o + slot * 256ul + sg * 64u;
         #pragma clang loop unroll(full)
         for (uint j = 0; j < 8u; j++) {
             uint c0 = 8u * j + fn;
-            po[c0]      = float(O[j].thread_elements()[0]);
-            po[c0 + 1u] = float(O[j].thread_elements()[1]);
+            *(device half2*)(po + c0) = half2(O[j].thread_elements()[0], O[j].thread_elements()[1]);
         }
     }
     if (sg == 0u && lane < 6u) {
@@ -5451,7 +5816,7 @@ inline void qwen_gqa6_m1_splitk_p1_impl(
 
 kernel void qwen_gqa6_m1_splitk_p1_f16(
     const device float* q [[buffer(0)]], const device half* kc [[buffer(1)]], const device half* vc [[buffer(2)]],
-    device float* po [[buffer(3)]], device float* pm [[buffer(4)]], device float* pl [[buffer(5)]],
+    device half* po [[buffer(3)]], device float* pm [[buffer(4)]], device float* pl [[buffer(5)]],
     constant FullAttnParams& p [[buffer(6)]],
     uint2 tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]
@@ -5462,7 +5827,7 @@ kernel void qwen_gqa6_m1_splitk_p1_f16(
 
 kernel void qwen_gqa6_m1_splitk_p1_f16_tree(
     const device float* q [[buffer(0)]], const device half* kc [[buffer(1)]], const device half* vc [[buffer(2)]],
-    device float* po [[buffer(3)]], device float* pm [[buffer(4)]], device float* pl [[buffer(5)]],
+    device half* po [[buffer(3)]], device float* pm [[buffer(4)]], device float* pl [[buffer(5)]],
     constant FullAttnParams& p [[buffer(6)]], constant TreeParams& tp [[buffer(7)]],
     uint2 tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]
@@ -5473,8 +5838,8 @@ kernel void qwen_gqa6_m1_splitk_p1_f16_tree(
 
 kernel void qwen_gqa6_m1_splitk_p1_q8(
     const device float* q [[buffer(0)]], const device uchar* kc [[buffer(1)]], const device uchar* vc [[buffer(2)]],
-    const device float2* ksb [[buffer(3)]], const device float2* vsb [[buffer(4)]],
-    device float* po [[buffer(5)]], device float* pm [[buffer(6)]], device float* pl [[buffer(7)]],
+    const device half2* ksb [[buffer(3)]], const device half2* vsb [[buffer(4)]],
+    device half* po [[buffer(5)]], device float* pm [[buffer(6)]], device float* pl [[buffer(7)]],
     constant FullAttnParams& p [[buffer(8)]],
     uint2 tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]
@@ -5485,8 +5850,8 @@ kernel void qwen_gqa6_m1_splitk_p1_q8(
 
 kernel void qwen_gqa6_m1_splitk_p1_q8_tree(
     const device float* q [[buffer(0)]], const device uchar* kc [[buffer(1)]], const device uchar* vc [[buffer(2)]],
-    const device float2* ksb [[buffer(3)]], const device float2* vsb [[buffer(4)]],
-    device float* po [[buffer(5)]], device float* pm [[buffer(6)]], device float* pl [[buffer(7)]],
+    const device half2* ksb [[buffer(3)]], const device half2* vsb [[buffer(4)]],
+    device half* po [[buffer(5)]], device float* pm [[buffer(6)]], device float* pl [[buffer(7)]],
     constant FullAttnParams& p [[buffer(8)]], constant TreeParams& tp [[buffer(9)]],
     uint2 tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]
@@ -5497,8 +5862,8 @@ kernel void qwen_gqa6_m1_splitk_p1_q8_tree(
 
 kernel void qwen_gqa6_m1_splitk_p1_q4(
     const device float* q [[buffer(0)]], const device uchar* kc [[buffer(1)]], const device uchar* vc [[buffer(2)]],
-    const device float2* ksb [[buffer(3)]], const device float2* vsb [[buffer(4)]],
-    device float* po [[buffer(5)]], device float* pm [[buffer(6)]], device float* pl [[buffer(7)]],
+    const device half2* ksb [[buffer(3)]], const device half2* vsb [[buffer(4)]],
+    device half* po [[buffer(5)]], device float* pm [[buffer(6)]], device float* pl [[buffer(7)]],
     constant FullAttnParams& p [[buffer(8)]],
     uint2 tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]
@@ -5509,8 +5874,8 @@ kernel void qwen_gqa6_m1_splitk_p1_q4(
 
 kernel void qwen_gqa6_m1_splitk_p1_q4_tree(
     const device float* q [[buffer(0)]], const device uchar* kc [[buffer(1)]], const device uchar* vc [[buffer(2)]],
-    const device float2* ksb [[buffer(3)]], const device float2* vsb [[buffer(4)]],
-    device float* po [[buffer(5)]], device float* pm [[buffer(6)]], device float* pl [[buffer(7)]],
+    const device half2* ksb [[buffer(3)]], const device half2* vsb [[buffer(4)]],
+    device half* po [[buffer(5)]], device float* pm [[buffer(6)]], device float* pl [[buffer(7)]],
     constant FullAttnParams& p [[buffer(8)]], constant TreeParams& tp [[buffer(9)]],
     uint2 tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]
@@ -5551,9 +5916,9 @@ inline void qwen_gqa6_m2_splitk_p1_impl(
     const device half*   q_p2,
     const device uchar*  k_cache,
     const device uchar*  v_cache,
-    const device float2* k_sb,
-    const device float2* v_sb,
-    device float*        part_o,
+    const device half2*  k_sb,
+    const device half2*  v_sb,
+    device half*         part_o,
     device float*        part_m,
     device float*        part_l,
     constant FullAttnParams& p,
@@ -5569,6 +5934,8 @@ inline void qwen_gqa6_m2_splitk_p1_impl(
     constexpr uint BK = 32u, STR = 264u;
     uint hkv = tgid.x, s = tgid.y;
     if (hkv >= p.Hkv || s >= p.num_splits) return;
+    uint total_tiles = (p.kv_len + BK - 1u) / BK;
+    bool use_win = (!IS_SPARSE) && (p.win_recent > p.win_sink) && (p.win_recent < total_tiles);
     uint iter_start, iter_end;
     if (IS_SPARSE) {
         uint n_active        = active_counts[hkv];
@@ -5576,7 +5943,7 @@ inline void qwen_gqa6_m2_splitk_p1_impl(
         iter_start           = s * pages_per_split;
         iter_end             = min(n_active, (s + 1u) * pages_per_split);
     } else {
-        uint num_k_tiles     = (p.kv_len + BK - 1u) / BK;
+        uint num_k_tiles     = use_win ? (p.win_sink + (total_tiles - p.win_recent)) : total_tiles;
         uint tiles_per_split = (num_k_tiles + p.num_splits - 1u) / p.num_splits;
         iter_start           = s * tiles_per_split;
         iter_end             = min(num_k_tiles, (s + 1u) * tiles_per_split);
@@ -5607,7 +5974,8 @@ inline void qwen_gqa6_m2_splitk_p1_impl(
     const float scale_log2 = p.scale * 1.4426950408889634f;
 
     for (uint it = iter_start; it < iter_end; ++it) {
-        uint kb = IS_SPARSE ? (active_pages[(ulong)hkv * 1024ul + it] * BK) : (it * BK);
+        uint tile_idx = use_win ? ((it < p.win_sink) ? it : (p.win_recent + (it - p.win_sink))) : it;
+        uint kb = IS_SPARSE ? (active_pages[(ulong)hkv * 1024ul + it] * BK) : (tile_idx * BK);
         uint tile_k = min(BK, p.kv_len - kb);
         load_kv_tile32_full256<KV_BITS, STR>(k_cache, k_sb, sKV, kb, tile_k, hkv, p.Hkv, tid);
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -5717,13 +6085,13 @@ inline void qwen_gqa6_m2_splitk_p1_impl(
             uint hl0 = fm >> 1;
             ulong slot0 = ((ulong)t * p.Hq + (hkv * 6u + hl0)) * p.num_splits + s;
             ulong slot1 = ((ulong)t * p.Hq + (hkv * 6u + 3u + hl0)) * p.num_splits + s;
-            device float* po0 = part_o + slot0 * 256ul + sg * 64u;
-            device float* po1 = part_o + slot1 * 256ul + sg * 64u;
+            device half* po0 = part_o + slot0 * 256ul + sg * 64u;
+            device half* po1 = part_o + slot1 * 256ul + sg * 64u;
             #pragma clang loop unroll(full)
             for (uint j = 0; j < 8u; j++) {
                 uint c0 = 8u * j + fn;
-                po0[c0] = float(O0[j].thread_elements()[0]); po0[c0 + 1u] = float(O0[j].thread_elements()[1]);
-                po1[c0] = float(O1[j].thread_elements()[0]); po1[c0 + 1u] = float(O1[j].thread_elements()[1]);
+                *(device half2*)(po0 + c0) = half2(O0[j].thread_elements()[0], O0[j].thread_elements()[1]);
+                *(device half2*)(po1 + c0) = half2(O1[j].thread_elements()[0], O1[j].thread_elements()[1]);
             }
         }
     }
@@ -5731,7 +6099,7 @@ inline void qwen_gqa6_m2_splitk_p1_impl(
 
 kernel void qwen_gqa6_m2_splitk_p1_f16(
     const device half* q [[buffer(0)]], const device half* kc [[buffer(1)]], const device half* vc [[buffer(2)]],
-    device float* po [[buffer(3)]], device float* pm [[buffer(4)]], device float* pl [[buffer(5)]],
+    device half* po [[buffer(3)]], device float* pm [[buffer(4)]], device float* pl [[buffer(5)]],
     constant FullAttnParams& p [[buffer(6)]],
     uint2 tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]
@@ -5742,7 +6110,7 @@ kernel void qwen_gqa6_m2_splitk_p1_f16(
 
 kernel void qwen_gqa6_m2_splitk_p1_f16_tree(
     const device half* q [[buffer(0)]], const device half* kc [[buffer(1)]], const device half* vc [[buffer(2)]],
-    device float* po [[buffer(3)]], device float* pm [[buffer(4)]], device float* pl [[buffer(5)]],
+    device half* po [[buffer(3)]], device float* pm [[buffer(4)]], device float* pl [[buffer(5)]],
     constant FullAttnParams& p [[buffer(6)]], constant TreeParams& tp [[buffer(7)]],
     uint2 tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]
@@ -5753,8 +6121,8 @@ kernel void qwen_gqa6_m2_splitk_p1_f16_tree(
 
 kernel void qwen_gqa6_m2_splitk_p1_q8(
     const device half* q [[buffer(0)]], const device uchar* kc [[buffer(1)]], const device uchar* vc [[buffer(2)]],
-    const device float2* ksb [[buffer(3)]], const device float2* vsb [[buffer(4)]],
-    device float* po [[buffer(5)]], device float* pm [[buffer(6)]], device float* pl [[buffer(7)]],
+    const device half2* ksb [[buffer(3)]], const device half2* vsb [[buffer(4)]],
+    device half* po [[buffer(5)]], device float* pm [[buffer(6)]], device float* pl [[buffer(7)]],
     constant FullAttnParams& p [[buffer(8)]],
     uint2 tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]
@@ -5765,8 +6133,8 @@ kernel void qwen_gqa6_m2_splitk_p1_q8(
 
 kernel void qwen_gqa6_m2_splitk_p1_q8_tree(
     const device half* q [[buffer(0)]], const device uchar* kc [[buffer(1)]], const device uchar* vc [[buffer(2)]],
-    const device float2* ksb [[buffer(3)]], const device float2* vsb [[buffer(4)]],
-    device float* po [[buffer(5)]], device float* pm [[buffer(6)]], device float* pl [[buffer(7)]],
+    const device half2* ksb [[buffer(3)]], const device half2* vsb [[buffer(4)]],
+    device half* po [[buffer(5)]], device float* pm [[buffer(6)]], device float* pl [[buffer(7)]],
     constant FullAttnParams& p [[buffer(8)]], constant TreeParams& tp [[buffer(9)]],
     uint2 tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]
@@ -5777,8 +6145,8 @@ kernel void qwen_gqa6_m2_splitk_p1_q8_tree(
 
 kernel void qwen_gqa6_m2_splitk_p1_q4(
     const device half* q [[buffer(0)]], const device uchar* kc [[buffer(1)]], const device uchar* vc [[buffer(2)]],
-    const device float2* ksb [[buffer(3)]], const device float2* vsb [[buffer(4)]],
-    device float* po [[buffer(5)]], device float* pm [[buffer(6)]], device float* pl [[buffer(7)]],
+    const device half2* ksb [[buffer(3)]], const device half2* vsb [[buffer(4)]],
+    device half* po [[buffer(5)]], device float* pm [[buffer(6)]], device float* pl [[buffer(7)]],
     constant FullAttnParams& p [[buffer(8)]],
     uint2 tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]
@@ -5789,8 +6157,8 @@ kernel void qwen_gqa6_m2_splitk_p1_q4(
 
 kernel void qwen_gqa6_m2_splitk_p1_q4_tree(
     const device half* q [[buffer(0)]], const device uchar* kc [[buffer(1)]], const device uchar* vc [[buffer(2)]],
-    const device float2* ksb [[buffer(3)]], const device float2* vsb [[buffer(4)]],
-    device float* po [[buffer(5)]], device float* pm [[buffer(6)]], device float* pl [[buffer(7)]],
+    const device half2* ksb [[buffer(3)]], const device half2* vsb [[buffer(4)]],
+    device half* po [[buffer(5)]], device float* pm [[buffer(6)]], device float* pl [[buffer(7)]],
     constant FullAttnParams& p [[buffer(8)]], constant TreeParams& tp [[buffer(9)]],
     uint2 tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]
@@ -5830,9 +6198,9 @@ inline void qwen_gqa6_m4_splitk_p1_impl(
     const device half*   q_p4,
     const device uchar*  k_cache,
     const device uchar*  v_cache,
-    const device float2* k_sb,
-    const device float2* v_sb,
-    device float*        part_o,
+    const device half2*  k_sb,
+    const device half2*  v_sb,
+    device half*         part_o,
     device float*        part_m,
     device float*        part_l,
     constant FullAttnParams& p,
@@ -5848,6 +6216,8 @@ inline void qwen_gqa6_m4_splitk_p1_impl(
     uint hkv = tgid.x, s = tgid.y;
     if (hkv >= p.Hkv || s >= p.num_splits) return;
 
+    uint total_tiles = (p.kv_len + BK - 1u) / BK;
+    bool use_win = (!IS_SPARSE) && (p.win_recent > p.win_sink) && (p.win_recent < total_tiles);
     uint iter_start, iter_end;
     if (IS_SPARSE) {
         uint n_active        = active_counts[hkv];
@@ -5855,7 +6225,7 @@ inline void qwen_gqa6_m4_splitk_p1_impl(
         iter_start           = s * pages_per_split;
         iter_end             = min(n_active, (s + 1u) * pages_per_split);
     } else {
-        uint num_k_tiles     = (p.kv_len + BK - 1u) / BK;
+        uint num_k_tiles     = use_win ? (p.win_sink + (total_tiles - p.win_recent)) : total_tiles;
         uint tiles_per_split = (num_k_tiles + p.num_splits - 1u) / p.num_splits;
         iter_start           = s * tiles_per_split;
         iter_end             = min(num_k_tiles, (s + 1u) * tiles_per_split);
@@ -5872,7 +6242,7 @@ inline void qwen_gqa6_m4_splitk_p1_impl(
         return;
     }
 
-    threadgroup half* sS_base = &sKV[0][0]; // 32*264*2 = 16,896 B >= 4*24*32*2 = 6,144 B!
+    threadgroup half* sS_base = &sKV[0][0]; // 32*264*2 = 16,896 B >= 4*24*32*2 = 6,144 B (lean 18.1 KiB SRAM -> max occupancy!)
     const device half* qp0 = q_p4 + (ulong)(hkv * 3u + 0u) * 8ul * 256ul + sg * 64u;
     const device half* qp1 = q_p4 + (ulong)(hkv * 3u + 1u) * 8ul * 256ul + sg * 64u;
     const device half* qp2 = q_p4 + (ulong)(hkv * 3u + 2u) * 8ul * 256ul + sg * 64u;
@@ -5892,7 +6262,8 @@ inline void qwen_gqa6_m4_splitk_p1_impl(
     const float scale_log2 = p.scale * 1.4426950408889634f;
 
     for (uint it = iter_start; it < iter_end; ++it) {
-        uint kb = IS_SPARSE ? (active_pages[(ulong)hkv * 1024ul + it] * BK) : (it * BK);
+        uint tile_idx = use_win ? ((it < p.win_sink) ? it : (p.win_recent + (it - p.win_sink))) : it;
+        uint kb = IS_SPARSE ? (active_pages[(ulong)hkv * 1024ul + it] * BK) : (tile_idx * BK);
         uint tile_k = min(BK, p.kv_len - kb);
         load_kv_tile32_full256<KV_BITS, STR>(k_cache, k_sb, sKV, kb, tile_k, hkv, p.Hkv, tid);
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -6015,13 +6386,13 @@ inline void qwen_gqa6_m4_splitk_p1_impl(
         #pragma clang loop unroll(full)
         for (uint hp = 0; hp < 3u; hp++) {
             ulong slot = ((ulong)t * p.Hq + (hkv * 6u + hp * 2u + hl_sub)) * p.num_splits + s;
-            device float* po = part_o + slot * 256ul + sg * 64u;
+            device half* po = part_o + slot * 256ul + sg * 64u;
             #pragma clang loop unroll(full)
             for (uint j = 0; j < 8u; j++) {
                 uint c0 = 8u * j + fn;
                 half v0 = (hp == 0u) ? O0[j].thread_elements()[0] : ((hp == 1u) ? O1[j].thread_elements()[0] : O2[j].thread_elements()[0]);
                 half v1 = (hp == 0u) ? O0[j].thread_elements()[1] : ((hp == 1u) ? O1[j].thread_elements()[1] : O2[j].thread_elements()[1]);
-                po[c0] = float(v0); po[c0 + 1u] = float(v1);
+                *(device half2*)(po + c0) = half2(v0, v1);
             }
         }
     }
@@ -6029,7 +6400,7 @@ inline void qwen_gqa6_m4_splitk_p1_impl(
 
 kernel void qwen_gqa6_m4_splitk_p1_f16(
     const device half* q [[buffer(0)]], const device half* kc [[buffer(1)]], const device half* vc [[buffer(2)]],
-    device float* po [[buffer(3)]], device float* pm [[buffer(4)]], device float* pl [[buffer(5)]],
+    device half* po [[buffer(3)]], device float* pm [[buffer(4)]], device float* pl [[buffer(5)]],
     constant FullAttnParams& p [[buffer(6)]],
     uint2 tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]
@@ -6040,7 +6411,7 @@ kernel void qwen_gqa6_m4_splitk_p1_f16(
 
 kernel void qwen_gqa6_m4_splitk_p1_f16_tree(
     const device half* q [[buffer(0)]], const device half* kc [[buffer(1)]], const device half* vc [[buffer(2)]],
-    device float* po [[buffer(3)]], device float* pm [[buffer(4)]], device float* pl [[buffer(5)]],
+    device half* po [[buffer(3)]], device float* pm [[buffer(4)]], device float* pl [[buffer(5)]],
     constant FullAttnParams& p [[buffer(6)]], constant TreeParams& tp [[buffer(7)]],
     uint2 tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]
@@ -6051,8 +6422,8 @@ kernel void qwen_gqa6_m4_splitk_p1_f16_tree(
 
 kernel void qwen_gqa6_m4_splitk_p1_q8(
     const device half* q [[buffer(0)]], const device uchar* kc [[buffer(1)]], const device uchar* vc [[buffer(2)]],
-    const device float2* ksb [[buffer(3)]], const device float2* vsb [[buffer(4)]],
-    device float* po [[buffer(5)]], device float* pm [[buffer(6)]], device float* pl [[buffer(7)]],
+    const device half2* ksb [[buffer(3)]], const device half2* vsb [[buffer(4)]],
+    device half* po [[buffer(5)]], device float* pm [[buffer(6)]], device float* pl [[buffer(7)]],
     constant FullAttnParams& p [[buffer(8)]],
     uint2 tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]
@@ -6063,8 +6434,8 @@ kernel void qwen_gqa6_m4_splitk_p1_q8(
 
 kernel void qwen_gqa6_m4_splitk_p1_q8_tree(
     const device half* q [[buffer(0)]], const device uchar* kc [[buffer(1)]], const device uchar* vc [[buffer(2)]],
-    const device float2* ksb [[buffer(3)]], const device float2* vsb [[buffer(4)]],
-    device float* po [[buffer(5)]], device float* pm [[buffer(6)]], device float* pl [[buffer(7)]],
+    const device half2* ksb [[buffer(3)]], const device half2* vsb [[buffer(4)]],
+    device half* po [[buffer(5)]], device float* pm [[buffer(6)]], device float* pl [[buffer(7)]],
     constant FullAttnParams& p [[buffer(8)]], constant TreeParams& tp [[buffer(9)]],
     uint2 tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]
@@ -6075,8 +6446,8 @@ kernel void qwen_gqa6_m4_splitk_p1_q8_tree(
 
 kernel void qwen_gqa6_m4_splitk_p1_q4(
     const device half* q [[buffer(0)]], const device uchar* kc [[buffer(1)]], const device uchar* vc [[buffer(2)]],
-    const device float2* ksb [[buffer(3)]], const device float2* vsb [[buffer(4)]],
-    device float* po [[buffer(5)]], device float* pm [[buffer(6)]], device float* pl [[buffer(7)]],
+    const device half2* ksb [[buffer(3)]], const device half2* vsb [[buffer(4)]],
+    device half* po [[buffer(5)]], device float* pm [[buffer(6)]], device float* pl [[buffer(7)]],
     constant FullAttnParams& p [[buffer(8)]],
     uint2 tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]
@@ -6087,8 +6458,8 @@ kernel void qwen_gqa6_m4_splitk_p1_q4(
 
 kernel void qwen_gqa6_m4_splitk_p1_q4_tree(
     const device half* q [[buffer(0)]], const device uchar* kc [[buffer(1)]], const device uchar* vc [[buffer(2)]],
-    const device float2* ksb [[buffer(3)]], const device float2* vsb [[buffer(4)]],
-    device float* po [[buffer(5)]], device float* pm [[buffer(6)]], device float* pl [[buffer(7)]],
+    const device half2* ksb [[buffer(3)]], const device half2* vsb [[buffer(4)]],
+    device half* po [[buffer(5)]], device float* pm [[buffer(6)]], device float* pl [[buffer(7)]],
     constant FullAttnParams& p [[buffer(8)]], constant TreeParams& tp [[buffer(9)]],
     uint2 tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]
@@ -6119,67 +6490,16 @@ kernel void qwen_pack_q_h(
     }
 }
 
-// Helper: load [BK=32, 128] half tile from FP16 / Q8 / Q4 KV cache into sKV_raw (stride 132) using first 128 threads
-template<int KV_BITS>
-inline void load_kv_tile32_half128(
-    const device uchar*  kv_cache,
-    const device float2* kv_sb,
-    threadgroup half*    sKV_raw,
-    uint kb, uint tile_k, uint d_half, uint hkv, uint Hkv, uint tid
-) {
-    if (tid >= 128u) return;
-    uint kr = tid >> 2;
-    if (kr < tile_k) {
-        ulong head_idx = (ulong)(kb + kr) * Hkv + hkv;
-        if (KV_BITS == 16) {
-            uint kc = (tid & 3u) * 32u;
-            const device half4* hp = (const device half4*)((const device half*)kv_cache + head_idx * 256ul + d_half * 128u + kc);
-            threadgroup half4* dst = (threadgroup half4*)(sKV_raw + kr * 132u + kc);
-            #pragma clang loop unroll(full)
-            for (uint i = 0; i < 8u; i++) dst[i] = hp[i];
-        } else if (KV_BITS == 8) {
-            uint kc  = (tid & 3u) * 32u;
-            uint grp = d_half * 2u + ((tid & 3u) >> 1);
-            float2 sb = kv_sb[head_idx * 4ul + grp];
-            float4 fs = float4(sb.x), fb = float4(sb.y);
-            const device uchar4* qp = (const device uchar4*)(kv_cache + head_idx * 256ul + d_half * 128u + kc);
-            threadgroup half4* dst  = (threadgroup half4*)(sKV_raw + kr * 132u + kc);
-            #pragma clang loop unroll(full)
-            for (uint i = 0; i < 8u; i++) dst[i] = half4(fma(float4(qp[i]), fs, fb));
-        } else {
-            uint g_loc = (tid & 3u) >> 1;
-            uint sub16 = (tid & 1u) * 16u;
-            uint grp   = d_half * 2u + g_loc;
-            float2 sb = kv_sb[head_idx * 4ul + grp];
-            float4 fs = float4(sb.x), fb = float4(sb.y);
-            const device uchar4* qp = (const device uchar4*)(kv_cache + head_idx * 128ul + grp * 32u + sub16);
-            threadgroup half4* dst_lo = (threadgroup half4*)(sKV_raw + kr * 132u + g_loc * 64u + sub16);
-            threadgroup half4* dst_hi = (threadgroup half4*)(sKV_raw + kr * 132u + g_loc * 64u + 32u + sub16);
-            #pragma clang loop unroll(full)
-            for (uint i = 0; i < 4u; i++) {
-                uchar4 u = qp[i];
-                dst_lo[i] = half4(fma(float4(u & uchar4(0x0Fu)), fs, fb));
-                dst_hi[i] = half4(fma(float4(u >> uchar4(4u)),   fs, fb));
-            }
-        }
-    } else {
-        uint kc = (tid & 3u) * 32u;
-        threadgroup half4* dst = (threadgroup half4*)(sKV_raw + kr * 132u + kc);
-        #pragma clang loop unroll(full)
-        for (uint i = 0; i < 8u; i++) dst[i] = half4(0.0h);
-    }
-}
-
 // GQA-6 192-thread (6 SGs = 1 SG per query head!) BK=32 FP16-AMX Split-K Verify Kernel
-// Total SRAM: 11.7 KB (2+ TGs/core!) | 1x KV DRAM read across all 6 query heads | L1-resident half Q
+// Total SRAM: 12.0 KB (2+ TGs/core!) | coalesced uint4 + half4 KV8 dequant | half part_o | windowed MTP support
 template<int KV_BITS, bool IS_TREE, bool IS_SPARSE = false>
 inline void qwen_gqa6_verify_splitk_p1_impl(
     const device half*   q_h,
     const device uchar*  k_cache,
     const device uchar*  v_cache,
-    const device float2* k_sb,
-    const device float2* v_sb,
-    device float*        part_o,
+    const device half2*  k_sb,
+    const device half2*  v_sb,
+    device half*         part_o,
     device float*        part_m,
     device float*        part_l,
     constant FullAttnParams& p,
@@ -6197,6 +6517,8 @@ inline void qwen_gqa6_verify_splitk_p1_impl(
     uint t_base = tgid.z * 8u;
     if (hkv >= p.Hkv || s >= p.num_splits || t_base >= p.M || sg >= 6u) return;
 
+    uint total_tiles = (p.kv_len + BK - 1u) / BK;
+    bool use_win = (!IS_SPARSE) && (p.win_recent > p.win_sink) && (p.win_recent < total_tiles);
     uint iter_start, iter_end;
     if (IS_SPARSE) {
         uint n_active        = active_counts[hkv];
@@ -6204,7 +6526,7 @@ inline void qwen_gqa6_verify_splitk_p1_impl(
         iter_start           = s * pages_per_split;
         iter_end             = min(n_active, (s + 1u) * pages_per_split);
     } else {
-        uint num_k_tiles     = (p.kv_len + BK - 1u) / BK;
+        uint num_k_tiles     = use_win ? (p.win_sink + (total_tiles - p.win_recent)) : total_tiles;
         uint tiles_per_split = (num_k_tiles + p.num_splits - 1u) / p.num_splits;
         iter_start           = s * tiles_per_split;
         iter_end             = min(num_k_tiles, (s + 1u) * tiles_per_split);
@@ -6242,7 +6564,8 @@ inline void qwen_gqa6_verify_splitk_p1_impl(
     const float scale_log2 = p.scale * 1.4426950408889634f;
 
     for (uint it = iter_start; it < iter_end; ++it) {
-        uint kb = IS_SPARSE ? (active_pages[(ulong)hkv * 1024ul + it] * BK) : (it * BK);
+        uint tile_idx = use_win ? ((it < p.win_sink) ? it : (p.win_recent + (it - p.win_sink))) : it;
+        uint kb = IS_SPARSE ? (active_pages[(ulong)hkv * 1024ul + it] * BK) : (tile_idx * BK);
         uint tile_k = min(BK, p.kv_len - kb);
         simdgroup_half8x8 s0 = make_filled_simdgroup_matrix<half, 8, 8>(0.0h);
         simdgroup_half8x8 s1 = make_filled_simdgroup_matrix<half, 8, 8>(0.0h);
@@ -6321,7 +6644,7 @@ inline void qwen_gqa6_verify_splitk_p1_impl(
                 float row_max = simd_max(score);
                 float m_old = m_row[rr], m_new = max(m_old, row_max);
                 float alpha = (m_old == -INFINITY || m_new == -INFINITY) ? 0.0f : exp2(m_old - m_new);
-                float p_val = valid ? exp2(score - m_new) : 0.0f;
+                float p_val = (valid && m_new != -INFINITY) ? exp2(score - m_new) : 0.0f;
                 l_row[rr] = fma(l_row[rr], alpha, simd_sum(p_val));
                 m_row[rr] = m_new;
                 sP[r][lane] = half(p_val);
@@ -6379,22 +6702,19 @@ inline void qwen_gqa6_verify_splitk_p1_impl(
     uint t = t_base + fm;
     if (t < p.M) {
         ulong slot = ((ulong)t * p.Hq + (hkv * 6u + h_loc)) * p.num_splits + s;
-        device float* po = part_o + slot * 256ul;
+        device half* po = part_o + slot * 256ul;
         #pragma clang loop unroll(full)
         for (uint j = 0; j < 16u; j++) {
             uint c0 = 8u * j + fn;
-            po[c0]      = float(O0[j].thread_elements()[0]);
-            po[c0 + 1u] = float(O0[j].thread_elements()[1]);
-            uint c1 = 128u + c0;
-            po[c1]      = float(O1[j].thread_elements()[0]);
-            po[c1 + 1u] = float(O1[j].thread_elements()[1]);
+            *(device half2*)(po + c0)        = half2(O0[j].thread_elements()[0], O0[j].thread_elements()[1]);
+            *(device half2*)(po + 128u + c0) = half2(O1[j].thread_elements()[0], O1[j].thread_elements()[1]);
         }
     }
 }
 
 kernel void qwen_gqa6_verify_splitk_p1_f16(
     const device half* q [[buffer(0)]], const device half* kc [[buffer(1)]], const device half* vc [[buffer(2)]],
-    device float* po [[buffer(3)]], device float* pm [[buffer(4)]], device float* pl [[buffer(5)]],
+    device half* po [[buffer(3)]], device float* pm [[buffer(4)]], device float* pl [[buffer(5)]],
     constant FullAttnParams& p [[buffer(6)]],
     uint3 tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]
@@ -6405,7 +6725,7 @@ kernel void qwen_gqa6_verify_splitk_p1_f16(
 
 kernel void qwen_gqa6_verify_splitk_p1_f16_tree(
     const device half* q [[buffer(0)]], const device half* kc [[buffer(1)]], const device half* vc [[buffer(2)]],
-    device float* po [[buffer(3)]], device float* pm [[buffer(4)]], device float* pl [[buffer(5)]],
+    device half* po [[buffer(3)]], device float* pm [[buffer(4)]], device float* pl [[buffer(5)]],
     constant FullAttnParams& p [[buffer(6)]], constant TreeParams& tp [[buffer(7)]],
     uint3 tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]
@@ -6416,8 +6736,8 @@ kernel void qwen_gqa6_verify_splitk_p1_f16_tree(
 
 kernel void qwen_gqa6_verify_splitk_p1_q8(
     const device half* q [[buffer(0)]], const device uchar* kc [[buffer(1)]], const device uchar* vc [[buffer(2)]],
-    const device float2* ksb [[buffer(3)]], const device float2* vsb [[buffer(4)]],
-    device float* po [[buffer(5)]], device float* pm [[buffer(6)]], device float* pl [[buffer(7)]],
+    const device half2* ksb [[buffer(3)]], const device half2* vsb [[buffer(4)]],
+    device half* po [[buffer(5)]], device float* pm [[buffer(6)]], device float* pl [[buffer(7)]],
     constant FullAttnParams& p [[buffer(8)]],
     uint3 tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]
@@ -6428,8 +6748,8 @@ kernel void qwen_gqa6_verify_splitk_p1_q8(
 
 kernel void qwen_gqa6_verify_splitk_p1_q8_tree(
     const device half* q [[buffer(0)]], const device uchar* kc [[buffer(1)]], const device uchar* vc [[buffer(2)]],
-    const device float2* ksb [[buffer(3)]], const device float2* vsb [[buffer(4)]],
-    device float* po [[buffer(5)]], device float* pm [[buffer(6)]], device float* pl [[buffer(7)]],
+    const device half2* ksb [[buffer(3)]], const device half2* vsb [[buffer(4)]],
+    device half* po [[buffer(5)]], device float* pm [[buffer(6)]], device float* pl [[buffer(7)]],
     constant FullAttnParams& p [[buffer(8)]], constant TreeParams& tp [[buffer(9)]],
     uint3 tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]
@@ -6440,8 +6760,8 @@ kernel void qwen_gqa6_verify_splitk_p1_q8_tree(
 
 kernel void qwen_gqa6_verify_splitk_p1_q4(
     const device half* q [[buffer(0)]], const device uchar* kc [[buffer(1)]], const device uchar* vc [[buffer(2)]],
-    const device float2* ksb [[buffer(3)]], const device float2* vsb [[buffer(4)]],
-    device float* po [[buffer(5)]], device float* pm [[buffer(6)]], device float* pl [[buffer(7)]],
+    const device half2* ksb [[buffer(3)]], const device half2* vsb [[buffer(4)]],
+    device half* po [[buffer(5)]], device float* pm [[buffer(6)]], device float* pl [[buffer(7)]],
     constant FullAttnParams& p [[buffer(8)]],
     uint3 tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]
@@ -6452,8 +6772,8 @@ kernel void qwen_gqa6_verify_splitk_p1_q4(
 
 kernel void qwen_gqa6_verify_splitk_p1_q4_tree(
     const device half* q [[buffer(0)]], const device uchar* kc [[buffer(1)]], const device uchar* vc [[buffer(2)]],
-    const device float2* ksb [[buffer(3)]], const device float2* vsb [[buffer(4)]],
-    device float* po [[buffer(5)]], device float* pm [[buffer(6)]], device float* pl [[buffer(7)]],
+    const device half2* ksb [[buffer(3)]], const device half2* vsb [[buffer(4)]],
+    device half* po [[buffer(5)]], device float* pm [[buffer(6)]], device float* pl [[buffer(7)]],
     constant FullAttnParams& p [[buffer(8)]], constant TreeParams& tp [[buffer(9)]],
     uint3 tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]
@@ -6491,13 +6811,117 @@ kernel void qwen_pack_q_pf_h(
 }
 
 template<int KV_BITS>
+__attribute__((always_inline)) inline void qwen_hier_ld256(
+    threadgroup half (&sKV)[32][264],
+    const device uchar* kv,
+    const device half2* sb,
+    uint kb, uint tile_k, uint kr, uint ch, uint Hkv, uint hkv
+) {
+    threadgroup half4* dst = (threadgroup half4*)(&sKV[kr][ch * 32u]);
+    if (kr < tile_k) {
+        ulong row = (ulong)(kb + kr) * Hkv + hkv;
+        if (KV_BITS == 16) {
+            const device uint4* hp = (const device uint4*)(kv + row * 512ul + ch * 64u);
+            threadgroup uint4* dst_u4 = (threadgroup uint4*)(&sKV[kr][ch * 32u]);
+            dst_u4[0] = hp[0]; dst_u4[1] = hp[1]; dst_u4[2] = hp[2]; dst_u4[3] = hp[3];
+        } else if (KV_BITS == 8) {
+            // Exact FP32 affine KV8 dequant from half2(scale, bias) + coalesced uint4 row bursts!
+            float2 s = float2(sb[row * 4ul + (ch >> 1)]);
+            float4 fs = float4(s.x), fb = float4(s.y);
+            const device uint4* qp = (const device uint4*)(kv + row * 256ul + ch * 32u);
+            uint4 u0 = qp[0], u1 = qp[1];
+            dst[0] = half4(fma(float4(as_type<uchar4>(u0.x)), fs, fb));
+            dst[1] = half4(fma(float4(as_type<uchar4>(u0.y)), fs, fb));
+            dst[2] = half4(fma(float4(as_type<uchar4>(u0.z)), fs, fb));
+            dst[3] = half4(fma(float4(as_type<uchar4>(u0.w)), fs, fb));
+            dst[4] = half4(fma(float4(as_type<uchar4>(u1.x)), fs, fb));
+            dst[5] = half4(fma(float4(as_type<uchar4>(u1.y)), fs, fb));
+            dst[6] = half4(fma(float4(as_type<uchar4>(u1.z)), fs, fb));
+            dst[7] = half4(fma(float4(as_type<uchar4>(u1.w)), fs, fb));
+        } else {
+            float2 s = float2(sb[row * 4ul + (ch >> 1)]);
+            float4 fs = float4(s.x), fb = float4(s.y);
+            const device uint4* qp = (const device uint4*)(kv + row * 128ul + (ch >> 1) * 32u);
+            uint4 u0 = qp[0], u1 = qp[1];
+            if ((ch & 1u) == 0u) {
+                dst[0] = half4(fma(float4(as_type<uchar4>(u0.x) & uchar4(0x0Fu)), fs, fb));
+                dst[1] = half4(fma(float4(as_type<uchar4>(u0.y) & uchar4(0x0Fu)), fs, fb));
+                dst[2] = half4(fma(float4(as_type<uchar4>(u0.z) & uchar4(0x0Fu)), fs, fb));
+                dst[3] = half4(fma(float4(as_type<uchar4>(u0.w) & uchar4(0x0Fu)), fs, fb));
+                dst[4] = half4(fma(float4(as_type<uchar4>(u1.x) & uchar4(0x0Fu)), fs, fb));
+                dst[5] = half4(fma(float4(as_type<uchar4>(u1.y) & uchar4(0x0Fu)), fs, fb));
+                dst[6] = half4(fma(float4(as_type<uchar4>(u1.z) & uchar4(0x0Fu)), fs, fb));
+                dst[7] = half4(fma(float4(as_type<uchar4>(u1.w) & uchar4(0x0Fu)), fs, fb));
+            } else {
+                dst[0] = half4(fma(float4(as_type<uchar4>(u0.x) >> uchar4(4u)), fs, fb));
+                dst[1] = half4(fma(float4(as_type<uchar4>(u0.y) >> uchar4(4u)), fs, fb));
+                dst[2] = half4(fma(float4(as_type<uchar4>(u0.z) >> uchar4(4u)), fs, fb));
+                dst[3] = half4(fma(float4(as_type<uchar4>(u0.w) >> uchar4(4u)), fs, fb));
+                dst[4] = half4(fma(float4(as_type<uchar4>(u1.x) >> uchar4(4u)), fs, fb));
+                dst[5] = half4(fma(float4(as_type<uchar4>(u1.y) >> uchar4(4u)), fs, fb));
+                dst[6] = half4(fma(float4(as_type<uchar4>(u1.z) >> uchar4(4u)), fs, fb));
+                dst[7] = half4(fma(float4(as_type<uchar4>(u1.w) >> uchar4(4u)), fs, fb));
+            }
+        }
+    } else {
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 8u; i++) dst[i] = half4(0.0h);
+    }
+}
+
+__attribute__((always_inline)) inline void qwen_hier_flush_qsub(
+    const thread simdgroup_half8x8 (&Oq)[8],
+    uint r_loc, uint h, uint t0, uint dq, uint fn,
+    bool first_chunk, bool is_last_chunk,
+    constant FullAttnParams& p,
+    const device float* gate,
+    device half* out,
+    device float* o_f32,
+    threadgroup const float (&sLg)[64],
+    threadgroup const float (&sAg)[64],
+    threadgroup const float (&sAc)[64]
+) {
+    uint gt = t0 + r_loc;
+    if (gt >= p.M) return;
+    ulong q_off = ((ulong)gt * p.Hq + h) * 256ul;
+    device float* og = o_f32 + q_off;
+    float ag = sAg[r_loc];
+    float ac = sAc[r_loc];
+    if (is_last_chunk) {
+        float inv_l = (sLg[r_loc] > 0.0f) ? (1.0f / sLg[r_loc]) : 0.0f;
+        const device float* gp = gate + q_off;
+        device half* op = out + q_off;
+        #pragma clang loop unroll(full)
+        for (uint j = 0; j < 8u; j++) {
+            uint c = dq * 64u + 8u * j + fn;
+            float2 cv = float2(float(Oq[j].thread_elements()[0]), float(Oq[j].thread_elements()[1]));
+            float2 vv = first_chunk ? (cv * ac) : fma(*(const device float2*)(og + c), float2(ag), cv * ac);
+            float2 gv = *(const device float2*)(gp + c);
+            *(device half2*)(op + c) = half2((vv.x * inv_l) * sigmoid_f32(gv.x),
+                                             (vv.y * inv_l) * sigmoid_f32(gv.y));
+        }
+    } else {
+        #pragma clang loop unroll(full)
+        for (uint j = 0; j < 8u; j++) {
+            uint c = dq * 64u + 8u * j + fn;
+            float2 cv = float2(float(Oq[j].thread_elements()[0]), float(Oq[j].thread_elements()[1]));
+            device float2* ogp = (device float2*)(og + c);
+            *ogp = first_chunk ? (cv * ac) : fma(*ogp, float2(ag), cv * ac);
+        }
+    }
+}
+
+// Single-Head Hierarchical FP16-AMX FlashAttention-2 Prefill (1 head x 64 Q-rows, zero register spill!)
+// 22.1 KB TG mem (2+ TGs/core), 4 barriers/tile (in-place sP[64][36] softmax overlapped with V-load),
+// exact FP32 KV8/KV4 dequant, CHUNK_K=1024 + vectorized float2/half2 flush!
+template<int KV_BITS>
 inline void qwen_gqa_prefill_flash_hier_impl(
     const device half*   q_h,
     const device float*  gate,
     const device uchar*  k_cache,
     const device uchar*  v_cache,
-    const device float2* k_sb,
-    const device float2* v_sb,
+    const device half2*  k_sb,
+    const device half2*  v_sb,
     device half*         out,
     device float*        o_f32, // scratch [M, Hq, 256] FP32 (reuses buf_split_o_)
     constant FullAttnParams& p,
@@ -6510,7 +6934,7 @@ inline void qwen_gqa_prefill_flash_hier_impl(
     threadgroup float (&sAg)[64],
     threadgroup float (&sAc)[64]
 ) {
-    constexpr uint BQ = 64u, BK = 32u, STR = 264u, CHUNK_K = 512u;
+    constexpr uint BQ = 64u, BK = 32u, STR = 264u, CHUNK_K = 1024u;
     uint gqa = p.Hq / p.Hkv;
     uint n_qt = (p.M + BQ - 1u) / BQ;
     uint M_pad = n_qt * BQ;
@@ -6531,38 +6955,6 @@ inline void qwen_gqa_prefill_flash_hier_impl(
     uint max_kv = p.pos + min(t0 + BQ, p.M);
     uint kr = tid >> 3, ch = tid & 7u;
 
-    auto ld256 = [&](const device uchar* kv, const device float2* sb, uint kb, uint tile_k) {
-        threadgroup half4* dst = (threadgroup half4*)(&sKV[kr][ch * 32u]);
-        if (kr < tile_k) {
-            ulong row = (ulong)(kb + kr) * p.Hkv + hkv;
-            if (KV_BITS == 16) {
-                const device half4* hp = (const device half4*)((const device half*)kv + row * 256ul + ch * 32u);
-                #pragma clang loop unroll(full)
-                for (uint i = 0; i < 8u; i++) dst[i] = hp[i];
-            } else if (KV_BITS == 8) {
-                float2 s = sb[row * 4ul + (ch >> 1)];
-                float4 fs = float4(s.x), fb = float4(s.y);
-                const device uchar4* qp = (const device uchar4*)(kv + row * 256ul + ch * 32u);
-                #pragma clang loop unroll(full)
-                for (uint i = 0; i < 8u; i++) dst[i] = half4(fma(float4(qp[i]), fs, fb));
-            } else {
-                float2 s = sb[row * 4ul + (ch >> 1)];
-                float4 fs = float4(s.x), fb = float4(s.y);
-                const device uchar4* qp = (const device uchar4*)(kv + row * 128ul + (ch >> 1) * 32u);
-                if ((ch & 1u) == 0u) {
-                    #pragma clang loop unroll(full)
-                    for (uint i = 0; i < 8u; i++) dst[i] = half4(fma(float4(qp[i] & uchar4(0x0Fu)), fs, fb));
-                } else {
-                    #pragma clang loop unroll(full)
-                    for (uint i = 0; i < 8u; i++) dst[i] = half4(fma(float4(qp[i] >> uchar4(4u)), fs, fb));
-                }
-            }
-        } else {
-            #pragma clang loop unroll(full)
-            for (uint i = 0; i < 8u; i++) dst[i] = half4(0.0h);
-        }
-    };
-
     bool first_chunk = true;
     for (uint kb_c = 0; kb_c < max_kv; kb_c += CHUNK_K) {
         uint kb_c_end = min(max_kv, kb_c + CHUNK_K);
@@ -6581,9 +6973,11 @@ inline void qwen_gqa_prefill_flash_hier_impl(
 
         for (uint kb = kb_c; kb < kb_c_end; kb += BK) {
             uint tile_k = min(BK, kb_c_end - kb);
-            ld256(k_cache, k_sb, kb, tile_k);
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+            // Phase 1: Load K tile into sKV
+            qwen_hier_ld256<KV_BITS>(sKV, k_cache, k_sb, kb, tile_k, kr, ch, p.Hkv, hkv);
+            threadgroup_barrier(mem_flags::mem_threadgroup); // Barrier #1
 
+            // Phase 2: QK^T -> write scores directly into sP[64][36] (disjoint from sKV -> saves 2 barriers/tile!)
             simdgroup_half8x8 s00 = make_filled_simdgroup_matrix<half,8,8>(0.0h), s01 = s00, s10 = s00, s11 = s00;
             #pragma clang loop unroll(full)
             for (uint kk = 0; kk < 256u; kk += 8u) {
@@ -6595,22 +6989,23 @@ inline void qwen_gqa_prefill_flash_hier_impl(
                 simdgroup_multiply_accumulate(s00, qa, ka, s00); simdgroup_multiply_accumulate(s01, qa, kb_m, s01);
                 simdgroup_multiply_accumulate(s10, qb, ka, s10); simdgroup_multiply_accumulate(s11, qb, kb_m, s11);
             }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            threadgroup half* sS = &sKV[0][0];
             uint r0 = qk_q + fm, r1 = qk_q + 8u + fm;
-            sS[r0*32u + qk_k + fn]    = s00.thread_elements()[0]; sS[r0*32u + qk_k + fn + 1u]    = s00.thread_elements()[1];
-            sS[r0*32u + qk_k + 8u+fn] = s01.thread_elements()[0]; sS[r0*32u + qk_k + 8u+fn + 1u] = s01.thread_elements()[1];
-            sS[r1*32u + qk_k + fn]    = s10.thread_elements()[0]; sS[r1*32u + qk_k + fn + 1u]    = s10.thread_elements()[1];
-            sS[r1*32u + qk_k + 8u+fn] = s11.thread_elements()[0]; sS[r1*32u + qk_k + 8u+fn + 1u] = s11.thread_elements()[1];
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+            sP[r0][qk_k + fn]      = s00.thread_elements()[0]; sP[r0][qk_k + fn + 1u]      = s00.thread_elements()[1];
+            sP[r0][qk_k + 8u + fn] = s01.thread_elements()[0]; sP[r0][qk_k + 8u + fn + 1u] = s01.thread_elements()[1];
+            sP[r1][qk_k + fn]      = s10.thread_elements()[0]; sP[r1][qk_k + fn + 1u]      = s10.thread_elements()[1];
+            sP[r1][qk_k + 8u + fn] = s11.thread_elements()[0]; sP[r1][qk_k + 8u + fn + 1u] = s11.thread_elements()[1];
+            threadgroup_barrier(mem_flags::mem_threadgroup); // Barrier #2 (syncs K reads + sP score writes)
+
+            // Phase 3: Load V into sKV CONCURRENT with in-place online softmax on sP[64][36]!
+            qwen_hier_ld256<KV_BITS>(sKV, v_cache, v_sb, kb, tile_k, kr, ch, p.Hkv, hkv);
 
             bool interior = full_q && (kb + BK <= p.pos + t0);
             if (interior) {
                 #pragma clang loop unroll(full)
                 for (uint rr = 0; rr < 8u; rr++) {
                     uint r = sg * 8u + rr;
-                    float sc = float(sS[r * 32u + lane]) * scale_log2;
+                    float sc = float(sP[r][lane]) * scale_log2;
                     float rm = simd_max(sc), mo = m_row[rr], mn = max(mo, rm);
                     float al = (kb == kb_c) ? 0.0f : exp2(mo - mn), pv = exp2(sc - mn);
                     l_row[rr] = fma(l_row[rr], al, simd_sum(pv)); m_row[rr] = mn;
@@ -6621,7 +7016,7 @@ inline void qwen_gqa_prefill_flash_hier_impl(
                 for (uint rr = 0; rr < 8u; rr++) {
                     uint r = sg * 8u + rr;
                     bool valid = (t0 + r < p.M) && (lane < tile_k) && (kb + lane <= p.pos + t0 + r);
-                    float sc = valid ? (float(sS[r * 32u + lane]) * scale_log2) : -INFINITY;
+                    float sc = valid ? (float(sP[r][lane]) * scale_log2) : -INFINITY;
                     float rm = simd_max(sc), mo = m_row[rr], mn = max(mo, rm);
                     float al = (mo == -INFINITY || mn == -INFINITY) ? 0.0f : exp2(mo - mn);
                     float pv = (valid && mn != -INFINITY) ? exp2(sc - mn) : 0.0f;
@@ -6629,11 +7024,9 @@ inline void qwen_gqa_prefill_flash_hier_impl(
                     sP[r][lane] = half(pv); if (lane == 0u) sA[r] = half(al);
                 }
             }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+            threadgroup_barrier(mem_flags::mem_threadgroup); // Barrier #3 (syncs V load + sP/sA writes)
 
-            ld256(v_cache, v_sb, kb, tile_k);
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
+            // Phase 4: Rescale O + PV
             uint rb = qh * 32u;
             half a0 = sA[rb+0u+fm], a1 = sA[rb+8u+fm], a2 = sA[rb+16u+fm], a3 = sA[rb+24u+fm];
             #pragma clang loop unroll(full)
@@ -6659,7 +7052,7 @@ inline void qwen_gqa_prefill_flash_hier_impl(
                     simdgroup_multiply_accumulate(O3[j], p3, vm, O3[j]);
                 }
             }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+            threadgroup_barrier(mem_flags::mem_threadgroup); // Barrier #4 (syncs V & sP reads)
         }
 
         if (lane == 0u) {
@@ -6680,39 +7073,10 @@ inline void qwen_gqa_prefill_flash_hier_impl(
 
         bool is_last_chunk = (kb_c_end >= max_kv);
         uint rb = qh * 32u;
-        for (uint q_sub = 0; q_sub < 4u; q_sub++) {
-            uint r_loc = rb + q_sub * 8u + fm;
-            uint gt = t0 + r_loc;
-            if (gt < p.M) {
-                ulong q_off = ((ulong)gt * p.Hq + h) * 256ul;
-                device float* og = o_f32 + q_off;
-                float ag = sAg[r_loc], ac = sAc[r_loc];
-                if (is_last_chunk) {
-                    float inv_l = (sLg[r_loc] > 0.0f) ? (1.0f / sLg[r_loc]) : 0.0f;
-                    const device float* gp = gate + q_off;
-                    device half* op = out + q_off;
-                    #pragma clang loop unroll(full)
-                    for (uint j = 0; j < 8u; j++) {
-                        uint c = dq * 64u + 8u * j + fn;
-                        float cv0 = float((q_sub==0u)?O0[j].thread_elements()[0]:((q_sub==1u)?O1[j].thread_elements()[0]:((q_sub==2u)?O2[j].thread_elements()[0]:O3[j].thread_elements()[0])));
-                        float cv1 = float((q_sub==0u)?O0[j].thread_elements()[1]:((q_sub==1u)?O1[j].thread_elements()[1]:((q_sub==2u)?O2[j].thread_elements()[1]:O3[j].thread_elements()[1])));
-                        float v0 = first_chunk ? (cv0 * ac) : fma(og[c],      ag, cv0 * ac);
-                        float v1 = first_chunk ? (cv1 * ac) : fma(og[c + 1u], ag, cv1 * ac);
-                        op[c]      = half((v0 * inv_l) * sigmoid_f32(gp[c]));
-                        op[c + 1u] = half((v1 * inv_l) * sigmoid_f32(gp[c + 1u]));
-                    }
-                } else {
-                    #pragma clang loop unroll(full)
-                    for (uint j = 0; j < 8u; j++) {
-                        uint c = dq * 64u + 8u * j + fn;
-                        float cv0 = float((q_sub==0u)?O0[j].thread_elements()[0]:((q_sub==1u)?O1[j].thread_elements()[0]:((q_sub==2u)?O2[j].thread_elements()[0]:O3[j].thread_elements()[0])));
-                        float cv1 = float((q_sub==0u)?O0[j].thread_elements()[1]:((q_sub==1u)?O1[j].thread_elements()[1]:((q_sub==2u)?O2[j].thread_elements()[1]:O3[j].thread_elements()[1])));
-                        og[c]      = first_chunk ? (cv0 * ac) : fma(og[c],      ag, cv0 * ac);
-                        og[c + 1u] = first_chunk ? (cv1 * ac) : fma(og[c + 1u], ag, cv1 * ac);
-                    }
-                }
-            }
-        }
+        qwen_hier_flush_qsub(O0, rb +  0u + fm, h, t0, dq, fn, first_chunk, is_last_chunk, p, gate, out, o_f32, sLg, sAg, sAc);
+        qwen_hier_flush_qsub(O1, rb +  8u + fm, h, t0, dq, fn, first_chunk, is_last_chunk, p, gate, out, o_f32, sLg, sAg, sAc);
+        qwen_hier_flush_qsub(O2, rb + 16u + fm, h, t0, dq, fn, first_chunk, is_last_chunk, p, gate, out, o_f32, sLg, sAg, sAc);
+        qwen_hier_flush_qsub(O3, rb + 24u + fm, h, t0, dq, fn, first_chunk, is_last_chunk, p, gate, out, o_f32, sLg, sAg, sAc);
         first_chunk = false;
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -6726,37 +7090,40 @@ kernel void qwen_gqa_prefill_flash_hier_f16_f16(
     uint2 tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]
 ) {
-    threadgroup half sKV[32][264], sP[64][36], sA[64];
+    threadgroup half  sKV[32][264], sP[64][36], sA[64];
     threadgroup float sMg[64], sLg[64], sAg[64], sAc[64];
-    qwen_gqa_prefill_flash_hier_impl<16>(q_h, gate, (const device uchar*)kc, (const device uchar*)vc, nullptr, nullptr, out, of32, p, tgid, tid, lane, sg, sKV, sP, sA, sMg, sLg, sAg, sAc);
+    qwen_gqa_prefill_flash_hier_impl<16>(q_h, gate, (const device uchar*)kc, (const device uchar*)vc, nullptr, nullptr, out, of32, p, tgid, tid, lane, sg,
+                                         sKV, sP, sA, sMg, sLg, sAg, sAc);
 }
 
 kernel void qwen_gqa_prefill_flash_hier_q8_f16(
     const device half*   q_h   [[buffer(0)]], const device float*  gate [[buffer(1)]],
     const device uchar*  kc    [[buffer(2)]], const device uchar*  vc   [[buffer(3)]],
-    const device float2* ksb   [[buffer(4)]], const device float2* vsb  [[buffer(5)]],
+    const device half2*  ksb   [[buffer(4)]], const device half2*  vsb  [[buffer(5)]],
     device half*         out   [[buffer(6)]], device float*        of32 [[buffer(7)]],
     constant FullAttnParams& p [[buffer(8)]],
     uint2 tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]
 ) {
-    threadgroup half sKV[32][264], sP[64][36], sA[64];
+    threadgroup half  sKV[32][264], sP[64][36], sA[64];
     threadgroup float sMg[64], sLg[64], sAg[64], sAc[64];
-    qwen_gqa_prefill_flash_hier_impl<8>(q_h, gate, kc, vc, ksb, vsb, out, of32, p, tgid, tid, lane, sg, sKV, sP, sA, sMg, sLg, sAg, sAc);
+    qwen_gqa_prefill_flash_hier_impl<8>(q_h, gate, kc, vc, ksb, vsb, out, of32, p, tgid, tid, lane, sg,
+                                        sKV, sP, sA, sMg, sLg, sAg, sAc);
 }
 
 kernel void qwen_gqa_prefill_flash_hier_q4_f16(
     const device half*   q_h   [[buffer(0)]], const device float*  gate [[buffer(1)]],
     const device uchar*  kc    [[buffer(2)]], const device uchar*  vc   [[buffer(3)]],
-    const device float2* ksb   [[buffer(4)]], const device float2* vsb  [[buffer(5)]],
+    const device half2*  ksb   [[buffer(4)]], const device half2*  vsb  [[buffer(5)]],
     device half*         out   [[buffer(6)]], device float*        of32 [[buffer(7)]],
     constant FullAttnParams& p [[buffer(8)]],
     uint2 tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]
 ) {
-    threadgroup half sKV[32][264], sP[64][36], sA[64];
+    threadgroup half  sKV[32][264], sP[64][36], sA[64];
     threadgroup float sMg[64], sLg[64], sAg[64], sAc[64];
-    qwen_gqa_prefill_flash_hier_impl<4>(q_h, gate, kc, vc, ksb, vsb, out, of32, p, tgid, tid, lane, sg, sKV, sP, sA, sMg, sLg, sAg, sAc);
+    qwen_gqa_prefill_flash_hier_impl<4>(q_h, gate, kc, vc, ksb, vsb, out, of32, p, tgid, tid, lane, sg,
+                                        sKV, sP, sA, sMg, sLg, sAg, sAc);
 }
 
 // ============================================================================
@@ -6784,7 +7151,7 @@ struct QuestParams {
 template<int KV_BITS>
 inline void qwen_quest_build_bounds_impl(
     const device uchar*  kc,
-    const device float2* ksb,
+    const device half2*  ksb,
     device half2*        k_bounds,
     constant QuestParams& p,
     uint2 tgid, uint tid
@@ -6802,10 +7169,10 @@ inline void qwen_quest_build_bounds_impl(
         if (KV_BITS == 16) {
             v = float(((const device half*)kc)[row * 256ul + d]);
         } else if (KV_BITS == 8) {
-            float2 sb = ksb[row * 4ul + (d >> 6)];
+            float2 sb = float2(ksb[row * 4ul + (d >> 6)]);
             v = fma(float(kc[row * 256ul + d]), sb.x, sb.y);
         } else {
-            float2 sb = ksb[row * 4ul + (d >> 6)];
+            float2 sb = float2(ksb[row * 4ul + (d >> 6)]);
             uint grp = d >> 6, off = d & 63u;
             uchar b = kc[row * 128ul + grp * 32u + (off & 31u)];
             uint qv = (off < 32u) ? (b & 0x0Fu) : (b >> 4u);
@@ -6823,12 +7190,12 @@ kernel void qwen_quest_build_bounds_f16(
 ) { qwen_quest_build_bounds_impl<16>((const device uchar*)kc, nullptr, kb, p, tgid, tid); }
 
 kernel void qwen_quest_build_bounds_q8(
-    const device uchar* kc [[buffer(0)]], const device float2* ksb [[buffer(1)]], device half2* kb [[buffer(2)]],
+    const device uchar* kc [[buffer(0)]], const device half2* ksb [[buffer(1)]], device half2* kb [[buffer(2)]],
     constant QuestParams& p [[buffer(3)]], uint2 tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]
 ) { qwen_quest_build_bounds_impl<8>(kc, ksb, kb, p, tgid, tid); }
 
 kernel void qwen_quest_build_bounds_q4(
-    const device uchar* kc [[buffer(0)]], const device float2* ksb [[buffer(1)]], device half2* kb [[buffer(2)]],
+    const device uchar* kc [[buffer(0)]], const device half2* ksb [[buffer(1)]], device half2* kb [[buffer(2)]],
     constant QuestParams& p [[buffer(3)]], uint2 tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]
 ) { qwen_quest_build_bounds_impl<4>(kc, ksb, kb, p, tgid, tid); }
 
@@ -7033,7 +7400,7 @@ kernel void qwen_quest_select_topk(
 #define DEF_GQA6_M1_SP_F16(NAME, IS_TREE, TP_ARG, TP_PTR, AP_IDX, AC_IDX) \
 kernel void NAME( \
     const device float* q [[buffer(0)]], const device half* kc [[buffer(1)]], const device half* vc [[buffer(2)]], \
-    device float* po [[buffer(3)]], device float* pm [[buffer(4)]], device float* pl [[buffer(5)]], \
+    device half* po [[buffer(3)]], device float* pm [[buffer(4)]], device float* pl [[buffer(5)]], \
     constant FullAttnParams& p [[buffer(6)]] TP_ARG, \
     const device uint* ap [[buffer(AP_IDX)]], const device uint* ac [[buffer(AC_IDX)]], \
     uint2 tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], \
@@ -7045,8 +7412,8 @@ kernel void NAME( \
 #define DEF_GQA6_M1_SP_Q(NAME, BITS, IS_TREE, TP_ARG, TP_PTR, AP_IDX, AC_IDX) \
 kernel void NAME( \
     const device float* q [[buffer(0)]], const device uchar* kc [[buffer(1)]], const device uchar* vc [[buffer(2)]], \
-    const device float2* ksb [[buffer(3)]], const device float2* vsb [[buffer(4)]], \
-    device float* po [[buffer(5)]], device float* pm [[buffer(6)]], device float* pl [[buffer(7)]], \
+    const device half2* ksb [[buffer(3)]], const device half2* vsb [[buffer(4)]], \
+    device half* po [[buffer(5)]], device float* pm [[buffer(6)]], device float* pl [[buffer(7)]], \
     constant FullAttnParams& p [[buffer(8)]] TP_ARG, \
     const device uint* ap [[buffer(AP_IDX)]], const device uint* ac [[buffer(AC_IDX)]], \
     uint2 tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], \
@@ -7058,7 +7425,7 @@ kernel void NAME( \
 #define DEF_GQA6_M2_SP_F16(NAME, IS_TREE, TP_ARG, TP_PTR, AP_IDX, AC_IDX) \
 kernel void NAME( \
     const device half* q [[buffer(0)]], const device half* kc [[buffer(1)]], const device half* vc [[buffer(2)]], \
-    device float* po [[buffer(3)]], device float* pm [[buffer(4)]], device float* pl [[buffer(5)]], \
+    device half* po [[buffer(3)]], device float* pm [[buffer(4)]], device float* pl [[buffer(5)]], \
     constant FullAttnParams& p [[buffer(6)]] TP_ARG, \
     const device uint* ap [[buffer(AP_IDX)]], const device uint* ac [[buffer(AC_IDX)]], \
     uint2 tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], \
@@ -7070,8 +7437,8 @@ kernel void NAME( \
 #define DEF_GQA6_M2_SP_Q(NAME, BITS, IS_TREE, TP_ARG, TP_PTR, AP_IDX, AC_IDX) \
 kernel void NAME( \
     const device half* q [[buffer(0)]], const device uchar* kc [[buffer(1)]], const device uchar* vc [[buffer(2)]], \
-    const device float2* ksb [[buffer(3)]], const device float2* vsb [[buffer(4)]], \
-    device float* po [[buffer(5)]], device float* pm [[buffer(6)]], device float* pl [[buffer(7)]], \
+    const device half2* ksb [[buffer(3)]], const device half2* vsb [[buffer(4)]], \
+    device half* po [[buffer(5)]], device float* pm [[buffer(6)]], device float* pl [[buffer(7)]], \
     constant FullAttnParams& p [[buffer(8)]] TP_ARG, \
     const device uint* ap [[buffer(AP_IDX)]], const device uint* ac [[buffer(AC_IDX)]], \
     uint2 tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], \
@@ -7083,7 +7450,7 @@ kernel void NAME( \
 #define DEF_GQA6_M4_SP_F16(NAME, IS_TREE, TP_ARG, TP_PTR, AP_IDX, AC_IDX) \
 kernel void NAME( \
     const device half* q [[buffer(0)]], const device half* kc [[buffer(1)]], const device half* vc [[buffer(2)]], \
-    device float* po [[buffer(3)]], device float* pm [[buffer(4)]], device float* pl [[buffer(5)]], \
+    device half* po [[buffer(3)]], device float* pm [[buffer(4)]], device float* pl [[buffer(5)]], \
     constant FullAttnParams& p [[buffer(6)]] TP_ARG, \
     const device uint* ap [[buffer(AP_IDX)]], const device uint* ac [[buffer(AC_IDX)]], \
     uint2 tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], \
@@ -7095,8 +7462,8 @@ kernel void NAME( \
 #define DEF_GQA6_M4_SP_Q(NAME, BITS, IS_TREE, TP_ARG, TP_PTR, AP_IDX, AC_IDX) \
 kernel void NAME( \
     const device half* q [[buffer(0)]], const device uchar* kc [[buffer(1)]], const device uchar* vc [[buffer(2)]], \
-    const device float2* ksb [[buffer(3)]], const device float2* vsb [[buffer(4)]], \
-    device float* po [[buffer(5)]], device float* pm [[buffer(6)]], device float* pl [[buffer(7)]], \
+    const device half2* ksb [[buffer(3)]], const device half2* vsb [[buffer(4)]], \
+    device half* po [[buffer(5)]], device float* pm [[buffer(6)]], device float* pl [[buffer(7)]], \
     constant FullAttnParams& p [[buffer(8)]] TP_ARG, \
     const device uint* ap [[buffer(AP_IDX)]], const device uint* ac [[buffer(AC_IDX)]], \
     uint2 tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], \
@@ -7108,7 +7475,7 @@ kernel void NAME( \
 #define DEF_GQA6_V_SP_F16(NAME, IS_TREE, TP_ARG, TP_PTR, AP_IDX, AC_IDX) \
 kernel void NAME( \
     const device half* q [[buffer(0)]], const device half* kc [[buffer(1)]], const device half* vc [[buffer(2)]], \
-    device float* po [[buffer(3)]], device float* pm [[buffer(4)]], device float* pl [[buffer(5)]], \
+    device half* po [[buffer(3)]], device float* pm [[buffer(4)]], device float* pl [[buffer(5)]], \
     constant FullAttnParams& p [[buffer(6)]] TP_ARG, \
     const device uint* ap [[buffer(AP_IDX)]], const device uint* ac [[buffer(AC_IDX)]], \
     uint3 tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], \
@@ -7120,8 +7487,8 @@ kernel void NAME( \
 #define DEF_GQA6_V_SP_Q(NAME, BITS, IS_TREE, TP_ARG, TP_PTR, AP_IDX, AC_IDX) \
 kernel void NAME( \
     const device half* q [[buffer(0)]], const device uchar* kc [[buffer(1)]], const device uchar* vc [[buffer(2)]], \
-    const device float2* ksb [[buffer(3)]], const device float2* vsb [[buffer(4)]], \
-    device float* po [[buffer(5)]], device float* pm [[buffer(6)]], device float* pl [[buffer(7)]], \
+    const device half2* ksb [[buffer(3)]], const device half2* vsb [[buffer(4)]], \
+    device half* po [[buffer(5)]], device float* pm [[buffer(6)]], device float* pl [[buffer(7)]], \
     constant FullAttnParams& p [[buffer(8)]] TP_ARG, \
     const device uint* ap [[buffer(AP_IDX)]], const device uint* ac [[buffer(AC_IDX)]], \
     uint3 tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], \

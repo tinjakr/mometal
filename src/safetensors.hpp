@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #ifdef __OBJC__
@@ -53,7 +54,7 @@ struct MappedShard {
     size_t file_size = 0;
     size_t mapped_size = 0;
     id mtl_buffer = nil; // id<MTLBuffer> (whole-shard buffer when no skip_prefixes)
-    std::vector<MappedSubRange> sub_ranges; // selective page-aligned Metal sub-buffers when skip_prefixes used
+    std::vector<MappedSubRange> sub_ranges; // selective page-aligned Metal sub-buffers when filtering
 };
 
 class SafetensorsStore {
@@ -64,10 +65,14 @@ public:
     SafetensorsStore(const SafetensorsStore&) = delete;
     SafetensorsStore& operator=(const SafetensorsStore&) = delete;
 
-    // Load a model directory (reads model.safetensors.index.json if present, else all *.safetensors)
-    // Skips tensors whose names match any skip_prefix (NEVER faults or Metal-maps skipped tensor pages!)
+    // Load a model directory (reads model.safetensors.index.json if present, else all *.safetensors).
+    // Parallelizes multi-shard mmap + Metal mapping; skips tensors matching any skip_prefix.
     void load_dir(id device, const std::string& dir, const std::vector<std::string>& skip_prefixes = {},
                   bool prefetch_now = true);
+
+    // Load ONLY tensors matching at least one include_prefix (zero mmap/wiring of non-matching shards/tensors).
+    void load_dir_only(id device, const std::string& dir, const std::vector<std::string>& include_prefixes,
+                       bool prefetch_now = true);
 
     // Load a single .safetensors file (e.g., mtp.safetensors)
     void load_file(id device, const std::string& path, const std::string& key_prefix = "",
@@ -92,6 +97,44 @@ private:
     std::unordered_map<std::string, TensorView> tensors_;
     std::vector<std::pair<uintptr_t, uintptr_t>> evicted_ranges_;
     size_t total_mapped_bytes_ = 0;
+};
+
+// Zero-Metal-wiring CPU-only read-only mmap reader for Q4_g64 embedding tables (e.g. embed_tokens).
+// Never creates an MTLBuffer or calls MADV_WILLNEED, so untouched vocab rows stay un-faulted & unwired!
+class CpuMmapQ4Weight {
+public:
+    CpuMmapQ4Weight() = default;
+    ~CpuMmapQ4Weight();
+
+    CpuMmapQ4Weight(const CpuMmapQ4Weight&) = delete;
+    CpuMmapQ4Weight& operator=(const CpuMmapQ4Weight&) = delete;
+
+    // Open <prefix>.weight / .scales / .biases from model_dir (index.json or model.safetensors)
+    bool open(const std::string& model_dir, const std::string& prefix);
+    void close();
+
+    bool valid() const { return w_ptr_ != nullptr; }
+    uint32_t out_dim() const { return out_dim_; }
+    uint32_t in_dim() const { return in_dim_; }
+
+    // Dequantize M requested rows into contiguous float32 out_f32[M * in_dim] using ARM NEON
+    void gather_f32(const int* token_ids, int M, float* out_f32) const;
+
+private:
+    struct RawMap {
+        std::string path;
+        void* ptr = nullptr;
+        size_t size = 0;
+    };
+    std::vector<RawMap> maps_;
+    const uint32_t* w_ptr_ = nullptr;
+    const uint8_t*  s_ptr_ = nullptr;
+    const uint8_t*  b_ptr_ = nullptr;
+    DType s_dtype_ = DType::BF16;
+    DType b_dtype_ = DType::BF16;
+    uint32_t out_dim_ = 0;
+    uint32_t in_dim_ = 0;
+    uint32_t groups_per_row_ = 0;
 };
 
 DType parse_dtype(const std::string& s);

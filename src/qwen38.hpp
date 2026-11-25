@@ -107,8 +107,8 @@ private:
         // Full attention KV cache (FP16 or 8/4-bit group-64 affine quantized)
         id k_cache = nil;    // f16 / u8 / u4 [max_seq, Hkv, D]
         id v_cache = nil;    // f16 / u8 / u4 [max_seq, Hkv, D]
-        id k_sb = nil;       // float2 [max_seq, Hkv, D/64] (scale, bias) when kv_bits < 16
-        id v_sb = nil;       // float2 [max_seq, Hkv, D/64] (scale, bias) when kv_bits < 16
+        id k_sb = nil;       // half2 [max_seq, Hkv, D/64] (scale, bias) when kv_bits < 16
+        id v_sb = nil;       // half2 [max_seq, Hkv, D/64] (scale, bias) when kv_bits < 16
         // Optional Quest query-aware block-sparse K min/max bounds (allocated ONLY when sparse_kv_budget_ > 0)
         id k_bounds = nil;   // half2 [max_pages, Hkv, D] (k_min, k_max) per 32-token page
         int quest_built_pages = 0;
@@ -125,6 +125,9 @@ private:
     MetalContext& ctx_;
     SafetensorsStore store_;
     SafetensorsStore mtp_store_;
+    SafetensorsStore embed_store_; // Dedicated un-prefetched store for embed_tokens when MTP GPU drafting is active
+    CpuMmapQ4Weight cpu_embed_;    // Zero-Metal-wiring CPU Q4 mmap embedder when !mtp_loaded_ (-682 MiB wired RAM!)
+    bool use_cpu_embed_ = false;
     ModelInfo info_;
 
     // Hyperparameters
@@ -147,6 +150,7 @@ private:
     int max_seq_len_ = 8192;
     int kv_cap_ = 0; // Round 33: Lazy KV capacity grown on demand up to max_seq_len_!
     int kv_bits_ = 16; // 16 (FP16), 8 (Q8_G64), or 4 (Q4_G64)
+    int mtp_kv_bits_ = 4; // Lossless KV4 for 1-layer MTP drafter (independent of target kv_bits_!)
     int sparse_kv_budget_ = 0; // Optional Quest block-sparse decode budget (0 = exact dense)
     static constexpr uint32_t QUEST_PAGE_SIZE = 32u;
     static constexpr uint32_t QUEST_SINK_PAGES = 4u;        // 128 sink tokens
@@ -154,9 +158,12 @@ private:
     static constexpr uint32_t QUEST_MAX_ACTIVE_PAGES = 1024u;
     static constexpr uint32_t QUEST_SCORE_STRIDE = 8192u;   // up to 262k context pages
     int chunk_size_ = 512;
+    int ane_min_ = 176;
     int pos_ = 0;
     int rope_delta_ = 0;
     int image_token_id_ = 248056;
+    uint32_t special_tok_lo_ = 248000u;
+    std::vector<uint32_t> special_tok_ids_;
 
     // Model weights & state
     Q4Weight embed_tokens_;
@@ -197,7 +204,7 @@ private:
     id buf_bs_top2_     = nil; // private ArgmaxOut [8, 4096] (256 KB L2-resident fused top-2!)
     id buf_bs_cands_    = nil; // private uint [8, 256]
     id buf_bs_cand_cnt_ = nil; // private uint [8]
-    id buf_bs_extra_    = nil; // shared uint [64] (special + session IDs >= bs_vocab)
+    id buf_bs_extra_    = nil; // shared uint [128] (special + session IDs >= bs_vocab)
     int mtp_pos_ = 0;
     bool mtp_seeded_ = false;
     int mtp_seed_token_ = 0;
@@ -210,18 +217,16 @@ private:
     std::vector<PldSlot> pld3_;
     SuffixCache suffix_cache_;
     MtpWeights mtp_;
-    id mtp_k_cache_ = nil;        // f16 / u8 / u4 [max_seq, Hkv, head_dim]
-    id mtp_v_cache_ = nil;        // f16 / u8 / u4 [max_seq, Hkv, head_dim]
-    id mtp_k_sb_ = nil;           // float2 [max_seq, Hkv, head_dim/64] when kv_bits < 16
-    id mtp_v_sb_ = nil;           // float2 [max_seq, Hkv, head_dim/64] when kv_bits < 16
+    id mtp_k_cache_ = nil;        // u4 / f16 [max_seq, Hkv, head_dim]
+    id mtp_v_cache_ = nil;        // u4 / f16 [max_seq, Hkv, head_dim]
+    id mtp_k_sb_ = nil;           // half2 [max_seq, Hkv, head_dim/64] when mtp_kv_bits_ < 16
+    id mtp_v_sb_ = nil;           // half2 [max_seq, Hkv, head_dim/64] when mtp_kv_bits_ < 16
     id mtp_k_bounds_ = nil;       // half2 [max_pages, Hkv, head_dim] when sparse_kv_budget_ > 0
     int mtp_quest_built_pages_ = 0;
     id buf_mtp_seed_hid_ = nil;   // private f32 [hidden]
     id buf_mtp_last_hid_ = nil;   // private f32 [hidden] (last target normed hidden from forward)
     id buf_mtp_verify_hid_ = nil; // private f32 [MAX_VERIFY, hidden]
     id buf_mtp_in_hid_ = nil;     // private f32 [chunk_size + 1, hidden]
-    id buf_mtp_concat_ = nil;     // private f32 [chunk_size, 2*hidden]
-    id buf_mtp_emb_ = nil;        // private f32 [chunk_size, hidden]
     id buf_mtp_logits_ = nil;     // shared f32 [MAX_VERIFY, vocab_size] (verify batch logits)
     id buf_mtp_argmax_ = nil;     // shared uint32 [MAX_VERIFY]
     id buf_mtp_sync_ids_ = nil;   // shared int [MAX_VERIFY + 2] for single-CB deferred sync
@@ -256,6 +261,11 @@ private:
     uint32_t pending_path_len_ = 0;
     uint32_t pending_path_[16] = {};
     TreeParams cur_tree_{};
+    id buf_tree_params_ = nil;   // shared 256B TreeParams buffer for pre-encoded CB #2b!
+    float ema_cb2_ms_[2] = {0.0f, 0.0f}; // live GPU ms EMA (base non-attn) for [0]=M=4, [1]=M=8
+    int last_t7_m_ = 0;
+    bool last_t7_tree_ = false;
+    bool ane_share_nonuniform_lut_ = false;
     static TreeParams make_tree_params(const int* parents, int n_nodes, uint32_t mask_base_pos = 0);
     // Ping-pong MAX_VERIFY-token record buffers for Lazy Fused GDN Replay (ZERO bak_ssm_state_ -> saves 66 MB RAM!)
     std::vector<id> rec_qkv_[2]; // f32 [MAX_VERIFY, conv_dim] per linear layer
@@ -285,7 +295,8 @@ private:
     size_t cur_vis_rows_off_ = 0;
     uint32_t cur_vis_count_ = 0;
 
-    // Pre-allocated GPU scratch arena
+    // Pre-allocated GPU scratch arena (placement heap aliases mutually-disjoint Attn/GDN, MLP, and MTP scratch!)
+    id scratch_heap_ = nil;
     id buf_token_ids_ = nil;
     id buf_hidden_ = nil;
     id buf_normed_ = nil;
@@ -305,6 +316,8 @@ private:
     id buf_mlp_gate_ = nil;
     id buf_mlp_up_ = nil;
     id buf_split_o_ = nil;
+    id buf_mtp_concat_ = nil;     // heap-placed private f32 [chunk_size, 2*hidden]
+    id buf_mtp_emb_ = nil;        // heap-placed private f32 [chunk_size, hidden]
     id buf_split_m_ = nil;
     id buf_split_l_ = nil;
     id buf_quest_scores_ = nil; // private float [Hkv*7, QUEST_SCORE_STRIDE] when sparse_kv_budget_ > 0
@@ -358,13 +371,17 @@ private:
     id pso_gdn_rec_tree_ = nil;
     id pso_gdn_rec_lazy_ = nil;
     id pso_gdn_rec_tree_lazy_ = nil;
+    id pso_gdn_rec_tree_lazy_s1_ = nil;
+    id pso_gdn_rec_tree_lazy_s2_ = nil;
     id pso_gdn_norm_ = nil;
     id pso_gdn_norm_f16_ = nil;
     id pso_fa_q_prep_ = nil;
+    id pso_fa_q_prep_hier_ = nil;
     id pso_fa_q_prep_tree_ = nil;
     id pso_fa_kv_prep_ = nil;
     id pso_fa_kv_prep_tree_ = nil;
     id pso_fa_q_prep_mrope_ = nil;
+    id pso_fa_q_prep_mrope_hier_ = nil;
     id pso_fa_kv_prep_mrope_ = nil;
     id pso_scatter_embeds_ = nil;
     id pso_fa_attn_ = nil;
@@ -414,6 +431,21 @@ private:
     id pso_fa_gqa6_m4_q_tree_ = nil;
     id pso_fa_gqa6_v_q_ = nil;
     id pso_fa_gqa6_v_q_tree_ = nil;
+    // Dedicated lossless KV4 pipelines for 1-layer MTP drafter (independent of target kv_bits_!)
+    id pso_mtp_kv_prep_ = nil;
+    id pso_mtp_kv_prep_tree_ = nil;
+    id pso_mtp_attn_f16_ = nil;
+    id pso_mtp_attn_tree_f16_ = nil;
+    id pso_mtp_vsplit1_ = nil;
+    id pso_mtp_vsplit1_tree_ = nil;
+    id pso_mtp_gqa6_m1_ = nil;
+    id pso_mtp_gqa6_m1_tree_ = nil;
+    id pso_mtp_gqa6_m2_ = nil;
+    id pso_mtp_gqa6_m2_tree_ = nil;
+    id pso_mtp_gqa6_m4_ = nil;
+    id pso_mtp_gqa6_m4_tree_ = nil;
+    id pso_mtp_gqa6_v_ = nil;
+    id pso_mtp_gqa6_v_tree_ = nil;
     // Quest query-aware block-sparse decode pipelines (loaded ONLY when sparse_kv_budget_ > 0)
     id pso_quest_build_bounds_ = nil;
     id pso_quest_score_pages_ = nil;
@@ -444,10 +476,15 @@ private:
     id pso_ane_add_norm_f16_ = nil;
     id pso_ane_hf4_swiglu_bf16_ = nil;
     id pso_ane_hf4_swiglu_m1_ = nil;
+    id pso_ane_hf4_swiglu_m4_ = nil;
     id pso_ane_hf4_down_sk_bf16_ = nil;
+    id pso_ane_hf4_down_sk4_bf16_ = nil;
     id pso_ane_hf4_down_m1_sk_ = nil;
+    id pso_ane_hf4_down_sk_m4_ = nil;
     id pso_ane_hf4_tiled_gateup_ = nil;
     id pso_ane_hf4_tiled_down_ = nil;
+    id pso_ane_hf4_swiglu_tiled32_ = nil;
+    id pso_ane_hf4_down_tiled32_sk_ = nil;
     id pso_lmh_build_bitscreen_ = nil;
     id pso_bs_quant_x_ = nil;
     id pso_bs_score_b1_ = nil;
@@ -460,6 +497,8 @@ private:
 
     Q4Weight load_q4(const SafetensorsStore& st, const std::string& prefix);
     void ensure_kv_capacity(int needed);
+    void shrink_kv_capacity(int target_cap);
+    void encode_ane_tail_mlp(id enc, const LayerWeights& lw, id hid_buf, size_t tail_hid_off, uint32_t gm);
     void init_draft_row_map();
     void reset_draft_row_map();
     void add_draft_token(int tok);
@@ -478,7 +517,8 @@ private:
     void encode_full_attn_layer(id enc, const LayerWeights& lw, id k_cache, id v_cache,
                                 uint32_t M, int start_pos, id k_sb = nil, id v_sb = nil,
                                 bool skip_input_norm = false, const TensorView* next_norm = nullptr,
-                                id dual_out_f32 = nil, id k_bounds = nil, int* quest_built_pages = nullptr);
+                                id dual_out_f32 = nil, id k_bounds = nil, int* quest_built_pages = nullptr,
+                                bool is_mtp = false, bool use_tree_buf = false);
     struct DraftSampleSpec {
         float temp = 0.0f;
         uint64_t seed = 0;
@@ -489,7 +529,8 @@ private:
     };
 
     void encode_chunk(id enc, int M, int start_pos, bool compute_logits, bool compute_argmax,
-                      bool verify_all_logits = false, bool record_gdn = false, float compact_margin = 0.0f);
+                      bool verify_all_logits = false, bool record_gdn = false, float compact_margin = 0.0f,
+                      bool use_tree_buf = false);
     void encode_final_norm_and_mtp(id enc, id hid_buf, id tok_buf, size_t tok_off, uint32_t M, int start_pos,
                                    bool compute_logits, bool compute_argmax);
     void forward_ane_chunk(const int* tokens, int n_chunk, bool is_last, bool compute_argmax,

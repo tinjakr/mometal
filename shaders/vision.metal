@@ -6,6 +6,28 @@ inline float bf16_to_f32(ushort bits) {
     return as_type<float>(uint(bits) << 16);
 }
 
+inline ushort f32_to_bf16_rne(float v) {
+    uint u = as_type<uint>(v);
+    uint r = u + 0x7FFFu + ((u >> 16) & 1u);
+    return ushort(r >> 16);
+}
+
+#if __METAL_VERSION__ >= 310
+#define VIS_HAS_NATIVE_BF16 1
+typedef bfloat  vis_bf16_t;
+typedef bfloat2 vis_bf16_2;
+inline float      vis_bf16_to_f32(vis_bf16_t v)             { return float(v); }
+inline vis_bf16_t vis_f32_to_bf16(float v)                  { return bfloat(v); }
+inline vis_bf16_2 vis_f32x2_to_bf16x2(float a, float b)     { return bfloat2(bfloat(a), bfloat(b)); }
+#else
+#define VIS_HAS_NATIVE_BF16 0
+typedef ushort  vis_bf16_t;
+typedef ushort2 vis_bf16_2;
+inline float      vis_bf16_to_f32(vis_bf16_t v)             { return bf16_to_f32(v); }
+inline vis_bf16_t vis_f32_to_bf16(float v)                  { return f32_to_bf16_rne(v); }
+inline vis_bf16_2 vis_f32x2_to_bf16x2(float a, float b)     { return ushort2(f32_to_bf16_rne(a), f32_to_bf16_rne(b)); }
+#endif
+
 inline float gelu_tanh_f32(float v) {
     // Clamp inner to [-15, 15] so fast-math tanh never overflows exp(2*x) -> NaN!
     float inner = clamp(0.7978845608028654f * (v + 0.044715f * v * v * v), -15.0f, 15.0f);
@@ -42,6 +64,7 @@ struct VisGemmParams {
     uint has_bias;
 };
 
+#if VIS_HAS_NATIVE_BF16
 template<int ACT, typename OutT>
 inline void vis_bf16_gemm_native_impl(
     const device bfloat* W,
@@ -220,6 +243,168 @@ kernel void vis_bf16_gemm_gelu_exact_f16x(
     threadgroup bfloat sB[64][36];
     vis_bf16_gemm_native_impl<2, bfloat>(W, bias, X, Y, p, tgid, tid, lane, sg, sA, sB);
 }
+#else
+// Metal 3.0 fallback for M1/M2 (Apple7/Apple8): BF16 stored as ushort, AMX via simdgroup_half8x8
+template<int ACT, typename OutT>
+inline void vis_bf16_gemm_m30_impl(
+    const device ushort* W,
+    const device ushort* bias,
+    const device ushort* X,
+    device OutT*         Y,
+    constant VisGemmParams& p,
+    uint2 tgid, uint tid, uint lane, uint sg,
+    threadgroup half (&sA)[64][36],
+    threadgroup half (&sB)[64][36]
+) {
+    uint m0 = tgid.y * 64u;
+    uint n0 = tgid.x * 64u;
+    if (m0 >= p.M || n0 >= p.N) return;
+
+    simdgroup_float8x8 acc[4][4];
+    #pragma clang loop unroll(full)
+    for (uint im = 0; im < 4u; im++)
+    #pragma clang loop unroll(full)
+    for (uint in_ = 0; in_ < 4u; in_++) {
+        acc[im][in_] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    }
+
+    uint sg_m  = (sg >> 1) * 32u;
+    uint sg_n  = (sg & 1u) * 32u;
+    uint r_loc = tid >> 1;
+    uint h_idx = tid & 1u;
+    uint c_blk = h_idx * 16u;
+
+    uint gm_ld = m0 + r_loc;
+    uint gn_ld = n0 + r_loc;
+    bool gm_ok = gm_ld < p.M;
+    bool gn_ok = gn_ld < p.N;
+
+    const device ushort* x_base = X + (ulong)(gm_ok ? gm_ld : 0u) * p.K;
+    const device ushort* w_base = W + (ulong)(gn_ok ? gn_ld : 0u) * p.K;
+
+    for (uint k0 = 0; k0 < p.K; k0 += 32u) {
+        uint k_rem = min(32u, p.K - k0);
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 16u; i++) {
+            uint kc = c_blk + i;
+            sA[r_loc][kc] = (gm_ok && kc < k_rem) ? half(bf16_to_f32(x_base[k0 + kc])) : half(0.0h);
+            sB[r_loc][kc] = (gn_ok && kc < k_rem) ? half(bf16_to_f32(w_base[k0 + kc])) : half(0.0h);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        #pragma clang loop unroll(full)
+        for (uint kk = 0; kk < 32u; kk += 8u) {
+            simdgroup_half8x8 a[4], b[4];
+            #pragma clang loop unroll(full)
+            for (uint im = 0; im < 4u; im++) simdgroup_load(a[im], &sA[sg_m + 8u * im][kk], 36);
+            #pragma clang loop unroll(full)
+            for (uint in_ = 0; in_ < 4u; in_++) simdgroup_load(b[in_], &sB[sg_n + 8u * in_][kk], 36, ulong2(0, 0), true);
+            #pragma clang loop unroll(full)
+            for (uint im = 0; im < 4u; im++)
+            #pragma clang loop unroll(full)
+            for (uint in_ = 0; in_ < 4u; in_++) {
+                simdgroup_multiply_accumulate(acc[im][in_], a[im], b[in_], acc[im][in_]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    uint qid = lane >> 2;
+    uint fm  = (qid & 4u) + ((lane >> 1) & 3u);
+    uint fn  = (qid & 2u) * 2u + (lane & 1u) * 2u;
+
+    #pragma clang loop unroll(full)
+    for (uint im = 0; im < 4u; im++) {
+        uint gm = m0 + sg_m + 8u * im + fm;
+        if (gm < p.M) {
+            device OutT* yr = Y + (ulong)gm * p.N;
+            #pragma clang loop unroll(full)
+            for (uint in_ = 0; in_ < 4u; in_++) {
+                uint gn0 = n0 + sg_n + 8u * in_ + fn;
+                float v0 = acc[im][in_].thread_elements()[0];
+                float v1 = acc[im][in_].thread_elements()[1];
+                if (p.has_bias) {
+                    if (gn0 < p.N)      v0 += bf16_to_f32(bias[gn0]);
+                    if (gn0 + 1u < p.N) v1 += bf16_to_f32(bias[gn0 + 1u]);
+                }
+                if (ACT == 1) {
+                    v0 = gelu_tanh_f32(v0);
+                    v1 = gelu_tanh_f32(v1);
+                    if (gn0 + 1u < p.N) {
+                        *((device ushort2*)(yr + gn0)) = ushort2(f32_to_bf16_rne(v0), f32_to_bf16_rne(v1));
+                    } else if (gn0 < p.N) {
+                        yr[gn0] = f32_to_bf16_rne(v0);
+                    }
+                } else if (ACT == 2) {
+                    v0 = gelu_exact_f32(v0);
+                    v1 = gelu_exact_f32(v1);
+                    if (gn0 + 1u < p.N) {
+                        *((device ushort2*)(yr + gn0)) = ushort2(f32_to_bf16_rne(v0), f32_to_bf16_rne(v1));
+                    } else if (gn0 < p.N) {
+                        yr[gn0] = f32_to_bf16_rne(v0);
+                    }
+                } else {
+                    if (gn0 + 1u < p.N) {
+                        device float2* yp = (device float2*)(yr + gn0);
+                        float2 vv = float2(v0, v1);
+                        *yp = p.add_residual ? (*yp + vv) : vv;
+                    } else if (gn0 < p.N) {
+                        yr[gn0] = p.add_residual ? (yr[gn0] + OutT(v0)) : OutT(v0);
+                    }
+                }
+            }
+        }
+    }
+}
+
+kernel void vis_bf16_gemm_f16x(
+    const device ushort* W    [[buffer(0)]],
+    const device ushort* bias [[buffer(1)]],
+    const device ushort* X    [[buffer(2)]],
+    device float*        Y    [[buffer(3)]],
+    constant VisGemmParams& p [[buffer(4)]],
+    uint2 tgid                [[threadgroup_position_in_grid]],
+    uint  tid                 [[thread_index_in_threadgroup]],
+    uint  lane                [[thread_index_in_simdgroup]],
+    uint  sg                  [[simdgroup_index_in_threadgroup]]
+) {
+    threadgroup half sA[64][36];
+    threadgroup half sB[64][36];
+    vis_bf16_gemm_m30_impl<0, float>(W, bias, X, Y, p, tgid, tid, lane, sg, sA, sB);
+}
+
+kernel void vis_bf16_gemm_gelu_tanh_f16x(
+    const device ushort* W    [[buffer(0)]],
+    const device ushort* bias [[buffer(1)]],
+    const device ushort* X    [[buffer(2)]],
+    device ushort*       Y    [[buffer(3)]],
+    constant VisGemmParams& p [[buffer(4)]],
+    uint2 tgid                [[threadgroup_position_in_grid]],
+    uint  tid                 [[thread_index_in_threadgroup]],
+    uint  lane                [[thread_index_in_simdgroup]],
+    uint  sg                  [[simdgroup_index_in_threadgroup]]
+) {
+    threadgroup half sA[64][36];
+    threadgroup half sB[64][36];
+    vis_bf16_gemm_m30_impl<1, ushort>(W, bias, X, Y, p, tgid, tid, lane, sg, sA, sB);
+}
+
+kernel void vis_bf16_gemm_gelu_exact_f16x(
+    const device ushort* W    [[buffer(0)]],
+    const device ushort* bias [[buffer(1)]],
+    const device ushort* X    [[buffer(2)]],
+    device ushort*       Y    [[buffer(3)]],
+    constant VisGemmParams& p [[buffer(4)]],
+    uint2 tgid                [[threadgroup_position_in_grid]],
+    uint  tid                 [[thread_index_in_threadgroup]],
+    uint  lane                [[thread_index_in_simdgroup]],
+    uint  sg                  [[simdgroup_index_in_threadgroup]]
+) {
+    threadgroup half sA[64][36];
+    threadgroup half sB[64][36];
+    vis_bf16_gemm_m30_impl<2, ushort>(W, bias, X, Y, p, tgid, tid, lane, sg, sA, sB);
+}
+#endif
 
 // ============================================================================
 // 2. Round 25: Fused Bilinear 2D PosEmbed Add + Block-0 LayerNorm (FP32 -> BF16)
@@ -232,21 +417,21 @@ struct VisNormParams {
 };
 
 kernel void vis_add_pos_and_norm_f16(
-    device float*        hid       [[buffer(0)]],
-    const device bfloat* pos_embed [[buffer(1)]],
-    const device int4*   pos_idx   [[buffer(2)]],
-    const device float4* pos_wt    [[buffer(3)]],
-    const device bfloat* weight    [[buffer(4)]],
-    const device bfloat* bias      [[buffer(5)]],
-    device bfloat*       out       [[buffer(6)]],
-    constant VisNormParams& p      [[buffer(7)]],
-    uint row                       [[threadgroup_position_in_grid]],
-    uint tid                       [[thread_position_in_threadgroup]],
-    uint tg_size                   [[threads_per_threadgroup]]
+    device float*            hid       [[buffer(0)]],
+    const device vis_bf16_t* pos_embed [[buffer(1)]],
+    const device int4*       pos_idx   [[buffer(2)]],
+    const device float4*     pos_wt    [[buffer(3)]],
+    const device vis_bf16_t* weight    [[buffer(4)]],
+    const device vis_bf16_t* bias      [[buffer(5)]],
+    device vis_bf16_t*       out       [[buffer(6)]],
+    constant VisNormParams& p          [[buffer(7)]],
+    uint row                           [[threadgroup_position_in_grid]],
+    uint tid                           [[thread_position_in_threadgroup]],
+    uint tg_size                       [[threads_per_threadgroup]]
 ) {
     if (row >= p.M) return;
-    device float*  hp = hid + (ulong)row * p.D;
-    device bfloat* op = out + (ulong)row * p.D;
+    device float*      hp = hid + (ulong)row * p.D;
+    device vis_bf16_t* op = out + (ulong)row * p.D;
     int4 idx = pos_idx[row];
     float4 wt = pos_wt[row];
 
@@ -260,10 +445,10 @@ kernel void vis_add_pos_and_norm_f16(
         for (uint k = 0; k < 5u; k++) {
             uint d = k * 256u + tid;
             if (d < p.D) {
-                float pe = float(pos_embed[(ulong)idx.x * p.D + d]) * wt.x
-                         + float(pos_embed[(ulong)idx.y * p.D + d]) * wt.y
-                         + float(pos_embed[(ulong)idx.z * p.D + d]) * wt.z
-                         + float(pos_embed[(ulong)idx.w * p.D + d]) * wt.w;
+                float pe = vis_bf16_to_f32(pos_embed[(ulong)idx.x * p.D + d]) * wt.x
+                         + vis_bf16_to_f32(pos_embed[(ulong)idx.y * p.D + d]) * wt.y
+                         + vis_bf16_to_f32(pos_embed[(ulong)idx.z * p.D + d]) * wt.z
+                         + vis_bf16_to_f32(pos_embed[(ulong)idx.w * p.D + d]) * wt.w;
                 float v = hp[d] + pe;
                 hp[d] = v;
                 vals[k] = v;
@@ -303,16 +488,16 @@ kernel void vis_add_pos_and_norm_f16(
         for (uint k = 0; k < 5u; k++) {
             uint d = k * 256u + tid;
             if (d < p.D) {
-                op[d] = bfloat((vals[k] - mean) * inv_std * float(weight[d]) + float(bias[d]));
+                op[d] = vis_f32_to_bf16((vals[k] - mean) * inv_std * vis_bf16_to_f32(weight[d]) + vis_bf16_to_f32(bias[d]));
             }
         }
     } else {
         float sum = 0.0f;
         for (uint d = tid; d < p.D; d += tg_size) {
-            float pe = float(pos_embed[(ulong)idx.x * p.D + d]) * wt.x
-                     + float(pos_embed[(ulong)idx.y * p.D + d]) * wt.y
-                     + float(pos_embed[(ulong)idx.z * p.D + d]) * wt.z
-                     + float(pos_embed[(ulong)idx.w * p.D + d]) * wt.w;
+            float pe = vis_bf16_to_f32(pos_embed[(ulong)idx.x * p.D + d]) * wt.x
+                     + vis_bf16_to_f32(pos_embed[(ulong)idx.y * p.D + d]) * wt.y
+                     + vis_bf16_to_f32(pos_embed[(ulong)idx.z * p.D + d]) * wt.z
+                     + vis_bf16_to_f32(pos_embed[(ulong)idx.w * p.D + d]) * wt.w;
             float v = hp[d] + pe;
             hp[d] = v;
             sum += v;
@@ -343,7 +528,7 @@ kernel void vis_add_pos_and_norm_f16(
         float inv_std = smem[0];
 
         for (uint d = tid; d < p.D; d += tg_size) {
-            op[d] = bfloat((hp[d] - mean) * inv_std * float(weight[d]) + float(bias[d]));
+            op[d] = vis_f32_to_bf16((hp[d] - mean) * inv_std * vis_bf16_to_f32(weight[d]) + vis_bf16_to_f32(bias[d]));
         }
     }
 }
@@ -353,18 +538,18 @@ kernel void vis_add_pos_and_norm_f16(
 // ============================================================================
 
 kernel void vis_layernorm_f16(
-    const device float*  x      [[buffer(0)]],
-    const device bfloat* weight [[buffer(1)]],
-    const device bfloat* bias   [[buffer(2)]],
-    device bfloat*       out    [[buffer(3)]],
-    constant VisNormParams& p   [[buffer(4)]],
-    uint row                    [[threadgroup_position_in_grid]],
-    uint tid                    [[thread_position_in_threadgroup]],
-    uint tg_size                [[threads_per_threadgroup]]
+    const device float*      x      [[buffer(0)]],
+    const device vis_bf16_t* weight [[buffer(1)]],
+    const device vis_bf16_t* bias   [[buffer(2)]],
+    device vis_bf16_t*       out    [[buffer(3)]],
+    constant VisNormParams& p       [[buffer(4)]],
+    uint row                        [[threadgroup_position_in_grid]],
+    uint tid                        [[thread_position_in_threadgroup]],
+    uint tg_size                    [[threads_per_threadgroup]]
 ) {
     if (row >= p.M) return;
     const device float* xp = x + (ulong)row * p.D;
-    device bfloat* op = out + (ulong)row * p.D;
+    device vis_bf16_t*  op = out + (ulong)row * p.D;
 
     threadgroup float smem[32];
     uint sg = tid >> 5, lane = tid & 31u, nsg = tg_size >> 5;
@@ -414,7 +599,7 @@ kernel void vis_layernorm_f16(
         for (uint k = 0; k < 5u; k++) {
             uint i = k * 256u + tid;
             if (i < p.D) {
-                op[i] = bfloat((vals[k] - mean) * inv_std * float(weight[i]) + float(bias[i]));
+                op[i] = vis_f32_to_bf16((vals[k] - mean) * inv_std * vis_bf16_to_f32(weight[i]) + vis_bf16_to_f32(bias[i]));
             }
         }
     } else {
@@ -446,7 +631,7 @@ kernel void vis_layernorm_f16(
         float inv_std = smem[0];
 
         for (uint i = tid; i < p.D; i += tg_size) {
-            op[i] = bfloat((xp[i] - mean) * inv_std * float(weight[i]) + float(bias[i]));
+            op[i] = vis_f32_to_bf16((xp[i] - mean) * inv_std * vis_bf16_to_f32(weight[i]) + vis_bf16_to_f32(bias[i]));
         }
     }
 }
@@ -514,7 +699,7 @@ kernel void vis_flash_attn_f16(
     const device half* q_in [[buffer(0)]], // [N, H, 72] FP16
     const device half* k_in [[buffer(1)]], // [N, H, 72] FP16
     const device half* v_in [[buffer(2)]], // [N, H, 72] FP16
-    device bfloat*     out  [[buffer(3)]], // [N, H, 72] BF16 -> feeds bfloat8x8 proj!
+    device vis_bf16_t* out  [[buffer(3)]], // [N, H, 72] BF16 -> feeds proj GEMM!
     constant VisAttnParams& p [[buffer(4)]],
     uint2 tgid              [[threadgroup_position_in_grid]],
     uint  tid               [[thread_index_in_threadgroup]],
@@ -700,12 +885,12 @@ kernel void vis_flash_attn_f16(
     uint lt = t0 + sg_m + fm;
     if (lt < p.seq_len) {
         float inv_l = sInvL[sg_m + fm];
-        device bfloat* op = out + (ulong)(p.seq_start + lt) * out_stride + out_h_off;
+        device vis_bf16_t* op = out + (ulong)(p.seq_start + lt) * out_stride + out_h_off;
         #pragma clang loop unroll(full)
         for (uint j = 0; j < 9u; j++) {
             uint c0 = 8u * j + fn;
-            *((device bfloat2*)(op + c0)) = bfloat2(bfloat(O[j].thread_elements()[0] * inv_l),
-                                                    bfloat(O[j].thread_elements()[1] * inv_l));
+            *((device vis_bf16_2*)(op + c0)) = vis_f32x2_to_bf16x2(O[j].thread_elements()[0] * inv_l,
+                                                                   O[j].thread_elements()[1] * inv_l);
         }
     }
 }

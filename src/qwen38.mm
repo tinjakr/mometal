@@ -2,6 +2,7 @@
 #import <Metal/Metal.h>
 
 #include "qwen38.hpp"
+#include "ane_builder.hpp"
 #include "json.hpp"
 #include "prefix_cache.hpp"
 #include "sampler.hpp"
@@ -37,6 +38,8 @@ struct FullAttnParams {
     float rope_theta, eps, scale;
     uint32_t num_splits;
     int rope_offset;
+    uint32_t win_sink = 0u;
+    uint32_t win_recent = 0u;
 };
 struct QuestParams {
     uint32_t kv_len, Hq, Hkv, M, start_page, end_page, total_pages, sink_pages;
@@ -71,10 +74,29 @@ struct MtpGatherParams {
 struct PathReplayParams { uint32_t len, pre_pos, Hkv, D, kv_bits, pad0, pad1, pad2; uint32_t path[16]; };
 struct AneShareParams {
     uint32_t M;
-    uint32_t hdr_words;
+    uint32_t HID;
+    uint32_t INTER;
+    uint32_t SUB;
+    uint32_t DK;
+    uint32_t n_subblocks;
     uint32_t lin_base_w[16];
     uint32_t lin_chunk_w[16];
+    uint32_t lin_hdr_w[16];
 };
+
+static inline AneShareParams make_ane_share_params(const AneShareLayer& sl, uint32_t M) {
+    AneShareParams ap{};
+    ap.M = M;
+    ap.HID = sl.hidden_size;
+    ap.INTER = sl.intermediate_size;
+    ap.SUB = sl.sub_size;
+    ap.DK = sl.dk_size;
+    ap.n_subblocks = sl.n_subblocks;
+    std::memcpy(ap.lin_base_w, sl.lin_base_w, sizeof(ap.lin_base_w));
+    std::memcpy(ap.lin_chunk_w, sl.lin_chunk_w, sizeof(ap.lin_chunk_w));
+    std::memcpy(ap.lin_hdr_w, sl.lin_hdr_w, sizeof(ap.lin_hdr_w));
+    return ap;
+}
 
 inline uint32_t ceil_div(uint32_t a, uint32_t b) { return (a + b - 1u) / b; }
 
@@ -158,13 +180,17 @@ Qwen38Model::Qwen38Model(MetalContext& ctx, const std::string& model_dir, int ma
     pso_gdn_rec_tree_ = ctx_.pipeline("qwen38", "qwen_gdn_recurrence_tree");
     pso_gdn_rec_lazy_ = ctx_.pipeline("qwen38", "qwen_gdn_recurrence_lazy");
     pso_gdn_rec_tree_lazy_ = ctx_.pipeline("qwen38", "qwen_gdn_recurrence_tree_lazy");
+    pso_gdn_rec_tree_lazy_s1_ = ctx_.pipeline("qwen38", "qwen_gdn_recurrence_tree_lazy_s1");
+    pso_gdn_rec_tree_lazy_s2_ = ctx_.pipeline("qwen38", "qwen_gdn_recurrence_tree_lazy_s2");
     pso_gdn_norm_     = ctx_.pipeline("qwen38", "qwen_gdn_rmsnorm_gated");
     pso_gdn_norm_f16_ = ctx_.pipeline("qwen38", "qwen_gdn_rmsnorm_gated_f16");
     pso_fa_q_prep_        = ctx_.pipeline("qwen38", "qwen_full_attn_q_prep");
+    pso_fa_q_prep_hier_   = ctx_.pipeline("qwen38", "qwen_full_attn_q_prep_hier");
     pso_fa_q_prep_tree_   = ctx_.pipeline("qwen38", "qwen_full_attn_q_prep_tree");
     pso_fa_kv_prep_       = ctx_.pipeline("qwen38", "qwen_full_attn_kv_prep");
     pso_fa_kv_prep_tree_  = ctx_.pipeline("qwen38", "qwen_full_attn_kv_prep_tree");
     pso_fa_q_prep_mrope_  = ctx_.pipeline("qwen38", "qwen_full_attn_q_prep_mrope");
+    pso_fa_q_prep_mrope_hier_ = ctx_.pipeline("qwen38", "qwen_full_attn_q_prep_mrope_hier");
     pso_fa_kv_prep_mrope_ = ctx_.pipeline("qwen38", "qwen_full_attn_kv_prep_mrope");
     pso_scatter_embeds_   = ctx_.pipeline("qwen38", "qwen_scatter_embeds");
     pso_fa_attn_          = ctx_.pipeline("qwen38", "qwen_gqa_attn_gated");
@@ -238,17 +264,8 @@ Qwen38Model::Qwen38Model(MetalContext& ctx, const std::string& model_dir, int ma
     pso_ane_add_          = ctx_.pipeline("qwen38", "qwen_ane_add_output");
     pso_ane_add_norm_     = ctx_.pipeline("qwen38", "qwen_ane_add_and_rmsnorm");
     pso_ane_add_norm_f16_ = ctx_.pipeline("qwen38", "qwen_ane_add_and_rmsnorm_f16");
-    pso_ane_hf4_swiglu_bf16_  = ctx_.pipeline("common", "ane_hf4_swiglu_bf16");
-    pso_ane_hf4_swiglu_m1_    = ctx_.pipeline("common", "ane_hf4_swiglu_m1");
-    pso_ane_hf4_down_sk_bf16_ = ctx_.pipeline("common", "ane_hf4_down_sk_bf16");
-    pso_ane_hf4_down_m1_sk_   = ctx_.pipeline("common", "ane_hf4_down_m1_sk");
-    pso_ane_hf4_tiled_gateup_ = ctx_.pipeline("common", "ane_hf4_tiled_gateup");
-    pso_ane_hf4_tiled_down_   = ctx_.pipeline("common", "ane_hf4_tiled_down");
-    pso_lmh_build_bitscreen_  = ctx_.pipeline("common", "lmh_build_bitscreen");
-    pso_bs_quant_x_           = ctx_.pipeline("common", "bitscreen_quant_x");
-    pso_bs_score_b1_          = ctx_.pipeline("common", "bitscreen_score_b1");
-    pso_bs_score_b2_          = ctx_.pipeline("common", "bitscreen_score_b2");
-    pso_bs_score_b3_          = ctx_.pipeline("common", "bitscreen_score_b3");
+    // Note: ane_hf4/lut4_* and bitscreen_{build,quant_x,score_*} PSOs are specialized via function constants
+    // after reading config.json and initializing AneShareManager below!
     pso_bs_select_cands_      = ctx_.pipeline("common", "bitscreen_select_cands");
     pso_bs_rescore_q4_        = ctx_.pipeline("common", "bitscreen_rescore_q4");
 
@@ -279,62 +296,217 @@ Qwen38Model::Qwen38Model(MetalContext& ctx, const std::string& model_dir, int ma
     rotary_dim_ = static_cast<int>(std::round(head_dim_ * partial_rot));
     image_token_id_ = static_cast<int>(cfg["image_token_id"].as_int(248056));
 
-    // Optional native CoreML/IOSurface ANE MLP accelerator (+ single-copy ANE-Share!)
-    // Initialize BEFORE store_.load_dir() so shared MLP .safetensors pages are NEVER faulted or GPU-pinned!
+    // Hardware-adaptive ANE prefill offload threshold (base M1/M2/M3/M4 -> 64, Pro -> 96-128, Max/Ultra -> 176)
+    const int est_gpu_cores = ctx_.estimated_gpu_cores();
+    ane_min_ = (est_gpu_cores <= 12) ? 64 : ((est_gpu_cores <= 20) ? 96 : ((est_gpu_cores <= 32) ? 128 : 176));
+
+    // Specialize BitScreen kernels via FC_BS_D (index 10 = hidden_size_) for any hidden_size % 64 == 0, <= 8192!
+    if (hidden_size_ > 0 && (hidden_size_ % 64) == 0 && hidden_size_ <= 8192) {
+        const std::vector<std::pair<uint32_t, uint32_t>> bs_fc = {{10u, static_cast<uint32_t>(hidden_size_)}};
+        const std::string bs_sfx = "_d" + std::to_string(hidden_size_);
+        pso_lmh_build_bitscreen_ = ctx_.pipeline_u32_constants("common", "lmh_build_bitscreen", "lmh_build_bitscreen" + bs_sfx, bs_fc);
+        pso_bs_quant_x_          = ctx_.pipeline_u32_constants("common", "bitscreen_quant_x",   "bitscreen_quant_x" + bs_sfx,   bs_fc);
+        pso_bs_score_b1_         = ctx_.pipeline_u32_constants("common", "bitscreen_score_b1",  "bitscreen_score_b1" + bs_sfx,  bs_fc);
+        pso_bs_score_b2_         = ctx_.pipeline_u32_constants("common", "bitscreen_score_b2",  "bitscreen_score_b2" + bs_sfx,  bs_fc);
+        pso_bs_score_b3_         = ctx_.pipeline_u32_constants("common", "bitscreen_score_b3",  "bitscreen_score_b3" + bs_sfx,  bs_fc);
+    }
+
+    // Single-copy ANE-Share MLP accelerator (1-copy ONLY; falls back cleanly to GPU-only on any failure!)
+    // Initialize BEFORE store_.load_dir() so shared MLP .safetensors pages are NEVER faulted or GPU-pinned.
     std::string resolved_ane = ane_models_dir;
+    std::string auto_fmt = resolve_ane_build_format("auto");
+    std::string effective_tag = ane_tag;
     if (resolved_ane == "off" || resolved_ane == "none") {
         resolved_ane.clear();
     } else if (resolved_ane == "auto") {
         std::string c1 = model_dir + "/ane-models";
         std::string c2 = model_dir + "-ane";
-        const char* home = std::getenv("HOME");
-        std::string c3 = (home && model_dir.find("rowq4") != std::string::npos)
-            ? (std::string(home) + "/Projects/ane-lab/hw-baseline/build-rowq4/models")
-            : "";
+        std::string c3 = default_ane_cache_dir(model_dir, auto_fmt);
         if (std::filesystem::is_directory(c1)) resolved_ane = c1;
         else if (std::filesystem::is_directory(c2)) resolved_ane = c2;
-        else if (!c3.empty() && std::filesystem::is_directory(c3)) resolved_ane = c3;
-        else resolved_ane.clear();
-    }
-    std::vector<std::string> skip_mlp_prefixes;
-    if (!resolved_ane.empty()) {
-        ane_ = std::make_unique<AneMlpEngine>(ctx_, resolved_ane, num_layers_, ane_tag);
-        if (ane_ && ane_->ready() && ane_share_layers > 0 && ane_->tag() == "hf4") {
-            ane_share_ = std::make_unique<AneShareManager>(ctx_, resolved_ane, ane_->tag(), num_layers_, ane_share_layers);
-            int target_shared = std::min(ane_share_layers, num_layers_);
-            if (ane_share_->shared_count() < target_shared) {
-                std::fprintf(stderr,
-                             "[ane-share] WARNING: only %d/%d requested layers verified for single-copy sharing; "
-                             "remaining %d layer(s) fall back to 2-copy (ANE model.hwx + GPU safetensors g64)\n",
-                             ane_share_->shared_count(), target_shared,
-                             target_shared - ane_share_->shared_count());
+        else if (std::filesystem::is_directory(c3)) resolved_ane = c3;
+        else if (ane_share_layers > 0) {
+            // Zero-Python on-demand native C++ ANE MLP build into ~/.cache/mometal/ane/!
+            AneBuildOptions bopt;
+            bopt.model_dir = model_dir;
+            bopt.out_dir = c3;
+            bopt.format = (ane_tag == "lut4" || ane_tag == "hf4" || ane_tag == "nf4") ? ane_tag : "auto";
+            bopt.tag = (ane_tag == "auto" || ane_tag.empty()) ? "auto" : ane_tag;
+            auto bres = build_ane_mlps_native(bopt);
+            if (bres.ok) {
+                resolved_ane = bres.out_dir;
+                effective_tag = bres.tag;
+            } else {
+                std::fprintf(stderr, "[ane-build] Auto-build failed (%s); falling back to GPU-only\n", bres.error.c_str());
+                resolved_ane.clear();
             }
-            for (int i = 0; i < num_layers_; ++i) {
-                if (!ane_share_->has_layer(i)) continue;
-                std::string ls = "layers." + std::to_string(i) + ".mlp.";
-                skip_mlp_prefixes.push_back("model.language_model." + ls);
-                skip_mlp_prefixes.push_back("language_model.model." + ls);
-                skip_mlp_prefixes.push_back("model." + ls);
+        } else {
+            resolved_ane.clear();
+        }
+    } else if (ane_share_layers > 0) {
+        // Explicit --ane-models <dir> + --ane-share: auto-build missing layers natively if dir doesn't have L0 yet
+        std::string want_fmt = (ane_tag == "lut4" || ane_tag == "hf4" || ane_tag == "nf4") ? ane_tag : auto_fmt;
+        std::string want_tag = (ane_tag == "auto" || ane_tag.empty()) ? want_fmt : ane_tag;
+        if (!std::filesystem::is_directory(resolved_ane + "/L0_mlp_p0_" + want_tag + ".mlmodelc")) {
+            AneBuildOptions bopt;
+            bopt.model_dir = model_dir;
+            bopt.out_dir = resolved_ane;
+            bopt.format = want_fmt;
+            bopt.tag = want_tag;
+            auto bres = build_ane_mlps_native(bopt);
+            if (bres.ok) {
+                effective_tag = bres.tag;
+            } else {
+                std::fprintf(stderr, "[ane-build] Build into %s failed (%s); falling back to GPU-only\n",
+                             resolved_ane.c_str(), bres.error.c_str());
+                resolved_ane.clear();
             }
         }
     }
+    // Always skip Vision weights in main LLM store (Vision tower lazy-loads on first image -> -859 MiB RAM on text-only!)
+    // Also skip embed_tokens from main prefetched store when untied: loaded via zero-wiring CpuMmapQ4Weight when !mtp_loaded_
+    // (-682 MiB wired RAM!) or dedicated un-prefetched embed_store_ when mtp_loaded_ (zero startup fault, keeps single-CB MTP!).
+    const bool tie_word_embeddings = tc.contains("tie_word_embeddings")
+        ? tc["tie_word_embeddings"].as_bool(false)
+        : (cfg.contains("tie_word_embeddings") ? cfg["tie_word_embeddings"].as_bool(false) : false);
+    std::vector<std::string> skip_prefixes = {
+        "vision_tower.",
+        "model.visual.",
+        "visual."
+    };
+    if (!tie_word_embeddings) {
+        skip_prefixes.push_back("language_model.model.embed_tokens.");
+        skip_prefixes.push_back("model.language_model.embed_tokens.");
+        skip_prefixes.push_back("model.embed_tokens.");
+    }
+    if (mtp_dir == "off" || mtp_dir == "none") {
+        skip_prefixes.push_back("mtp.");
+    }
+    if (!resolved_ane.empty()) {
+        try {
+            // Defer ANE warmup so AneShareManager verifies existing model.hwx BEFORE warmup launches (eliminates cold-cache race),
+            // then async warmup overlaps with safetensors loading & BitScreen build!
+            ane_ = std::make_unique<AneMlpEngine>(ctx_, resolved_ane, num_layers_, hidden_size_, effective_tag, /*defer_warmup=*/true);
+            if (ane_ && ane_->ready()) {
+                ane_share_ = std::make_unique<AneShareManager>(
+                    ctx_, resolved_ane, ane_->tag(), num_layers_,
+                    static_cast<uint32_t>(hidden_size_), static_cast<uint32_t>(intermediate_size_));
+                if (ane_share_->shared_count() < num_layers_) {
+                    // Cold first-ever build writes model.hwx during CoreML warmup; run warmup to completion once and retry
+                    ane_->start_warmup_async();
+                    ane_->wait_warmup();
+                    ane_share_ = std::make_unique<AneShareManager>(
+                        ctx_, resolved_ane, ane_->tag(), num_layers_,
+                        static_cast<uint32_t>(hidden_size_), static_cast<uint32_t>(intermediate_size_));
+                } else {
+                    ane_->start_warmup_async();
+                }
+                if (ane_share_->shared_count() == num_layers_) {
+                    ane_share_nonuniform_lut_ = ane_share_->is_nonuniform_lut();
+                    const AneShareLayer& sl0 = ane_share_->layer(0);
+                    uint32_t hdr0 = sl0.lin_hdr_w[0];
+                    bool uniform_hdr = true;
+                    for (int li_layer = 0; li_layer < num_layers_ && uniform_hdr; ++li_layer) {
+                        const AneShareLayer& sl = ane_share_->layer(li_layer);
+                        uint32_t n_lin = sl.n_subblocks * 4u;
+                        for (uint32_t li = 0; li < n_lin; ++li) {
+                            if (sl.lin_hdr_w[li] != hdr0) { uniform_hdr = false; break; }
+                        }
+                    }
+                    std::vector<std::pair<uint32_t, uint32_t>> ane_fc = {
+                        {0u, sl0.hidden_size},
+                        {1u, sl0.intermediate_size},
+                        {2u, sl0.sub_size},
+                        {3u, sl0.dk_size},
+                        {4u, sl0.n_subblocks}
+                    };
+                    std::string ane_sfx = "_h" + std::to_string(sl0.hidden_size)
+                                        + "_i" + std::to_string(sl0.intermediate_size)
+                                        + "_s" + std::to_string(sl0.sub_size)
+                                        + "_n" + std::to_string(sl0.n_subblocks);
+                    if (uniform_hdr) {
+                        ane_fc.push_back({5u, hdr0});
+                        ane_sfx += "_w" + std::to_string(hdr0);
+                    }
+                    if (ane_share_nonuniform_lut_) {
+                        pso_ane_hf4_swiglu_bf16_     = ctx_.pipeline_u32_constants("common", "ane_lut4_swiglu_bf16",     "ane_lut4_swiglu_bf16"     + ane_sfx, ane_fc);
+                        pso_ane_hf4_down_sk4_bf16_   = ctx_.pipeline_u32_constants("common", "ane_lut4_down_sk4_bf16",   "ane_lut4_down_sk4_bf16"   + ane_sfx, ane_fc);
+                        pso_ane_hf4_down_sk_bf16_    = pso_ane_hf4_down_sk4_bf16_;
+                        pso_ane_hf4_swiglu_m4_       = ctx_.pipeline_u32_constants("common", "ane_lut4_swiglu_m4",       "ane_lut4_swiglu_m4"       + ane_sfx, ane_fc);
+                        pso_ane_hf4_down_sk_m4_      = ctx_.pipeline_u32_constants("common", "ane_lut4_down_sk_m4",      "ane_lut4_down_sk_m4"      + ane_sfx, ane_fc);
+                        pso_ane_hf4_swiglu_m1_       = pso_ane_hf4_swiglu_m4_;
+                        pso_ane_hf4_down_m1_sk_      = pso_ane_hf4_down_sk_m4_;
+                        pso_ane_hf4_tiled_gateup_    = ctx_.pipeline_u32_constants("common", "ane_lut4_tiled_gateup",    "ane_lut4_tiled_gateup"    + ane_sfx, ane_fc);
+                        pso_ane_hf4_tiled_down_      = ctx_.pipeline_u32_constants("common", "ane_lut4_tiled_down",      "ane_lut4_tiled_down"      + ane_sfx, ane_fc);
+                        pso_ane_hf4_swiglu_tiled32_  = ctx_.pipeline_u32_constants("common", "ane_lut4_swiglu_tiled32",  "ane_lut4_swiglu_tiled32"  + ane_sfx, ane_fc);
+                        pso_ane_hf4_down_tiled32_sk_ = ctx_.pipeline_u32_constants("common", "ane_lut4_down_tiled32_sk", "ane_lut4_down_tiled32_sk" + ane_sfx, ane_fc);
+                    } else {
+                        pso_ane_hf4_swiglu_bf16_     = ctx_.pipeline_u32_constants("common", "ane_hf4_swiglu_bf16",      "ane_hf4_swiglu_bf16"      + ane_sfx, ane_fc);
+                        pso_ane_hf4_down_sk_bf16_    = ctx_.pipeline_u32_constants("common", "ane_hf4_down_sk_bf16",     "ane_hf4_down_sk_bf16"     + ane_sfx, ane_fc);
+                        pso_ane_hf4_down_sk4_bf16_   = ctx_.pipeline_u32_constants("common", "ane_hf4_down_sk4_bf16",    "ane_hf4_down_sk4_bf16"    + ane_sfx, ane_fc);
+                        pso_ane_hf4_swiglu_m1_       = ctx_.pipeline("common", "ane_hf4_swiglu_m1");
+                        pso_ane_hf4_down_m1_sk_      = ctx_.pipeline("common", "ane_hf4_down_m1_sk");
+                        pso_ane_hf4_swiglu_m4_       = ctx_.pipeline_u32_constants("common", "ane_hf4_swiglu_m4",        "ane_hf4_swiglu_m4"        + ane_sfx, ane_fc);
+                        pso_ane_hf4_down_sk_m4_      = ctx_.pipeline_u32_constants("common", "ane_hf4_down_sk_m4",       "ane_hf4_down_sk_m4"       + ane_sfx, ane_fc);
+                        pso_ane_hf4_tiled_gateup_    = ctx_.pipeline_u32_constants("common", "ane_hf4_tiled_gateup",     "ane_hf4_tiled_gateup"     + ane_sfx, ane_fc);
+                        pso_ane_hf4_tiled_down_      = ctx_.pipeline_u32_constants("common", "ane_hf4_tiled_down",       "ane_hf4_tiled_down"       + ane_sfx, ane_fc);
+                        pso_ane_hf4_swiglu_tiled32_  = ctx_.pipeline_u32_constants("common", "ane_hf4_swiglu_tiled32",   "ane_hf4_swiglu_tiled32"   + ane_sfx, ane_fc);
+                        pso_ane_hf4_down_tiled32_sk_ = ctx_.pipeline_u32_constants("common", "ane_hf4_down_tiled32_sk",  "ane_hf4_down_tiled32_sk"  + ane_sfx, ane_fc);
+                    }
+                    for (int i = 0; i < num_layers_; ++i) {
+                        std::string ls = "layers." + std::to_string(i) + ".mlp.";
+                        skip_prefixes.push_back("model.language_model." + ls);
+                        skip_prefixes.push_back("language_model.model." + ls);
+                        skip_prefixes.push_back("model." + ls);
+                    }
+                } else {
+                    std::fprintf(stderr,
+                                 "[ane-share] Only %d/%d layers verified single-copy; "
+                                 "unloading ANE and falling back to GPU-only (no 2-copy duplication)\n",
+                                 ane_share_->shared_count(), num_layers_);
+                    ane_share_.reset();
+                    ane_.reset();
+                }
+            } else {
+                ane_.reset();
+            }
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "[ane-share] ANE init failed (%s); falling back to GPU-only\n", e.what());
+            ane_share_.reset();
+            ane_.reset();
+        }
+    }
 
-    store_.load_dir(ctx_.device(), model_dir, skip_mlp_prefixes);
+    store_.load_dir(ctx_.device(), model_dir, skip_prefixes);
 
-    std::string lm_pfx = store_.has("language_model.model.embed_tokens.weight")
+    std::string lm_pfx = store_.has("language_model.model.norm.weight")
         ? "language_model."
-        : (store_.has("model.language_model.embed_tokens.weight") ? "model.language_model." : "");
+        : (store_.has("model.language_model.norm.weight") ? "model.language_model." : "");
     std::string model_pfx = (lm_pfx == "language_model.") ? "language_model.model."
                           : (lm_pfx == "model.language_model.") ? "model.language_model." : "model.";
 
-    embed_tokens_ = load_q4(store_, model_pfx + "embed_tokens");
-    final_norm_   = store_.get(model_pfx + "norm.weight");
-    std::string head_key = store_.has("language_model.lm_head.weight") ? "language_model.lm_head" : "lm_head";
-    lm_head_ = load_q4(store_, head_key);
+    final_norm_ = store_.get(model_pfx + "norm.weight");
+    std::string head_key = store_.has("language_model.lm_head.weight") ? "language_model.lm_head"
+                         : (store_.has("lm_head.weight") ? "lm_head" : "");
+    if (!head_key.empty()) {
+        lm_head_ = load_q4(store_, head_key);
+        if (tie_word_embeddings && store_.has(model_pfx + "embed_tokens.weight")) {
+            embed_tokens_ = load_q4(store_, model_pfx + "embed_tokens");
+        }
+    } else {
+        // Weight-tied model fallback (no separate lm_head.weight): map embed_tokens in Metal and share with lm_head!
+        if (store_.has(model_pfx + "embed_tokens.weight")) {
+            embed_tokens_ = load_q4(store_, model_pfx + "embed_tokens");
+        } else {
+            embed_store_.load_dir_only(ctx_.device(), model_dir, {model_pfx + "embed_tokens."}, /*prefetch_now=*/true);
+            embed_tokens_ = load_q4(embed_store_, model_pfx + "embed_tokens");
+        }
+        lm_head_ = embed_tokens_;
+    }
 
     layers_.resize(num_layers_);
     states_.resize(num_layers_);
-    kv_cap_ = std::min(max_seq_len_, 8192);
+    kv_cap_ = std::min(max_seq_len_, 2048);
     size_t kv_bytes = 0;
 
     for (int i = 0; i < num_layers_; ++i) {
@@ -374,7 +546,7 @@ Qwen38Model::Qwen38Model(MetalContext& ctx, const std::string& model_dir, int ma
             states_[i].v_cache = ctx_.alloc_private(kv_sz);
             kv_bytes += 2 * kv_sz;
             if (kv_bits_ < 16) {
-                size_t sb_sz = static_cast<size_t>(kv_cap_) * num_kv_heads_ * (head_dim_ / 64) * 2 * sizeof(float);
+                size_t sb_sz = static_cast<size_t>(kv_cap_) * num_kv_heads_ * (head_dim_ / 64) * 2 * sizeof(uint16_t);
                 states_[i].k_sb = ctx_.alloc_private(sb_sz);
                 states_[i].v_sb = ctx_.alloc_private(sb_sz);
                 kv_bytes += 2 * sb_sz;
@@ -419,7 +591,15 @@ Qwen38Model::Qwen38Model(MetalContext& ctx, const std::string& model_dir, int ma
         }
     }
 
-    // Optional MTP drafter loading (explicit path or "auto" -> <model_dir>-mtp, <model_dir>/model-mtp.safetensors, or bundled)
+    // Persistent scratch sizing (computed before MTP scratch so MTP buffers are allocated ONCE at C_attn!)
+    // When ANE is active, attention & MTP scratch supports up to 512+64 = 576-tok halves (1152-tok co-exec chunks!)
+    // while MLP scratch stays at chunk_size_ (512) to keep peak RAM lean!
+    size_t C_mlp  = static_cast<size_t>(chunk_size_);
+    size_t C_attn = (ane_ && ane_->ready())
+        ? static_cast<size_t>(AneMlpEngine::MAX_SUBS * ane_->block_rows() + 64)
+        : C_mlp;
+
+    // Optional MTP drafter loading (check already-mapped bundled store_ FIRST to avoid double-mapping model-mtp.safetensors!)
     std::string resolved_mtp = mtp_dir;
     if (resolved_mtp == "off" || resolved_mtp == "none") {
         resolved_mtp.clear();
@@ -427,10 +607,10 @@ Qwen38Model::Qwen38Model(MetalContext& ctx, const std::string& model_dir, int ma
         std::string cand_dir = model_dir + "-mtp";
         std::string cand_file = model_dir + "/model-mtp.safetensors";
         std::string cand_sibling = std::filesystem::path(model_dir).parent_path().string() + "/awq4-mtp";
-        if (std::filesystem::is_directory(cand_dir)) resolved_mtp = cand_dir;
+        if (store_.has("mtp.fc.weight")) resolved_mtp = "__bundled__";
+        else if (std::filesystem::is_directory(cand_dir)) resolved_mtp = cand_dir;
         else if (std::filesystem::is_regular_file(cand_file)) resolved_mtp = cand_file;
         else if (model_dir.find("rowq4") != std::string::npos && std::filesystem::is_directory(cand_sibling)) resolved_mtp = cand_sibling;
-        else if (store_.has("mtp.fc.weight")) resolved_mtp = "__bundled__";
         else resolved_mtp.clear();
     }
 
@@ -470,23 +650,70 @@ Qwen38Model::Qwen38Model(MetalContext& ctx, const std::string& model_dir, int ma
         mtp_.layer.up_proj        = load_q4(*ms, lp + "mlp.up_proj");
         mtp_.layer.down_proj      = load_q4(*ms, lp + "mlp.down_proj");
 
-        size_t mtp_elem_div = (kv_bits_ == 16) ? 1ull : ((kv_bits_ == 8) ? 2ull : 4ull);
+        // Lossless KV4 + 4k windowed attention for the 1-layer MTP drafter ONLY (independent of target kv_bits_!)
+        mtp_kv_bits_ = (head_dim_ == 256) ? 4 : kv_bits_;
+        if (mtp_kv_bits_ == kv_bits_ && kv_bits_ < 16) {
+            pso_mtp_kv_prep_        = pso_fa_kv_prep_q_;
+            pso_mtp_kv_prep_tree_   = pso_fa_kv_prep_q_tree_;
+            pso_mtp_attn_f16_       = pso_fa_attn_q_f16_;
+            pso_mtp_attn_tree_f16_  = pso_fa_attn_q_tree_f16_;
+            pso_mtp_vsplit1_        = pso_fa_vsplit1_q_;
+            pso_mtp_vsplit1_tree_   = pso_fa_vsplit1_q_tree_;
+            pso_mtp_gqa6_m1_        = pso_fa_gqa6_m1_q_;
+            pso_mtp_gqa6_m1_tree_   = pso_fa_gqa6_m1_q_tree_;
+            pso_mtp_gqa6_m2_        = pso_fa_gqa6_m2_q_;
+            pso_mtp_gqa6_m2_tree_   = pso_fa_gqa6_m2_q_tree_;
+            pso_mtp_gqa6_m4_        = pso_fa_gqa6_m4_q_;
+            pso_mtp_gqa6_m4_tree_   = pso_fa_gqa6_m4_q_tree_;
+            pso_mtp_gqa6_v_         = pso_fa_gqa6_v_q_;
+            pso_mtp_gqa6_v_tree_    = pso_fa_gqa6_v_q_tree_;
+        } else if (mtp_kv_bits_ < 16) {
+            std::string mqs = (mtp_kv_bits_ == 8) ? "q8" : "q4";
+            pso_mtp_kv_prep_        = ctx_.pipeline("qwen38", "qwen_full_attn_kv_prep_" + mqs);
+            pso_mtp_kv_prep_tree_   = ctx_.pipeline("qwen38", "qwen_full_attn_kv_prep_" + mqs + "_tree");
+            pso_mtp_attn_f16_       = ctx_.pipeline("qwen38", "qwen_gqa_attn_gated_" + mqs + "_f16");
+            pso_mtp_attn_tree_f16_  = ctx_.pipeline("qwen38", "qwen_gqa_attn_gated_" + mqs + "_tree_f16");
+            pso_mtp_vsplit1_        = ctx_.pipeline("qwen38", "qwen_gqa_verify_splitk_p1_" + mqs);
+            pso_mtp_vsplit1_tree_   = ctx_.pipeline("qwen38", "qwen_gqa_verify_splitk_p1_" + mqs + "_tree");
+            pso_mtp_gqa6_m1_        = ctx_.pipeline("qwen38", "qwen_gqa6_m1_splitk_p1_" + mqs);
+            pso_mtp_gqa6_m1_tree_   = ctx_.pipeline("qwen38", "qwen_gqa6_m1_splitk_p1_" + mqs + "_tree");
+            pso_mtp_gqa6_m2_        = ctx_.pipeline("qwen38", "qwen_gqa6_m2_splitk_p1_" + mqs);
+            pso_mtp_gqa6_m2_tree_   = ctx_.pipeline("qwen38", "qwen_gqa6_m2_splitk_p1_" + mqs + "_tree");
+            pso_mtp_gqa6_m4_        = ctx_.pipeline("qwen38", "qwen_gqa6_m4_splitk_p1_" + mqs);
+            pso_mtp_gqa6_m4_tree_   = ctx_.pipeline("qwen38", "qwen_gqa6_m4_splitk_p1_" + mqs + "_tree");
+            pso_mtp_gqa6_v_         = ctx_.pipeline("qwen38", "qwen_gqa6_verify_splitk_p1_" + mqs);
+            pso_mtp_gqa6_v_tree_    = ctx_.pipeline("qwen38", "qwen_gqa6_verify_splitk_p1_" + mqs + "_tree");
+        } else {
+            pso_mtp_kv_prep_        = pso_fa_kv_prep_;
+            pso_mtp_kv_prep_tree_   = pso_fa_kv_prep_tree_;
+            pso_mtp_attn_f16_       = pso_fa_attn_f16_;
+            pso_mtp_attn_tree_f16_  = pso_fa_attn_tree_f16_;
+            pso_mtp_vsplit1_        = pso_fa_vsplit1_;
+            pso_mtp_vsplit1_tree_   = pso_fa_vsplit1_tree_;
+            pso_mtp_gqa6_m1_        = pso_fa_gqa6_m1_;
+            pso_mtp_gqa6_m1_tree_   = pso_fa_gqa6_m1_tree_;
+            pso_mtp_gqa6_m2_        = pso_fa_gqa6_m2_;
+            pso_mtp_gqa6_m2_tree_   = pso_fa_gqa6_m2_tree_;
+            pso_mtp_gqa6_m4_        = pso_fa_gqa6_m4_;
+            pso_mtp_gqa6_m4_tree_   = pso_fa_gqa6_m4_tree_;
+            pso_mtp_gqa6_v_         = pso_fa_gqa6_v_;
+            pso_mtp_gqa6_v_tree_    = pso_fa_gqa6_v_tree_;
+        }
+
+        size_t mtp_elem_div = (mtp_kv_bits_ == 16) ? 1ull : ((mtp_kv_bits_ == 8) ? 2ull : 4ull);
         size_t kv_sz = (static_cast<size_t>(kv_cap_) * num_kv_heads_ * head_dim_ * sizeof(uint16_t)) / mtp_elem_div;
         mtp_k_cache_ = ctx_.alloc_private(kv_sz);
         mtp_v_cache_ = ctx_.alloc_private(kv_sz);
         kv_bytes += 2 * kv_sz;
-        if (kv_bits_ < 16) {
-            size_t sb_sz = static_cast<size_t>(kv_cap_) * num_kv_heads_ * (head_dim_ / 64) * 2 * sizeof(float);
+        if (mtp_kv_bits_ < 16) {
+            size_t sb_sz = static_cast<size_t>(kv_cap_) * num_kv_heads_ * (head_dim_ / 64) * 2 * sizeof(uint16_t);
             mtp_k_sb_ = ctx_.alloc_private(sb_sz);
             mtp_v_sb_ = ctx_.alloc_private(sb_sz);
             kv_bytes += 2 * sb_sz;
         }
-        if (sparse_kv_budget_ > 0) {
-            size_t kb_sz = static_cast<size_t>(ceil_div(static_cast<uint32_t>(kv_cap_), QUEST_PAGE_SIZE)) * num_kv_heads_ * head_dim_ * 4ull;
-            mtp_k_bounds_ = ctx_.alloc_private(kb_sz);
-            mtp_quest_built_pages_ = 0;
-            kv_bytes += kb_sz;
-        }
+        // MTP uses direct 4k windowed attention (128 sink + 3968 recent) rather than Quest bounds!
+        mtp_k_bounds_ = nil;
+        mtp_quest_built_pages_ = 0;
 
         // Allocate ping-pong MAX_VERIFY-token record buffers for Lazy Fused GDN Replay (ZERO bak_ssm_state_ -> -66 MB RAM!)
         for (int sl = 0; sl < 2; ++sl) {
@@ -508,9 +735,7 @@ Qwen38Model::Qwen38Model(MetalContext& ctx, const std::string& model_dir, int ma
         buf_mtp_seed_hid_   = ctx_.alloc_private(16ull * hidden_size_ * sizeof(float));
         buf_mtp_last_hid_   = ctx_.alloc_private(hidden_size_ * sizeof(float));
         buf_mtp_verify_hid_ = ctx_.alloc_private(static_cast<size_t>(MAX_VERIFY) * hidden_size_ * sizeof(float));
-        buf_mtp_in_hid_     = ctx_.alloc_private(static_cast<size_t>(chunk_size_ + 1) * hidden_size_ * sizeof(float));
-        buf_mtp_concat_     = ctx_.alloc_private(static_cast<size_t>(chunk_size_) * 2 * hidden_size_ * sizeof(float));
-        buf_mtp_emb_        = ctx_.alloc_private(static_cast<size_t>(chunk_size_) * hidden_size_ * sizeof(float));
+        buf_mtp_in_hid_     = ctx_.alloc_private((C_attn + 1) * hidden_size_ * sizeof(float));
         buf_mtp_logits_     = ctx_.alloc_shared(static_cast<size_t>(MAX_VERIFY) * vocab_size_ * sizeof(float));
         buf_mtp_argmax_     = ctx_.alloc_shared(static_cast<size_t>(MAX_VERIFY) * sizeof(uint32_t));
         buf_mtp_sync_ids_   = ctx_.alloc_shared(static_cast<size_t>(MAX_VERIFY + 10) * sizeof(int));
@@ -521,44 +746,145 @@ Qwen38Model::Qwen38Model(MetalContext& ctx, const std::string& model_dir, int ma
         mtp_loaded_ = true;
     }
 
-    // Native Metal Qwen3-VL Vision Tower (zero-copy mmap from shard 1, zero Python!)
-    vision_ = std::make_unique<QwenVisionTower>(ctx_, store_, model_dir);
+    // Finalize embed_tokens loading now that mtp_loaded_ is known:
+    // - When !mtp_loaded_ (and untied): zero-Metal-wiring CpuMmapQ4Weight (-682 MiB wired IOAccelerator RAM!)
+    // - When mtp_loaded_: dedicated un-prefetched embed_store_ (zero MADV_WILLNEED startup fault, keeps single-CB MTP + cb2_pre!)
+    if (!embed_tokens_.w.valid()) {
+        const bool force_gpu_embed = (std::getenv("MI_CPU_EMBED") && std::atoi(std::getenv("MI_CPU_EMBED")) == 0);
+        if (!mtp_loaded_ && !force_gpu_embed && cpu_embed_.open(model_dir, model_pfx + "embed_tokens")) {
+            use_cpu_embed_ = true;
+        } else {
+            embed_store_.load_dir_only(ctx_.device(), model_dir, {model_pfx + "embed_tokens."}, /*prefetch_now=*/false);
+            embed_tokens_ = load_q4(embed_store_, model_pfx + "embed_tokens");
+        }
+    }
 
-    // Persistent scratch arena:
-    // When ANE is active, attention scratch supports up to 512+64 = 576-tok halves (1152-tok co-exec chunks!)
-    // while MLP scratch stays at chunk_size_ (512) to keep peak RAM lean!
-    size_t C_mlp  = static_cast<size_t>(chunk_size_);
-    size_t C_attn = (ane_ && ane_->ready())
-        ? static_cast<size_t>(AneMlpEngine::MAX_SUBS * ane_->block_rows() + 64)
-        : C_mlp;
+    // Native Metal Qwen3-VL Vision Tower (lazy init: 0 B vision RAM & 0 ms vision.metal compile until first image!)
+    vision_ = QwenVisionTower::create_lazy(ctx_, model_dir);
+
+    // Persistent scratch arena — pack 13 mutually-disjoint private buffers (~225.75 MiB) into ONE
+    // tracked MTLHeapTypePlacement (~83.25 MiB -> saves ~142.5 MiB private GPU RAM with 0 ms overhead!).
     size_t val_dim = static_cast<size_t>(lin_num_v_heads_) * lin_head_v_dim_;
     size_t q_full_dim = static_cast<size_t>(num_heads_) * head_dim_;
     size_t kv_full_dim = static_cast<size_t>(num_kv_heads_) * head_dim_;
 
     buf_token_ids_    = ctx_.alloc_shared(2 * C_attn * sizeof(int));
-    buf_hidden_       = ctx_.alloc_private(C_attn * hidden_size_ * sizeof(float));
+    buf_hidden_       = use_cpu_embed_
+        ? ctx_.alloc_shared(C_attn * hidden_size_ * sizeof(float))
+        : ctx_.alloc_private(C_attn * hidden_size_ * sizeof(float));
     if (ane_ && ane_->ready()) {
-        buf_hidden_alt_ = ctx_.alloc_private(C_attn * hidden_size_ * sizeof(float));
+        buf_hidden_alt_ = use_cpu_embed_
+            ? ctx_.alloc_shared(C_attn * hidden_size_ * sizeof(float))
+            : ctx_.alloc_private(C_attn * hidden_size_ * sizeof(float));
     }
     buf_normed_       = ctx_.alloc_private(C_attn * hidden_size_ * sizeof(float));
-    buf_qkv_          = ctx_.alloc_private(C_attn * std::max<size_t>(lin_conv_dim_, 2 * q_full_dim) * sizeof(float));
-    buf_qkv_conv_     = ctx_.alloc_private(C_attn * lin_conv_dim_ * sizeof(float));
-    buf_z_            = ctx_.alloc_private(C_attn * std::max(val_dim, q_full_dim) * sizeof(float));
     buf_a_            = ctx_.alloc_private(C_attn * lin_num_v_heads_ * sizeof(float));
     buf_b_            = ctx_.alloc_private(C_attn * lin_num_v_heads_ * sizeof(float));
     buf_g_            = ctx_.alloc_private(C_attn * lin_num_v_heads_ * sizeof(float));
     buf_beta_         = ctx_.alloc_private(C_attn * lin_num_v_heads_ * sizeof(float));
-    buf_q_            = ctx_.alloc_private(C_attn * std::max<size_t>(lin_num_k_heads_ * lin_head_k_dim_, q_full_dim) * sizeof(float));
     buf_q_h_          = ctx_.alloc_private(static_cast<size_t>(num_heads_) * 16u * head_dim_ * sizeof(uint16_t));
-    buf_k_            = ctx_.alloc_private(C_attn * std::max<size_t>(lin_num_k_heads_ * lin_head_k_dim_, kv_full_dim) * sizeof(float));
-    buf_v_            = ctx_.alloc_private(C_attn * kv_full_dim * sizeof(float));
-    buf_attn_out_     = ctx_.alloc_private(C_attn * std::max(val_dim, q_full_dim) * sizeof(float));
-    buf_gdn_normed_   = ctx_.alloc_private(C_attn * val_dim * sizeof(float));
-    buf_mlp_gate_     = ctx_.alloc_private(C_mlp * intermediate_size_ * sizeof(float));
-    buf_mlp_up_       = ctx_.alloc_private(C_mlp * intermediate_size_ * sizeof(float));
-    buf_split_o_      = ctx_.alloc_private(static_cast<size_t>(MAX_VERIFY) * num_heads_ * 128 * head_dim_ * sizeof(float));
+
+    const size_t sz_qkv        = C_attn * std::max<size_t>(lin_conv_dim_, 2 * q_full_dim) * sizeof(float);
+    const size_t sz_qkv_conv   = C_attn * lin_conv_dim_ * sizeof(float);
+    const size_t sz_z          = C_attn * std::max(val_dim, q_full_dim) * sizeof(float);
+    const size_t sz_q          = C_attn * std::max<size_t>(lin_num_k_heads_ * lin_head_k_dim_, q_full_dim) * sizeof(float);
+    const size_t sz_k          = C_attn * std::max<size_t>(lin_num_k_heads_ * lin_head_k_dim_, kv_full_dim) * sizeof(float);
+    const size_t sz_v          = C_attn * kv_full_dim * sizeof(float);
+    const size_t sz_attn_out   = C_attn * std::max(val_dim, q_full_dim) * sizeof(float);
+    const size_t sz_gdn_normed = C_attn * val_dim * sizeof(float);
+    const size_t sz_mlp_gate   = C_mlp * intermediate_size_ * sizeof(float);
+    const size_t sz_mlp_up     = C_mlp * intermediate_size_ * sizeof(float);
+    const size_t split_o_half_bytes = static_cast<size_t>(MAX_VERIFY) * num_heads_ * 128u * head_dim_ * sizeof(uint16_t);
+    const size_t hier_o_f32_bytes   = C_attn * static_cast<size_t>(num_heads_) * head_dim_ * sizeof(float);
+    const size_t sz_split_o    = std::max(split_o_half_bytes, hier_o_f32_bytes);
+    const size_t sz_mtp_emb    = mtp_loaded_ ? (C_attn * hidden_size_ * sizeof(float)) : 0u;
+    const size_t sz_mtp_concat = mtp_loaded_ ? (C_attn * 2 * hidden_size_ * sizeof(float)) : 0u;
+
+    const MTLResourceOptions heap_buf_opts = MTLResourceStorageModePrivate | MTLResourceHazardTrackingModeTracked;
+    id<MTLDevice> dev = (id<MTLDevice>)ctx_.device();
+    auto align_up = [](size_t v, size_t a) -> size_t {
+        return (a > 1u) ? ((v + a - 1u) & ~(a - 1u)) : v;
+    };
+    auto sa = [&](size_t len) -> MTLSizeAndAlign {
+        return (len > 0u) ? [dev heapBufferSizeAndAlignWithLength:len options:heap_buf_opts]
+                          : MTLSizeAndAlign{0u, 1u};
+    };
+
+    MTLSizeAndAlign sa_qkv        = sa(sz_qkv);
+    MTLSizeAndAlign sa_qkv_conv   = sa(sz_qkv_conv);
+    MTLSizeAndAlign sa_z          = sa(sz_z);
+    MTLSizeAndAlign sa_q          = sa(sz_q);
+    MTLSizeAndAlign sa_k          = sa(sz_k);
+    MTLSizeAndAlign sa_v          = sa(sz_v);
+    MTLSizeAndAlign sa_attn_out   = sa(sz_attn_out);
+    MTLSizeAndAlign sa_gdn_normed = sa(sz_gdn_normed);
+    MTLSizeAndAlign sa_split_o    = sa(sz_split_o);
+    MTLSizeAndAlign sa_mlp_gate   = sa(sz_mlp_gate);
+    MTLSizeAndAlign sa_mlp_up     = sa(sz_mlp_up);
+    MTLSizeAndAlign sa_mtp_emb    = sa(sz_mtp_emb);
+    MTLSizeAndAlign sa_mtp_concat = sa(sz_mtp_concat);
+
+    // Phase A/B (Attn & GDN): Slot 0 holds buf_qkv_ (dead after conv1d/q_prep barrier!), aliased AFTER barrier
+    // by buf_attn_out_ + (buf_gdn_normed_ [GDN] | buf_split_o_ [Full-Attn]); Slots 1..5 are strictly disjoint!
+    const size_t off_qkv        = 0u;
+    const size_t off_attn_out   = 0u;
+    const size_t off_gdn_normed = align_up(off_attn_out + sa_attn_out.size, sa_gdn_normed.align);
+    const size_t off_split_o    = align_up(off_attn_out + sa_attn_out.size, sa_split_o.align);
+    const size_t slot0_end      = std::max(off_qkv + sa_qkv.size,
+                                           std::max(off_gdn_normed + sa_gdn_normed.size,
+                                                    off_split_o + sa_split_o.size));
+    const size_t off_qkv_conv   = align_up(slot0_end, sa_qkv_conv.align);
+    const size_t off_z          = align_up(off_qkv_conv + sa_qkv_conv.size, sa_z.align);
+    const size_t off_q          = align_up(off_z + sa_z.size, sa_q.align);
+    const size_t off_k          = align_up(off_q + sa_q.size, sa_k.align);
+    const size_t off_v          = align_up(off_k + sa_k.size, sa_v.align);
+    const size_t attn_gdn_end   = off_v + sa_v.size;
+
+    // Phase C (MLP): buf_mlp_gate_ and buf_mlp_up_ (also partY for tiled32_sk!) strictly disjoint from each other
+    const size_t off_mlp_gate   = 0u;
+    const size_t off_mlp_up     = align_up(off_mlp_gate + sa_mlp_gate.size, sa_mlp_up.align);
+    const size_t mlp_end        = off_mlp_up + sa_mlp_up.size;
+
+    // Phase D (MTP pre-FC): buf_mtp_emb_ and buf_mtp_concat_ strictly disjoint from each other
+    const size_t off_mtp_emb    = 0u;
+    const size_t off_mtp_concat = mtp_loaded_ ? align_up(off_mtp_emb + sa_mtp_emb.size, sa_mtp_concat.align) : 0u;
+    const size_t mtp_end        = mtp_loaded_ ? (off_mtp_concat + sa_mtp_concat.size) : 0u;
+
+    const size_t heap_bytes = align_up(std::max(attn_gdn_end, std::max(mlp_end, mtp_end)), 16384u);
+    MTLHeapDescriptor* hdesc = [[MTLHeapDescriptor alloc] init];
+    hdesc.type = MTLHeapTypePlacement;
+    hdesc.storageMode = MTLStorageModePrivate;
+    hdesc.hazardTrackingMode = MTLHazardTrackingModeTracked;
+    hdesc.size = heap_bytes;
+    id<MTLHeap> sheap = [dev newHeapWithDescriptor:hdesc];
+    scratch_heap_ = sheap;
+
+    auto alloc_in_heap = [&](size_t len, size_t off) -> id {
+        if (sheap) {
+            id<MTLBuffer> b = [sheap newBufferWithLength:len options:heap_buf_opts offset:off];
+            if (b) return b;
+        }
+        return ctx_.alloc_private(len);
+    };
+
+    buf_qkv_        = alloc_in_heap(sz_qkv,        off_qkv);
+    buf_qkv_conv_   = alloc_in_heap(sz_qkv_conv,   off_qkv_conv);
+    buf_z_          = alloc_in_heap(sz_z,          off_z);
+    buf_q_          = alloc_in_heap(sz_q,          off_q);
+    buf_k_          = alloc_in_heap(sz_k,          off_k);
+    buf_v_          = alloc_in_heap(sz_v,          off_v);
+    buf_attn_out_   = alloc_in_heap(sz_attn_out,   off_attn_out);
+    buf_gdn_normed_ = alloc_in_heap(sz_gdn_normed, off_gdn_normed);
+    buf_split_o_    = alloc_in_heap(sz_split_o,    off_split_o);
+    buf_mlp_gate_   = alloc_in_heap(sz_mlp_gate,   off_mlp_gate);
+    buf_mlp_up_     = alloc_in_heap(sz_mlp_up,     off_mlp_up);
+    if (mtp_loaded_) {
+        buf_mtp_emb_    = alloc_in_heap(sz_mtp_emb,    off_mtp_emb);
+        buf_mtp_concat_ = alloc_in_heap(sz_mtp_concat, off_mtp_concat);
+    }
     buf_split_m_      = ctx_.alloc_private(static_cast<size_t>(MAX_VERIFY) * num_heads_ * 128 * sizeof(float));
     buf_split_l_      = ctx_.alloc_private(static_cast<size_t>(MAX_VERIFY) * num_heads_ * 128 * sizeof(float));
+    buf_tree_params_  = ctx_.alloc_shared(sizeof(TreeParams));
     if (sparse_kv_budget_ > 0) {
         buf_quest_scores_ = ctx_.alloc_private(static_cast<size_t>(num_kv_heads_) * 7ull * QUEST_SCORE_STRIDE * sizeof(float));
         buf_quest_pages_  = ctx_.alloc_private(static_cast<size_t>(num_kv_heads_) * QUEST_MAX_ACTIVE_PAGES * sizeof(uint32_t));
@@ -571,8 +897,8 @@ Qwen38Model::Qwen38Model(MetalContext& ctx, const std::string& model_dir, int ma
     buf_argmax_parts_ = ctx_.alloc_private(std::max(static_cast<size_t>(MAX_VERIFY) * max_am_parts, min_draft_parts) * 8u);
     buf_argmax_out_   = ctx_.alloc_shared(static_cast<size_t>(MAX_VERIFY) * sizeof(uint32_t));
     buf_draft_row_map_ = ctx_.alloc_shared(static_cast<size_t>(MAX_DRAFT_ROW_MAP) * sizeof(uint32_t));
-    // Build BitScreen 1-bit sign(W) x 3-bitplane(X) pre-filter for MTP draft lm_head (V=98,304 -> 63 MB, ~2.5 ms GPU build!)
-    bool want_bs = mtp_loaded_ && (hidden_size_ == 5120) &&
+    // Build BitScreen 1-bit sign(W) x 3-bitplane(X) pre-filter for MTP draft lm_head (general hidden_size via FC_BS_D!)
+    bool want_bs = mtp_loaded_ && (hidden_size_ > 0 && (hidden_size_ % 64) == 0 && hidden_size_ <= 8192) &&
                    (!std::getenv("MI_BITSCREEN") || std::atoi(std::getenv("MI_BITSCREEN")) != 0);
     if (want_bs) {
         uint32_t bsv = std::getenv("MI_BITSCREEN_V")
@@ -580,15 +906,16 @@ Qwen38Model::Qwen38Model(MetalContext& ctx, const std::string& model_dir, int ma
             : 98304u;
         bs_vocab_ = std::clamp(bsv, 32768u, static_cast<uint32_t>(vocab_size_));
         bs_vocab_ = (bs_vocab_ / 2048u) * 2048u; // exact multiple of 2,048 strided buckets
-        buf_bs_w_        = ctx_.alloc_private(static_cast<size_t>(bs_vocab_) * 160ull * sizeof(uint32_t));
+        const size_t bs_kw = static_cast<size_t>(hidden_size_) / 32ull;
+        buf_bs_w_        = ctx_.alloc_private(static_cast<size_t>(bs_vocab_) * bs_kw * sizeof(uint32_t));
         buf_bs_meta_     = ctx_.alloc_private(static_cast<size_t>(bs_vocab_) * 2ull * sizeof(float));
-        buf_bs_xbp_      = ctx_.alloc_private(8ull * 3ull * 160ull * sizeof(uint32_t));
+        buf_bs_xbp_      = ctx_.alloc_private(8ull * 3ull * bs_kw * sizeof(uint32_t));
         buf_bs_xpc_      = ctx_.alloc_private(8ull * sizeof(float));
         buf_bs_top2_     = ctx_.alloc_private(8ull * 4096ull * 8ull); // ArgmaxOut [8, 4096]
         buf_bs_cands_    = ctx_.alloc_private(8ull * 256ull * sizeof(uint32_t));
         buf_bs_cand_cnt_ = ctx_.alloc_private(8ull * sizeof(uint32_t));
-        buf_bs_extra_    = ctx_.alloc_shared(64ull * sizeof(uint32_t));
-        kv_bytes += static_cast<size_t>(bs_vocab_) * (160ull * 4ull + 8ull);
+        buf_bs_extra_    = ctx_.alloc_shared(128ull * sizeof(uint32_t));
+        kv_bytes += static_cast<size_t>(bs_vocab_) * (bs_kw * 4ull + 8ull);
 
         @autoreleasepool {
             id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)ctx_.queue() commandBuffer];
@@ -612,16 +939,71 @@ Qwen38Model::Qwen38Model(MetalContext& ctx, const std::string& model_dir, int ma
         }
         bs_enabled_ = true;
     }
+    if (cfg.contains("eos_token_id")) {
+        const auto& e = cfg["eos_token_id"];
+        if (e.is_array()) {
+            for (const auto& x : e.as_array()) info_.eos_token_ids.push_back(static_cast<int>(x.as_int()));
+        } else if (e.is_int()) {
+            info_.eos_token_ids.push_back(static_cast<int>(e.as_int()));
+        }
+    } else if (tc.contains("eos_token_id")) {
+        const auto& e = tc["eos_token_id"];
+        if (e.is_array()) {
+            for (const auto& x : e.as_array()) info_.eos_token_ids.push_back(static_cast<int>(x.as_int()));
+        } else if (e.is_int()) {
+            info_.eos_token_ids.push_back(static_cast<int>(e.as_int()));
+        }
+    }
+    if (info_.eos_token_ids.empty()) info_.eos_token_ids = {248046, 248044};
+
+    // Dynamically discover special/added token IDs from config.json + tokenizer_config.json (model-agnostic!)
+    auto add_special_id = [&](int64_t tid) {
+        if (tid >= 0 && tid < vocab_size_) {
+            special_tok_ids_.push_back(static_cast<uint32_t>(tid));
+        }
+    };
+    for (int eid : info_.eos_token_ids) add_special_id(eid);
+    add_special_id(image_token_id_);
+    for (const char* k : {"bos_token_id", "pad_token_id", "video_token_id", "vision_start_token_id", "vision_end_token_id"}) {
+        if (cfg.contains(k) && cfg[k].is_int()) add_special_id(cfg[k].as_int());
+        if (tc.contains(k) && tc[k].is_int()) add_special_id(tc[k].as_int());
+    }
+    std::string tok_cfg_path = model_dir + "/tokenizer_config.json";
+    if (std::filesystem::is_regular_file(tok_cfg_path)) {
+        try {
+            Json tcfg = parse_json(read_file_to_string(tok_cfg_path));
+            if (tcfg.contains("added_tokens_decoder") && tcfg["added_tokens_decoder"].is_object()) {
+                for (const auto& kv : tcfg["added_tokens_decoder"].as_object()) {
+                    char* endp = nullptr;
+                    long long val = std::strtoll(kv.first.c_str(), &endp, 10);
+                    if (endp && *endp == '\0') add_special_id(static_cast<int64_t>(val));
+                }
+            }
+        } catch (...) {
+            // Non-fatal: fall back to config-derived IDs
+        }
+    }
+    std::sort(special_tok_ids_.begin(), special_tok_ids_.end());
+    special_tok_ids_.erase(std::unique(special_tok_ids_.begin(), special_tok_ids_.end()), special_tok_ids_.end());
+    const uint32_t tail_floor = (vocab_size_ > 4096) ? static_cast<uint32_t>(vocab_size_ - 4096) : FAST_DRAFT_VOCAB;
+    bool has_tail_special = false;
+    for (uint32_t sid : special_tok_ids_) {
+        if (sid >= tail_floor) { has_tail_special = true; break; }
+    }
+    if (!has_tail_special && vocab_size_ >= 248077) {
+        for (uint32_t sid = 248044u; sid < 248077u; ++sid) special_tok_ids_.push_back(sid);
+    }
+    special_tok_lo_ = static_cast<uint32_t>(vocab_size_);
+    for (uint32_t sid : special_tok_ids_) {
+        if (sid >= tail_floor) {
+            special_tok_lo_ = sid;
+            break;
+        }
+    }
+
     init_draft_row_map();
     pld4_.resize(PLD_MASK + 1u);
     pld3_.resize(PLD_MASK + 1u);
-
-    // Resize MTP prefill scratch if ANE uses 1024-tok halves
-    if (mtp_loaded_ && C_attn > C_mlp) {
-        buf_mtp_in_hid_ = ctx_.alloc_private((C_attn + 1) * hidden_size_ * sizeof(float));
-        buf_mtp_concat_ = ctx_.alloc_private(C_attn * 2 * hidden_size_ * sizeof(float));
-        buf_mtp_emb_    = ctx_.alloc_private(C_attn * hidden_size_ * sizeof(float));
-    }
 
     info_.arch = "qwen38";
     info_.model_dir = model_dir;
@@ -649,18 +1031,13 @@ Qwen38Model::Qwen38Model(MetalContext& ctx, const std::string& model_dir, int ma
     info_.num_layers = num_layers_;
     info_.num_visits = num_layers_;
     info_.max_seq_len = max_seq_len_;
-    info_.mapped_weight_bytes = store_.total_mapped_bytes() + mtp_store_.total_mapped_bytes();
+    info_.mapped_weight_bytes = store_.total_mapped_bytes() + mtp_store_.total_mapped_bytes() + embed_store_.total_mapped_bytes();
     info_.kv_cache_bytes = kv_bytes;
 
-    if (cfg.contains("eos_token_id")) {
-        const auto& e = cfg["eos_token_id"];
-        if (e.is_array()) {
-            for (const auto& x : e.as_array()) info_.eos_token_ids.push_back(static_cast<int>(x.as_int()));
-        } else if (e.is_int()) {
-            info_.eos_token_ids.push_back(static_cast<int>(e.as_int()));
-        }
+    // Join async 4-deep ANE warmup (overlapped with safetensors load & BitScreen build!) before returning ready model
+    if (ane_ && ane_->ready()) {
+        ane_->wait_warmup();
     }
-    if (info_.eos_token_ids.empty()) info_.eos_token_ids = {248046, 248044};
 
     reset();
 
@@ -677,112 +1054,183 @@ void Qwen38Model::ensure_kv_capacity(int needed) {
     if (needed > max_seq_len_) {
         throw std::runtime_error("Sequence length exceeds max_seq_len (" + std::to_string(max_seq_len_) + ")");
     }
-    int new_cap = std::max(needed, kv_cap_ * 2);
-    new_cap = ((new_cap + 4095) / 4096) * 4096;
+    int new_cap = needed;
+    if (needed <= 16384) {
+        new_cap = std::max(needed, std::max(kv_cap_ * 2, 2048));
+        new_cap = ((new_cap + 2047) / 2048) * 2048;
+    } else {
+        // Above 16k: stepwise +16k growth avoids 2x overshoot (e.g. 66k -> 80k instead of 131k!)
+        new_cap = ((needed + 16383) / 16384) * 16384;
+    }
     new_cap = std::min(new_cap, max_seq_len_);
 
     const size_t elem_div = (kv_bits_ == 16) ? 1ull : ((kv_bits_ == 8) ? 2ull : 4ull);
     const size_t row_kv_bytes = (static_cast<size_t>(num_kv_heads_) * head_dim_ * sizeof(uint16_t)) / elem_div;
     const size_t row_sb_bytes = (kv_bits_ < 16)
-        ? (static_cast<size_t>(num_kv_heads_) * (head_dim_ / 64) * 2 * sizeof(float))
+        ? (static_cast<size_t>(num_kv_heads_) * (head_dim_ / 64) * 2 * sizeof(uint16_t))
         : 0;
     const size_t new_kv_sz = static_cast<size_t>(new_cap) * row_kv_bytes;
     const size_t new_sb_sz = static_cast<size_t>(new_cap) * row_sb_bytes;
     const size_t copy_kv = static_cast<size_t>(pos_) * row_kv_bytes;
     const size_t copy_sb = static_cast<size_t>(pos_) * row_sb_bytes;
+    const size_t new_kb_sz = (sparse_kv_budget_ > 0)
+        ? (static_cast<size_t>(ceil_div(static_cast<uint32_t>(new_cap), QUEST_PAGE_SIZE)) * num_kv_heads_ * head_dim_ * 4ull)
+        : 0ull;
+    const size_t page_kb_bytes = static_cast<size_t>(num_kv_heads_) * head_dim_ * 4ull;
 
-    @autoreleasepool {
-        std::vector<id> new_k(num_layers_, nil), new_v(num_layers_, nil);
-        std::vector<id> new_ksb(num_layers_, nil), new_vsb(num_layers_, nil);
-        std::vector<id> new_kb(num_layers_, nil);
-        const size_t new_kb_sz = (sparse_kv_budget_ > 0)
-            ? (static_cast<size_t>(ceil_div(static_cast<uint32_t>(new_cap), QUEST_PAGE_SIZE)) * num_kv_heads_ * head_dim_ * 4ull)
-            : 0ull;
-        const size_t page_kb_bytes = static_cast<size_t>(num_kv_heads_) * head_dim_ * 4ull;
-        for (int i = 0; i < num_layers_; ++i) {
-            if (layers_[i].is_linear) continue;
-            new_k[i] = ctx_.alloc_private(new_kv_sz);
-            new_v[i] = ctx_.alloc_private(new_kv_sz);
-            if (row_sb_bytes > 0) {
-                new_ksb[i] = ctx_.alloc_private(new_sb_sz);
-                new_vsb[i] = ctx_.alloc_private(new_sb_sz);
+    // Layer-by-layer alloc -> blit -> swap/release inside @autoreleasepool:
+    // eliminates the 2x all-layers KV RAM peak spike (+3.2 GiB -> <= 1 single layer +0.19 GiB, or 0 B when pos_ == 0)!
+    for (int i = 0; i < num_layers_; ++i) {
+        if (layers_[i].is_linear) continue;
+        @autoreleasepool {
+            if (copy_kv == 0) {
+                states_[i].k_cache = nil;
+                states_[i].v_cache = nil;
+                states_[i].k_sb = nil;
+                states_[i].v_sb = nil;
+                states_[i].k_bounds = nil;
             }
-            if (new_kb_sz > 0) {
-                new_kb[i] = ctx_.alloc_private(new_kb_sz);
-            }
-        }
-        id new_mtp_k = nil, new_mtp_v = nil, new_mtp_ksb = nil, new_mtp_vsb = nil, new_mtp_kb = nil;
-        if (mtp_loaded_) {
-            new_mtp_k = ctx_.alloc_private(new_kv_sz);
-            new_mtp_v = ctx_.alloc_private(new_kv_sz);
-            if (row_sb_bytes > 0) {
-                new_mtp_ksb = ctx_.alloc_private(new_sb_sz);
-                new_mtp_vsb = ctx_.alloc_private(new_sb_sz);
-            }
-            if (new_kb_sz > 0) {
-                new_mtp_kb = ctx_.alloc_private(new_kb_sz);
-            }
-        }
+            id nk = ctx_.alloc_private(new_kv_sz);
+            id nv = ctx_.alloc_private(new_kv_sz);
+            id nksb = (row_sb_bytes > 0) ? ctx_.alloc_private(new_sb_sz) : nil;
+            id nvsb = (row_sb_bytes > 0) ? ctx_.alloc_private(new_sb_sz) : nil;
+            id nkb  = (new_kb_sz > 0) ? ctx_.alloc_private(new_kb_sz) : nil;
 
-        if (pos_ > 0 || (mtp_loaded_ && mtp_pos_ > 0)) {
-            id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)ctx_.queue() commandBuffer];
-            id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
             if (copy_kv > 0) {
-                for (int i = 0; i < num_layers_; ++i) {
-                    if (layers_[i].is_linear) continue;
-                    [blit copyFromBuffer:(id<MTLBuffer>)states_[i].k_cache sourceOffset:0 toBuffer:(id<MTLBuffer>)new_k[i] destinationOffset:0 size:copy_kv];
-                    [blit copyFromBuffer:(id<MTLBuffer>)states_[i].v_cache sourceOffset:0 toBuffer:(id<MTLBuffer>)new_v[i] destinationOffset:0 size:copy_kv];
-                    if (copy_sb > 0) {
-                        [blit copyFromBuffer:(id<MTLBuffer>)states_[i].k_sb sourceOffset:0 toBuffer:(id<MTLBuffer>)new_ksb[i] destinationOffset:0 size:copy_sb];
-                        [blit copyFromBuffer:(id<MTLBuffer>)states_[i].v_sb sourceOffset:0 toBuffer:(id<MTLBuffer>)new_vsb[i] destinationOffset:0 size:copy_sb];
-                    }
-                    if (new_kb_sz > 0 && states_[i].quest_built_pages > 0) {
-                        size_t copy_kb = static_cast<size_t>(states_[i].quest_built_pages) * page_kb_bytes;
-                        [blit copyFromBuffer:(id<MTLBuffer>)states_[i].k_bounds sourceOffset:0 toBuffer:(id<MTLBuffer>)new_kb[i] destinationOffset:0 size:copy_kb];
-                    }
+                id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)ctx_.queue() commandBuffer];
+                id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+                [blit copyFromBuffer:(id<MTLBuffer>)states_[i].k_cache sourceOffset:0 toBuffer:(id<MTLBuffer>)nk destinationOffset:0 size:copy_kv];
+                [blit copyFromBuffer:(id<MTLBuffer>)states_[i].v_cache sourceOffset:0 toBuffer:(id<MTLBuffer>)nv destinationOffset:0 size:copy_kv];
+                if (copy_sb > 0) {
+                    [blit copyFromBuffer:(id<MTLBuffer>)states_[i].k_sb sourceOffset:0 toBuffer:(id<MTLBuffer>)nksb destinationOffset:0 size:copy_sb];
+                    [blit copyFromBuffer:(id<MTLBuffer>)states_[i].v_sb sourceOffset:0 toBuffer:(id<MTLBuffer>)nvsb destinationOffset:0 size:copy_sb];
                 }
+                if (new_kb_sz > 0 && states_[i].quest_built_pages > 0) {
+                    size_t copy_kb = static_cast<size_t>(states_[i].quest_built_pages) * page_kb_bytes;
+                    [blit copyFromBuffer:(id<MTLBuffer>)states_[i].k_bounds sourceOffset:0 toBuffer:(id<MTLBuffer>)nkb destinationOffset:0 size:copy_kb];
+                }
+                [blit endEncoding];
+                [cb commit];
+                [cb waitUntilCompleted];
             }
-            if (mtp_loaded_ && mtp_pos_ > 0) {
-                size_t copy_mtp = static_cast<size_t>(mtp_pos_) * row_kv_bytes;
-                [blit copyFromBuffer:(id<MTLBuffer>)mtp_k_cache_ sourceOffset:0 toBuffer:(id<MTLBuffer>)new_mtp_k destinationOffset:0 size:copy_mtp];
-                [blit copyFromBuffer:(id<MTLBuffer>)mtp_v_cache_ sourceOffset:0 toBuffer:(id<MTLBuffer>)new_mtp_v destinationOffset:0 size:copy_mtp];
-                if (row_sb_bytes > 0) {
-                    size_t copy_mtp_sb = static_cast<size_t>(mtp_pos_) * row_sb_bytes;
-                    [blit copyFromBuffer:(id<MTLBuffer>)mtp_k_sb_ sourceOffset:0 toBuffer:(id<MTLBuffer>)new_mtp_ksb destinationOffset:0 size:copy_mtp_sb];
-                    [blit copyFromBuffer:(id<MTLBuffer>)mtp_v_sb_ sourceOffset:0 toBuffer:(id<MTLBuffer>)new_mtp_vsb destinationOffset:0 size:copy_mtp_sb];
-                }
-                if (new_kb_sz > 0 && mtp_quest_built_pages_ > 0) {
-                    size_t copy_kb = static_cast<size_t>(mtp_quest_built_pages_) * page_kb_bytes;
-                    [blit copyFromBuffer:(id<MTLBuffer>)mtp_k_bounds_ sourceOffset:0 toBuffer:(id<MTLBuffer>)new_mtp_kb destinationOffset:0 size:copy_kb];
-                }
-            }
-            [blit endEncoding];
-            [cb commit];
-            [cb waitUntilCompleted];
-        }
 
-        for (int i = 0; i < num_layers_; ++i) {
-            if (layers_[i].is_linear) continue;
-            states_[i].k_cache = new_k[i];
-            states_[i].v_cache = new_v[i];
+            states_[i].k_cache = nk;
+            states_[i].v_cache = nv;
             if (row_sb_bytes > 0) {
-                states_[i].k_sb = new_ksb[i];
-                states_[i].v_sb = new_vsb[i];
+                states_[i].k_sb = nksb;
+                states_[i].v_sb = nvsb;
             }
             if (new_kb_sz > 0) {
-                states_[i].k_bounds = new_kb[i];
+                states_[i].k_bounds = nkb;
             }
         }
-        if (mtp_loaded_) {
-            mtp_k_cache_ = new_mtp_k;
-            mtp_v_cache_ = new_mtp_v;
+    }
+
+    if (mtp_loaded_) {
+        const size_t mtp_elem_div = (mtp_kv_bits_ == 16) ? 1ull : ((mtp_kv_bits_ == 8) ? 2ull : 4ull);
+        const size_t mtp_row_kv_bytes = (static_cast<size_t>(num_kv_heads_) * head_dim_ * sizeof(uint16_t)) / mtp_elem_div;
+        const size_t mtp_row_sb_bytes = (mtp_kv_bits_ < 16)
+            ? (static_cast<size_t>(num_kv_heads_) * (head_dim_ / 64) * 2 * sizeof(uint16_t))
+            : 0;
+        const size_t mtp_new_kv_sz = static_cast<size_t>(new_cap) * mtp_row_kv_bytes;
+        const size_t mtp_new_sb_sz = static_cast<size_t>(new_cap) * mtp_row_sb_bytes;
+        @autoreleasepool {
+            if (mtp_pos_ <= 0) {
+                mtp_k_cache_ = nil;
+                mtp_v_cache_ = nil;
+                mtp_k_sb_ = nil;
+                mtp_v_sb_ = nil;
+                mtp_k_bounds_ = nil;
+            }
+            id nk = ctx_.alloc_private(mtp_new_kv_sz);
+            id nv = ctx_.alloc_private(mtp_new_kv_sz);
+            id nksb = (mtp_row_sb_bytes > 0) ? ctx_.alloc_private(mtp_new_sb_sz) : nil;
+            id nvsb = (mtp_row_sb_bytes > 0) ? ctx_.alloc_private(mtp_new_sb_sz) : nil;
+
+            if (mtp_pos_ > 0) {
+                size_t copy_mtp = static_cast<size_t>(mtp_pos_) * mtp_row_kv_bytes;
+                id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)ctx_.queue() commandBuffer];
+                id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+                [blit copyFromBuffer:(id<MTLBuffer>)mtp_k_cache_ sourceOffset:0 toBuffer:(id<MTLBuffer>)nk destinationOffset:0 size:copy_mtp];
+                [blit copyFromBuffer:(id<MTLBuffer>)mtp_v_cache_ sourceOffset:0 toBuffer:(id<MTLBuffer>)nv destinationOffset:0 size:copy_mtp];
+                if (mtp_row_sb_bytes > 0) {
+                    size_t copy_mtp_sb = static_cast<size_t>(mtp_pos_) * mtp_row_sb_bytes;
+                    [blit copyFromBuffer:(id<MTLBuffer>)mtp_k_sb_ sourceOffset:0 toBuffer:(id<MTLBuffer>)nksb destinationOffset:0 size:copy_mtp_sb];
+                    [blit copyFromBuffer:(id<MTLBuffer>)mtp_v_sb_ sourceOffset:0 toBuffer:(id<MTLBuffer>)nvsb destinationOffset:0 size:copy_mtp_sb];
+                }
+                [blit endEncoding];
+                [cb commit];
+                [cb waitUntilCompleted];
+            }
+
+            mtp_k_cache_ = nk;
+            mtp_v_cache_ = nv;
+            if (mtp_row_sb_bytes > 0) {
+                mtp_k_sb_ = nksb;
+                mtp_v_sb_ = nvsb;
+            }
+            mtp_k_bounds_ = nil;
+        }
+    }
+    kv_cap_ = new_cap;
+}
+
+void Qwen38Model::shrink_kv_capacity(int target_cap) {
+    int new_cap = std::min(max_seq_len_, std::max(target_cap, 2048));
+    if (new_cap >= kv_cap_) return;
+
+    const size_t elem_div = (kv_bits_ == 16) ? 1ull : ((kv_bits_ == 8) ? 2ull : 4ull);
+    const size_t row_kv_bytes = (static_cast<size_t>(num_kv_heads_) * head_dim_ * sizeof(uint16_t)) / elem_div;
+    const size_t row_sb_bytes = (kv_bits_ < 16)
+        ? (static_cast<size_t>(num_kv_heads_) * (head_dim_ / 64) * 2 * sizeof(uint16_t))
+        : 0;
+    const size_t new_kv_sz = static_cast<size_t>(new_cap) * row_kv_bytes;
+    const size_t new_sb_sz = static_cast<size_t>(new_cap) * row_sb_bytes;
+    const size_t new_kb_sz = (sparse_kv_budget_ > 0)
+        ? (static_cast<size_t>(ceil_div(static_cast<uint32_t>(new_cap), QUEST_PAGE_SIZE)) * num_kv_heads_ * head_dim_ * 4ull)
+        : 0ull;
+
+    for (int i = 0; i < num_layers_; ++i) {
+        if (layers_[i].is_linear) continue;
+        @autoreleasepool {
+            states_[i].k_cache = nil;
+            states_[i].v_cache = nil;
+            states_[i].k_sb = nil;
+            states_[i].v_sb = nil;
+            states_[i].k_bounds = nil;
+            states_[i].k_cache = ctx_.alloc_private(new_kv_sz);
+            states_[i].v_cache = ctx_.alloc_private(new_kv_sz);
             if (row_sb_bytes > 0) {
-                mtp_k_sb_ = new_mtp_ksb;
-                mtp_v_sb_ = new_mtp_vsb;
+                states_[i].k_sb = ctx_.alloc_private(new_sb_sz);
+                states_[i].v_sb = ctx_.alloc_private(new_sb_sz);
             }
             if (new_kb_sz > 0) {
-                mtp_k_bounds_ = new_mtp_kb;
+                states_[i].k_bounds = ctx_.alloc_private(new_kb_sz);
             }
+            states_[i].quest_built_pages = 0;
+        }
+    }
+    if (mtp_loaded_) {
+        const size_t mtp_elem_div = (mtp_kv_bits_ == 16) ? 1ull : ((mtp_kv_bits_ == 8) ? 2ull : 4ull);
+        const size_t mtp_row_kv_bytes = (static_cast<size_t>(num_kv_heads_) * head_dim_ * sizeof(uint16_t)) / mtp_elem_div;
+        const size_t mtp_row_sb_bytes = (mtp_kv_bits_ < 16)
+            ? (static_cast<size_t>(num_kv_heads_) * (head_dim_ / 64) * 2 * sizeof(uint16_t))
+            : 0;
+        const size_t mtp_new_kv_sz = static_cast<size_t>(new_cap) * mtp_row_kv_bytes;
+        const size_t mtp_new_sb_sz = static_cast<size_t>(new_cap) * mtp_row_sb_bytes;
+        @autoreleasepool {
+            mtp_k_cache_ = nil;
+            mtp_v_cache_ = nil;
+            mtp_k_sb_ = nil;
+            mtp_v_sb_ = nil;
+            mtp_k_bounds_ = nil;
+            mtp_k_cache_ = ctx_.alloc_private(mtp_new_kv_sz);
+            mtp_v_cache_ = ctx_.alloc_private(mtp_new_kv_sz);
+            if (mtp_row_sb_bytes > 0) {
+                mtp_k_sb_ = ctx_.alloc_private(mtp_new_sb_sz);
+                mtp_v_sb_ = ctx_.alloc_private(mtp_new_sb_sz);
+            }
+            mtp_quest_built_pages_ = 0;
         }
     }
     kv_cap_ = new_cap;
@@ -810,6 +1258,9 @@ void Qwen38Model::reset() {
     pos_ = 0;
     rope_delta_ = 0;
     mtp_pos_ = 0;
+    if (kv_cap_ > 8192) {
+        shrink_kv_capacity(2048);
+    }
     mtp_seeded_ = false;
     pending_sync_ = false;
     pending_replay_m_ = 0;
@@ -817,6 +1268,8 @@ void Qwen38Model::reset() {
     pending_path_len_ = 0;
     rec_slot_ = 0;
     cur_tree_ = TreeParams{};
+    last_t7_m_ = 0;
+    last_t7_tree_ = false;
     cur_mrope_buf_ = nil;
     cur_vis_count_ = 0;
     cur_mtp_depth_ = mtp_depth_;
@@ -848,11 +1301,9 @@ void Qwen38Model::init_draft_row_map() {
         rm[n++] = id;
         draft_in_map_[id] = 1u;
     }
-    // Always include Qwen special/control tokens (e.g. <|im_end|>, <think>, </think>, <tool_call>)
-    const uint32_t sp_lo = std::min<uint32_t>(248044u, static_cast<uint32_t>(vocab_size_));
-    const uint32_t sp_hi = std::min<uint32_t>(248077u, static_cast<uint32_t>(vocab_size_));
-    for (uint32_t id = sp_lo; id < sp_hi && n < MAX_DRAFT_ROW_MAP; ++id) {
-        if (!draft_in_map_[id]) {
+    // Always include dynamically discovered special/control tokens (e.g. <|im_end|>, <think>, </think>, <tool_call>)
+    for (uint32_t id : special_tok_ids_) {
+        if (id < static_cast<uint32_t>(vocab_size_) && !draft_in_map_[id] && n < MAX_DRAFT_ROW_MAP) {
             rm[n++] = id;
             draft_in_map_[id] = 1u;
         }
@@ -864,8 +1315,8 @@ void Qwen38Model::init_draft_row_map() {
         bs_in_extra_.assign(static_cast<size_t>(vocab_size_), 0u);
         uint32_t* ex = reinterpret_cast<uint32_t*>([(id<MTLBuffer>)buf_bs_extra_ contents]);
         uint32_t ne = 0u;
-        for (uint32_t id = sp_lo; id < sp_hi && ne < 64u; ++id) {
-            if (id >= bs_vocab_ && !bs_in_extra_[id]) {
+        for (uint32_t id : special_tok_ids_) {
+            if (id < static_cast<uint32_t>(vocab_size_) && id >= bs_vocab_ && !bs_in_extra_[id] && ne < 128u) {
                 ex[ne++] = id;
                 bs_in_extra_[id] = 1u;
             }
@@ -901,7 +1352,7 @@ void Qwen38Model::add_draft_token(int tok) {
         rm[draft_row_count_++] = static_cast<uint32_t>(tok);
     }
     if (bs_enabled_ && static_cast<uint32_t>(tok) >= bs_vocab_ &&
-        buf_bs_extra_ && !bs_in_extra_[tok] && bs_extra_count_ < 64u) {
+        buf_bs_extra_ && !bs_in_extra_[tok] && bs_extra_count_ < 128u) {
         uint32_t* ex = reinterpret_cast<uint32_t*>([(id<MTLBuffer>)buf_bs_extra_ contents]);
         bs_in_extra_[tok] = 1u;
         ex[bs_extra_count_++] = static_cast<uint32_t>(tok);
@@ -913,12 +1364,14 @@ id Qwen38Model::encode_draft_lm_head(id enc_id, uint32_t B, uint32_t& out_V, uin
     auto barrier = [&]() { [enc memoryBarrierWithScope:MTLBarrierScopeBuffers]; };
     if (bs_enabled_ && B >= 1u && B <= 3u) {
         // Stage 1a: Quantize FP16 buf_normed_[0..B-1] -> 3 bitplanes (<5 us)
+        const uint32_t bs_kw = static_cast<uint32_t>(hidden_size_) / 32u;
+        const uint32_t quant_tg = (bs_kw + 31u) & ~31u;
         [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_bs_quant_x_];
         [enc setBuffer:(id<MTLBuffer>)buf_normed_ offset:0 atIndex:0];
         [enc setBuffer:(id<MTLBuffer>)buf_bs_xbp_ offset:0 atIndex:1];
         [enc setBuffer:(id<MTLBuffer>)buf_bs_xpc_ offset:0 atIndex:2];
         [enc setBytes:&B length:sizeof(B) atIndex:3];
-        [enc dispatchThreadgroups:MTLSizeMake(B, 1, 1) threadsPerThreadgroup:MTLSizeMake(160, 1, 1)];
+        [enc dispatchThreadgroups:MTLSizeMake(B, 1, 1) threadsPerThreadgroup:MTLSizeMake(quant_tg, 1, 1)];
         barrier();
 
         // Stage 1b: 1-bit sign(W) x 3-bitplane(X) popcount screen + FUSED per-simdgroup register top-2!
@@ -1002,7 +1455,7 @@ id Qwen38Model::encode_draft_lm_head(id enc_id, uint32_t B, uint32_t& out_V, uin
 
 void Qwen38Model::maybe_widen_draft_vocab(int tok) {
     if (draft_vocab_size_ >= static_cast<uint32_t>(vocab_size_)) return;
-    if (tok < 0 || tok >= 248000) return; // Ignore special ChatML / control tokens
+    if (tok < 0 || static_cast<uint32_t>(tok) >= special_tok_lo_) return; // Ignore special ChatML / control tokens
     bool missed = (static_cast<uint32_t>(tok) >= draft_vocab_size_);
     draft_miss_mask_ = ((draft_miss_mask_ << 1) | (missed ? 1u : 0u)) & 0xFFFFu;
     if (!missed) return;
@@ -1246,23 +1699,23 @@ void Qwen38Model::encode_mlp_q4(id enc_id, const LayerWeights& lw, uint32_t M,
     id<MTLComputeCommandEncoder> enc = enc_id;
     auto barrier = [&]() { [enc memoryBarrierWithScope:MTLBarrierScopeBuffers]; };
 
-    // Single-Copy ANE hf4 (model.hwx) Native BF16-AMX MLP Path (4.0 bpw, 0 duplicate GPU weight pages!)
+    // Single-Copy ANE 4-bit (model.hwx: hf4 / lut4) Native BF16-AMX MLP Path (4.0 bpw, 0 duplicate GPU weight pages!)
     if (lw.ane_share_idx >= 0 && ane_share_ && ane_share_->has_layer(lw.ane_share_idx)) {
         const AneShareLayer& sl = ane_share_->layer(lw.ane_share_idx);
-        AneShareParams ap{};
-        ap.hdr_words = sl.hdr_words;
-        std::memcpy(ap.lin_base_w, sl.lin_base_w, sizeof(ap.lin_base_w));
-        std::memcpy(ap.lin_chunk_w, sl.lin_chunk_w, sizeof(ap.lin_chunk_w));
+        const uint32_t tgx_gu_m1 = ceil_div(sl.intermediate_size / 8u, 4u);
+        const uint32_t tgx_gu_m8 = sl.intermediate_size / 16u;
+        const uint32_t tgx_dn_sk = 16u * ceil_div(sl.hidden_size / 128u, 4u);
+        const uint32_t sk_down   = 2u * sl.n_subblocks;
 
         if (M == 1u) {
-            ap.M = 1u;
+            AneShareParams ap = make_ane_share_params(sl, 1u);
             [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_ane_hf4_swiglu_m1_];
             [enc setBuffer:(id<MTLBuffer>)sl.hwx_buf offset:0 atIndex:0];
             [enc setBuffer:(id<MTLBuffer>)sl.buf_scales_offs offset:0 atIndex:1];
             [enc setBuffer:(id<MTLBuffer>)buf_normed_ offset:0 atIndex:2];
             [enc setBuffer:(id<MTLBuffer>)buf_mlp_gate_ offset:0 atIndex:3];
             [enc setBytes:&ap length:sizeof(ap) atIndex:4];
-            [enc dispatchThreadgroups:MTLSizeMake(544u, 1, 1)
+            [enc dispatchThreadgroups:MTLSizeMake(tgx_gu_m1, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
             barrier();
 
@@ -1272,11 +1725,11 @@ void Qwen38Model::encode_mlp_q4(id enc_id, const LayerWeights& lw, uint32_t M,
             [enc setBuffer:(id<MTLBuffer>)buf_mlp_gate_ offset:0 atIndex:2];
             [enc setBuffer:(id<MTLBuffer>)buf_sk_part_ offset:0 atIndex:3];
             [enc setBytes:&ap length:sizeof(ap) atIndex:4];
-            [enc dispatchThreadgroups:MTLSizeMake(160u, 1, 8)
+            [enc dispatchThreadgroups:MTLSizeMake(tgx_dn_sk, 1, sk_down)
                 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
             barrier();
 
-            QmmSkParams sp{1u, static_cast<uint32_t>(hidden_size_), static_cast<uint32_t>(intermediate_size_), 1u, 8u};
+            QmmSkParams sp{1u, static_cast<uint32_t>(hidden_size_), static_cast<uint32_t>(intermediate_size_), 1u, sk_down};
             [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_mma_sk_reduce_];
             [enc setBuffer:(id<MTLBuffer>)buf_sk_part_ offset:0 atIndex:0];
             [enc setBuffer:(id<MTLBuffer>)buf_hidden_ offset:0 atIndex:1];
@@ -1288,28 +1741,30 @@ void Qwen38Model::encode_mlp_q4(id enc_id, const LayerWeights& lw, uint32_t M,
         }
 
         if (M <= 8u) {
-            ap.M = M;
+            AneShareParams ap = make_ane_share_params(sl, M);
+            // AMX swiglu_bf16 + KS=4 down_sk4_bf16 beats scalar m4 by -5.16 ms even at M=4 (23.07 vs 28.23 ms)!
             [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_ane_hf4_swiglu_bf16_];
             [enc setBuffer:(id<MTLBuffer>)sl.hwx_buf offset:0 atIndex:0];
             [enc setBuffer:(id<MTLBuffer>)sl.buf_scales_offs offset:0 atIndex:1];
             [enc setBuffer:(id<MTLBuffer>)buf_normed_ offset:0 atIndex:2];
             [enc setBuffer:(id<MTLBuffer>)buf_mlp_gate_ offset:0 atIndex:3];
             [enc setBytes:&ap length:sizeof(ap) atIndex:4];
-            [enc dispatchThreadgroups:MTLSizeMake(static_cast<uint32_t>(intermediate_size_) / 16u, 1, 1)
+            [enc dispatchThreadgroups:MTLSizeMake(tgx_gu_m8, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             barrier();
 
-            [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_ane_hf4_down_sk_bf16_];
+            // KS=4 (128 thr, 4 KB SRAM): 0% SG tail waste on DK=2176!
+            [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_ane_hf4_down_sk4_bf16_];
             [enc setBuffer:(id<MTLBuffer>)sl.hwx_buf offset:0 atIndex:0];
             [enc setBuffer:(id<MTLBuffer>)sl.buf_scales_offs offset:0 atIndex:1];
             [enc setBuffer:(id<MTLBuffer>)buf_mlp_gate_ offset:0 atIndex:2];
             [enc setBuffer:(id<MTLBuffer>)buf_sk_part_ offset:0 atIndex:3];
             [enc setBytes:&ap length:sizeof(ap) atIndex:4];
-            [enc dispatchThreadgroups:MTLSizeMake(static_cast<uint32_t>(hidden_size_) / 32u, 1, 8)
-                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            [enc dispatchThreadgroups:MTLSizeMake(tgx_dn_sk, 1, sk_down)
+                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
             barrier();
 
-            QmmSkNormParams sp{M, static_cast<uint32_t>(hidden_size_), static_cast<uint32_t>(intermediate_size_), 1u, 8u, rms_eps_};
+            QmmSkNormParams sp{M, static_cast<uint32_t>(hidden_size_), static_cast<uint32_t>(intermediate_size_), 1u, sk_down, rms_eps_};
             if (M >= 2u && next_norm != nullptr) {
                 if (dual_out_f32 != nil) {
                     [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_mma_sk_reduce_dual_norm_f16_];
@@ -1351,13 +1806,13 @@ void Qwen38Model::encode_mlp_q4(id enc_id, const LayerWeights& lw, uint32_t M,
             [enc dispatchThreadgroups:MTLSizeMake(M, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             barrier();
         }
-        // Short prompts (M <= 96): M=8 micro-batched hf4 avoids 64-row padding waste & 80-TG down_proj starvation!
-        if (M <= 96u) {
+        // Short / tail batches (9 <= M <= 64): M=8 AMX micro-batches (376 GB/s -> 23.1 ms/8 tok, 185 ms for M=64!)
+        if (M <= 64u) {
             for (uint32_t m0 = 0u; m0 < M; m0 += 8u) {
                 uint32_t sub = std::min<uint32_t>(8u, M - m0);
-                ap.M = sub;
+                AneShareParams ap = make_ane_share_params(sl, sub);
                 size_t x_off = static_cast<size_t>(m0) * hidden_size_ * sizeof(uint16_t);
-                size_t y_off = static_cast<size_t>(m0) * hidden_size_ * sizeof(float);
+                size_t y_off = hid_off + static_cast<size_t>(m0) * hidden_size_ * sizeof(float);
                 if (sub == 1u) {
                     [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_ane_hf4_swiglu_m1_];
                     [enc setBuffer:(id<MTLBuffer>)sl.hwx_buf offset:0 atIndex:0];
@@ -1365,7 +1820,7 @@ void Qwen38Model::encode_mlp_q4(id enc_id, const LayerWeights& lw, uint32_t M,
                     [enc setBuffer:(id<MTLBuffer>)buf_normed_ offset:x_off atIndex:2];
                     [enc setBuffer:(id<MTLBuffer>)buf_mlp_gate_ offset:0 atIndex:3];
                     [enc setBytes:&ap length:sizeof(ap) atIndex:4];
-                    [enc dispatchThreadgroups:MTLSizeMake(544u, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                    [enc dispatchThreadgroups:MTLSizeMake(tgx_gu_m1, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
                     barrier();
 
                     [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_ane_hf4_down_m1_sk_];
@@ -1374,7 +1829,7 @@ void Qwen38Model::encode_mlp_q4(id enc_id, const LayerWeights& lw, uint32_t M,
                     [enc setBuffer:(id<MTLBuffer>)buf_mlp_gate_ offset:0 atIndex:2];
                     [enc setBuffer:(id<MTLBuffer>)buf_sk_part_ offset:0 atIndex:3];
                     [enc setBytes:&ap length:sizeof(ap) atIndex:4];
-                    [enc dispatchThreadgroups:MTLSizeMake(160u, 1, 8) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                    [enc dispatchThreadgroups:MTLSizeMake(tgx_dn_sk, 1, sk_down) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
                     barrier();
                 } else {
                     [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_ane_hf4_swiglu_bf16_];
@@ -1383,21 +1838,21 @@ void Qwen38Model::encode_mlp_q4(id enc_id, const LayerWeights& lw, uint32_t M,
                     [enc setBuffer:(id<MTLBuffer>)buf_normed_ offset:x_off atIndex:2];
                     [enc setBuffer:(id<MTLBuffer>)buf_mlp_gate_ offset:0 atIndex:3];
                     [enc setBytes:&ap length:sizeof(ap) atIndex:4];
-                    [enc dispatchThreadgroups:MTLSizeMake(static_cast<uint32_t>(intermediate_size_) / 16u, 1, 1)
+                    [enc dispatchThreadgroups:MTLSizeMake(tgx_gu_m8, 1, 1)
                         threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
                     barrier();
 
-                    [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_ane_hf4_down_sk_bf16_];
+                    [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_ane_hf4_down_sk4_bf16_];
                     [enc setBuffer:(id<MTLBuffer>)sl.hwx_buf offset:0 atIndex:0];
                     [enc setBuffer:(id<MTLBuffer>)sl.buf_scales_offs offset:0 atIndex:1];
                     [enc setBuffer:(id<MTLBuffer>)buf_mlp_gate_ offset:0 atIndex:2];
                     [enc setBuffer:(id<MTLBuffer>)buf_sk_part_ offset:0 atIndex:3];
                     [enc setBytes:&ap length:sizeof(ap) atIndex:4];
-                    [enc dispatchThreadgroups:MTLSizeMake(static_cast<uint32_t>(hidden_size_) / 32u, 1, 8)
-                        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                    [enc dispatchThreadgroups:MTLSizeMake(tgx_dn_sk, 1, sk_down)
+                        threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
                     barrier();
                 }
-                QmmSkParams sp{sub, static_cast<uint32_t>(hidden_size_), static_cast<uint32_t>(intermediate_size_), 1u, 8u};
+                QmmSkParams sp{sub, static_cast<uint32_t>(hidden_size_), static_cast<uint32_t>(intermediate_size_), 1u, sk_down};
                 [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_mma_sk_reduce_];
                 [enc setBuffer:(id<MTLBuffer>)buf_sk_part_ offset:0 atIndex:0];
                 [enc setBuffer:(id<MTLBuffer>)buf_hidden_ offset:y_off atIndex:1];
@@ -1408,9 +1863,60 @@ void Qwen38Model::encode_mlp_q4(id enc_id, const LayerWeights& lw, uint32_t M,
             }
             return;
         }
-        // Large GPU-only chunks (M > 96): BM=64, BN=64 tiled hf4 directly from single-copy model.hwx!
-        ap.M = M;
+        // Mid-batch / Co-Exec (17 <= M <= 160): Fused BM=32 double-buffered SwiGLU + Split-K down_proj!
+        // Uses buf_mlp_up_ (34 MiB, unused since swiglu_tiled32 is fused!) as partY -> NEVER buf_sk_part_ (1.25 MiB)!
+        if (M <= 160u && pso_ane_hf4_swiglu_tiled32_ != nil && pso_ane_hf4_down_tiled32_sk_ != nil) {
+            AneShareParams ap = make_ane_share_params(sl, M);
+            const uint32_t m_tiles  = ceil_div(M, 32u);
+            const uint32_t tgx_gu32 = sl.n_subblocks * ceil_div(sl.sub_size / 8u, 4u);
+            const uint32_t tgx_dn32 = 16u * ceil_div(sl.hidden_size / 128u, 4u);
+            const uint32_t n_q      = 2u * sl.n_subblocks;
+            const uint32_t want_sk  = (M <= 64u) ? 4u : 2u;
+            const size_t part_cap   = [(id<MTLBuffer>)buf_mlp_up_ length];
+            uint32_t sk = 1u;
+            for (uint32_t cand : {want_sk, 2u, 1u}) {
+                if (cand <= n_q && (n_q % cand == 0u) &&
+                    static_cast<size_t>(cand) * M * hidden_size_ * sizeof(float) <= part_cap) {
+                    sk = cand;
+                    break;
+                }
+            }
+
+            [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_ane_hf4_swiglu_tiled32_];
+            [enc setBuffer:(id<MTLBuffer>)sl.hwx_buf offset:0 atIndex:0];
+            [enc setBuffer:(id<MTLBuffer>)sl.buf_scales_offs offset:0 atIndex:1];
+            [enc setBuffer:(id<MTLBuffer>)buf_normed_ offset:0 atIndex:2];
+            [enc setBuffer:(id<MTLBuffer>)buf_mlp_gate_ offset:0 atIndex:3];
+            [enc setBytes:&ap length:sizeof(ap) atIndex:4];
+            [enc dispatchThreadgroups:MTLSizeMake(tgx_gu32, m_tiles, 1u)
+                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            barrier();
+
+            [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_ane_hf4_down_tiled32_sk_];
+            [enc setBuffer:(id<MTLBuffer>)sl.hwx_buf offset:0 atIndex:0];
+            [enc setBuffer:(id<MTLBuffer>)sl.buf_scales_offs offset:0 atIndex:1];
+            [enc setBuffer:(id<MTLBuffer>)buf_mlp_gate_ offset:0 atIndex:2];
+            [enc setBuffer:(id<MTLBuffer>)buf_mlp_up_ offset:0 atIndex:3];
+            [enc setBytes:&ap length:sizeof(ap) atIndex:4];
+            [enc dispatchThreadgroups:MTLSizeMake(tgx_dn32, m_tiles, sk)
+                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            barrier();
+
+            QmmSkParams sp{M, static_cast<uint32_t>(hidden_size_), static_cast<uint32_t>(intermediate_size_), 1u, sk};
+            [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_mma_sk_reduce_];
+            [enc setBuffer:(id<MTLBuffer>)buf_mlp_up_ offset:0 atIndex:0];
+            [enc setBuffer:(id<MTLBuffer>)buf_hidden_ offset:hid_off atIndex:1];
+            [enc setBytes:&sp length:sizeof(sp) atIndex:2];
+            [enc dispatchThreads:MTLSizeMake(M * static_cast<uint32_t>(hidden_size_), 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            barrier();
+            return;
+        }
+        // Large GPU-only chunks (M > 160): BM=64, BN=64 tiled hf4 directly from single-copy model.hwx!
+        AneShareParams ap = make_ane_share_params(sl, M);
         const uint32_t m_tiles = ceil_div(M, 64u);
+        const uint32_t tgx_tiled_gu = sl.n_subblocks * ceil_div(sl.sub_size / 8u, 8u);
+        const uint32_t tgx_tiled_dn = 16u * ceil_div(sl.hidden_size / 128u, 8u);
         [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_ane_hf4_tiled_gateup_];
         [enc setBuffer:(id<MTLBuffer>)sl.hwx_buf offset:0 atIndex:0];
         [enc setBuffer:(id<MTLBuffer>)sl.buf_scales_offs offset:0 atIndex:1];
@@ -1418,7 +1924,7 @@ void Qwen38Model::encode_mlp_q4(id enc_id, const LayerWeights& lw, uint32_t M,
         [enc setBuffer:(id<MTLBuffer>)buf_mlp_gate_ offset:0 atIndex:3];
         [enc setBuffer:(id<MTLBuffer>)buf_mlp_up_ offset:0 atIndex:4];
         [enc setBytes:&ap length:sizeof(ap) atIndex:5];
-        [enc dispatchThreadgroups:MTLSizeMake(272u, m_tiles, 2u)
+        [enc dispatchThreadgroups:MTLSizeMake(tgx_tiled_gu, m_tiles, 2u)
             threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
         barrier();
 
@@ -1437,7 +1943,7 @@ void Qwen38Model::encode_mlp_q4(id enc_id, const LayerWeights& lw, uint32_t M,
         [enc setBuffer:(id<MTLBuffer>)buf_mlp_gate_ offset:0 atIndex:2];
         [enc setBuffer:(id<MTLBuffer>)buf_hidden_ offset:0 atIndex:3];
         [enc setBytes:&ap length:sizeof(ap) atIndex:4];
-        [enc dispatchThreadgroups:MTLSizeMake(80u, m_tiles, 1u)
+        [enc dispatchThreadgroups:MTLSizeMake(tgx_tiled_dn, m_tiles, 1u)
             threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
         barrier();
         return;
@@ -1560,7 +2066,7 @@ void Qwen38Model::encode_layer_attn_only(
 
         uint32_t kv_len = static_cast<uint32_t>(start_pos + static_cast<int>(M));
         bool use_vsplit = (M <= 8u && kv_len >= 128u && head_dim_ == 256 && (num_heads_ % num_kv_heads_ == 0));
-        bool use_gqa6 = use_vsplit && (num_heads_ == num_kv_heads_ * 6) && (kv_len >= 4096u);
+        bool use_gqa6 = use_vsplit && (num_heads_ == num_kv_heads_ * 6) && (kv_len >= 1024u);
         uint32_t splits = use_gqa6
             ? ((kv_len >= 32768u) ? 128u : ((kv_len >= 8192u) ? 64u : 32u))
             : (use_vsplit ? ((kv_len >= 4096u) ? 16u : ((kv_len >= 1024u) ? 8u : 4u))
@@ -1573,15 +2079,31 @@ void Qwen38Model::encode_layer_attn_only(
         };
 
         const bool qkv = (st.k_sb != nil);
+        const uint32_t M_pad = (M + 63u) & ~63u;
+        const bool use_hier = (!use_vsplit) && (splits <= 1u) && use_f16 && (M >= 64u) && (M <= 1024u) &&
+                              (head_dim_ == 256) && (start_pos >= 1024) && (num_heads_ % num_kv_heads_ == 0) &&
+                              (static_cast<size_t>(M_pad) * num_heads_ * head_dim_ * 2u <= [(id<MTLBuffer>)buf_qkv_conv_ length]) &&
+                              (static_cast<size_t>(M) * num_heads_ * head_dim_ * 4u <= [(id<MTLBuffer>)buf_split_o_ length]);
         if (cur_mrope_buf_ != nil) {
-            [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_fa_q_prep_mrope_];
-            [enc setBuffer:(id<MTLBuffer>)buf_qkv_ offset:0 atIndex:0];
-            [enc setBuffer:(id<MTLBuffer>)lw.q_norm.buffer offset:lw.q_norm.offset atIndex:1];
-            [enc setBuffer:(id<MTLBuffer>)buf_q_ offset:0 atIndex:2];
-            [enc setBuffer:(id<MTLBuffer>)buf_z_ offset:0 atIndex:3];
-            [enc setBytes:&fp length:sizeof(fp) atIndex:4];
-            [enc setBuffer:(id<MTLBuffer>)cur_mrope_buf_ offset:cur_mrope_off_ atIndex:5];
-            [enc dispatchThreadgroups:MTLSizeMake(num_heads_, M, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            if (use_hier) {
+                [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_fa_q_prep_mrope_hier_];
+                [enc setBuffer:(id<MTLBuffer>)buf_qkv_ offset:0 atIndex:0];
+                [enc setBuffer:(id<MTLBuffer>)lw.q_norm.buffer offset:lw.q_norm.offset atIndex:1];
+                [enc setBuffer:(id<MTLBuffer>)buf_qkv_conv_ offset:0 atIndex:2];
+                [enc setBuffer:(id<MTLBuffer>)buf_z_ offset:0 atIndex:3];
+                [enc setBytes:&fp length:sizeof(fp) atIndex:4];
+                [enc setBuffer:(id<MTLBuffer>)cur_mrope_buf_ offset:cur_mrope_off_ atIndex:5];
+                [enc dispatchThreadgroups:MTLSizeMake(num_heads_, M_pad, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            } else {
+                [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_fa_q_prep_mrope_];
+                [enc setBuffer:(id<MTLBuffer>)buf_qkv_ offset:0 atIndex:0];
+                [enc setBuffer:(id<MTLBuffer>)lw.q_norm.buffer offset:lw.q_norm.offset atIndex:1];
+                [enc setBuffer:(id<MTLBuffer>)buf_q_ offset:0 atIndex:2];
+                [enc setBuffer:(id<MTLBuffer>)buf_z_ offset:0 atIndex:3];
+                [enc setBytes:&fp length:sizeof(fp) atIndex:4];
+                [enc setBuffer:(id<MTLBuffer>)cur_mrope_buf_ offset:cur_mrope_off_ atIndex:5];
+                [enc dispatchThreadgroups:MTLSizeMake(num_heads_, M, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            }
 
             if (qkv) {
                 [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_fa_kv_prep_mrope_q_];
@@ -1607,13 +2129,23 @@ void Qwen38Model::encode_layer_attn_only(
                 [enc dispatchThreadgroups:MTLSizeMake(num_kv_heads_, M, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
             }
         } else {
-            [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_fa_q_prep_];
-            [enc setBuffer:(id<MTLBuffer>)buf_qkv_ offset:0 atIndex:0];
-            [enc setBuffer:(id<MTLBuffer>)lw.q_norm.buffer offset:lw.q_norm.offset atIndex:1];
-            [enc setBuffer:(id<MTLBuffer>)buf_q_ offset:0 atIndex:2];
-            [enc setBuffer:(id<MTLBuffer>)buf_z_ offset:0 atIndex:3];
-            [enc setBytes:&fp length:sizeof(fp) atIndex:4];
-            [enc dispatchThreadgroups:MTLSizeMake(num_heads_, M, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            if (use_hier) {
+                [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_fa_q_prep_hier_];
+                [enc setBuffer:(id<MTLBuffer>)buf_qkv_ offset:0 atIndex:0];
+                [enc setBuffer:(id<MTLBuffer>)lw.q_norm.buffer offset:lw.q_norm.offset atIndex:1];
+                [enc setBuffer:(id<MTLBuffer>)buf_qkv_conv_ offset:0 atIndex:2];
+                [enc setBuffer:(id<MTLBuffer>)buf_z_ offset:0 atIndex:3];
+                [enc setBytes:&fp length:sizeof(fp) atIndex:4];
+                [enc dispatchThreadgroups:MTLSizeMake(num_heads_, M_pad, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            } else {
+                [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_fa_q_prep_];
+                [enc setBuffer:(id<MTLBuffer>)buf_qkv_ offset:0 atIndex:0];
+                [enc setBuffer:(id<MTLBuffer>)lw.q_norm.buffer offset:lw.q_norm.offset atIndex:1];
+                [enc setBuffer:(id<MTLBuffer>)buf_q_ offset:0 atIndex:2];
+                [enc setBuffer:(id<MTLBuffer>)buf_z_ offset:0 atIndex:3];
+                [enc setBytes:&fp length:sizeof(fp) atIndex:4];
+                [enc dispatchThreadgroups:MTLSizeMake(num_heads_, M, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            }
 
             if (qkv) {
                 [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_fa_kv_prep_q_];
@@ -1732,7 +2264,7 @@ void Qwen38Model::encode_layer_attn_only(
             [enc setBuffer:(id<MTLBuffer>)buf_z_ offset:0 atIndex:3];
             [enc setBuffer:(id<MTLBuffer>)buf_attn_out_ offset:0 atIndex:4];
             [enc setBytes:&fp length:sizeof(fp) atIndex:5];
-            [enc dispatchThreadgroups:MTLSizeMake(num_heads_, M, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            [enc dispatchThreadgroups:MTLSizeMake(num_heads_, M, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
         } else if (splits > 1u) {
             if (qkv) {
                 [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_fa_split1_q_];
@@ -1767,19 +2299,10 @@ void Qwen38Model::encode_layer_attn_only(
             [enc setBytes:&fp length:sizeof(fp) atIndex:5];
             [enc dispatchThreadgroups:MTLSizeMake(num_heads_, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
         } else if (M >= 16u && head_dim_ == 256) {
-            const bool use_hier = use_f16 && (M >= 64u) && (M <= 1024u) && (start_pos >= 1024) &&
-                                  (num_heads_ % num_kv_heads_ == 0);
             if (use_hier) {
-                // 2-Level Hierarchical FP16-AMX + Periodic FP32 Flush FlashAttention-2 (BQ=64, BK=32, 11.20 TFLOPs!)
-                // Reuses buf_qkv_conv_ for packed q_h (<=12 MB) and buf_split_o_ for o_f32 (<=24 MB) -> ZERO extra RAM!
-                uint32_t M_pad = (M + 63u) & ~63u;
+                // Single-Head Hierarchical FP16-AMX FlashAttention-2 (1 head x 64 Q-rows, 4 barriers/tile, CHUNK_K=1024!)
+                // q_h was already packed directly into buf_qkv_conv_ by qwen_full_attn_q_prep*_hier (zero extra pass/barrier!)
                 uint32_t gqa = static_cast<uint32_t>(num_heads_ / num_kv_heads_);
-                [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_pack_q_pf_h_];
-                [enc setBuffer:(id<MTLBuffer>)buf_q_ offset:0 atIndex:0];
-                [enc setBuffer:(id<MTLBuffer>)buf_qkv_conv_ offset:0 atIndex:1];
-                [enc setBytes:&fp length:sizeof(fp) atIndex:2];
-                [enc dispatchThreadgroups:MTLSizeMake(num_heads_, M_pad, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
-                barrier();
                 if (qkv) {
                     [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_fa_prefill_hier_q_f16_];
                     [enc setBuffer:(id<MTLBuffer>)buf_qkv_conv_ offset:0 atIndex:0];
@@ -2141,6 +2664,180 @@ void Qwen38Model::encode_final_norm_and_mtp(
     }
 }
 
+void Qwen38Model::encode_ane_tail_mlp(id enc_id, const LayerWeights& lw, id hid_buf, size_t tail_hid_off, uint32_t gm) {
+    id<MTLComputeCommandEncoder> enc = enc_id;
+    auto barrier = [&]() { [enc memoryBarrierWithScope:MTLBarrierScopeBuffers]; };
+
+    const TensorView& pan = (lw.ane_share_idx >= 0) ? lw.post_attn_norm_share : lw.post_attn_norm;
+    NormParams np{gm, static_cast<uint32_t>(hidden_size_), rms_eps_};
+    [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_rmsnorm_f16_];
+    [enc setBuffer:(id<MTLBuffer>)hid_buf offset:tail_hid_off atIndex:0];
+    [enc setBuffer:(id<MTLBuffer>)pan.buffer offset:pan.offset atIndex:1];
+    [enc setBuffer:(id<MTLBuffer>)buf_normed_ offset:0 atIndex:2];
+    [enc setBytes:&np length:sizeof(np) atIndex:3];
+    [enc dispatchThreadgroups:MTLSizeMake(gm, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    barrier();
+
+    if (lw.ane_share_idx >= 0 && ane_share_ && ane_share_->has_layer(lw.ane_share_idx)) {
+        const AneShareLayer& sl = ane_share_->layer(lw.ane_share_idx);
+        if (gm <= 64u) {
+            // Fast M<=8 micro-batched hf4/lut4 SwiGLU + Split-K down_proj (376 GB/s -> ~23 ms per 8 tok, ~185 ms for gm=64!)
+            const uint32_t tgx_gu_m1 = ceil_div(sl.intermediate_size / 8u, 4u);
+            const uint32_t tgx_gu_m8 = sl.intermediate_size / 16u;
+            const uint32_t tgx_dn_sk = 16u * ceil_div(sl.hidden_size / 128u, 4u);
+            const uint32_t sk_down   = 2u * sl.n_subblocks;
+            for (uint32_t m0 = 0u; m0 < gm; m0 += 8u) {
+                uint32_t sub = std::min<uint32_t>(8u, gm - m0);
+                AneShareParams ap = make_ane_share_params(sl, sub);
+                size_t x_off = static_cast<size_t>(m0) * hidden_size_ * sizeof(uint16_t);
+                size_t y_off = tail_hid_off + static_cast<size_t>(m0) * hidden_size_ * sizeof(float);
+                if (sub == 1u) {
+                    [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_ane_hf4_swiglu_m1_];
+                    [enc setBuffer:(id<MTLBuffer>)sl.hwx_buf offset:0 atIndex:0];
+                    [enc setBuffer:(id<MTLBuffer>)sl.buf_scales_offs offset:0 atIndex:1];
+                    [enc setBuffer:(id<MTLBuffer>)buf_normed_ offset:x_off atIndex:2];
+                    [enc setBuffer:(id<MTLBuffer>)buf_mlp_gate_ offset:0 atIndex:3];
+                    [enc setBytes:&ap length:sizeof(ap) atIndex:4];
+                    [enc dispatchThreadgroups:MTLSizeMake(tgx_gu_m1, 1, 1)
+                        threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                    barrier();
+
+                    [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_ane_hf4_down_m1_sk_];
+                    [enc setBuffer:(id<MTLBuffer>)sl.hwx_buf offset:0 atIndex:0];
+                    [enc setBuffer:(id<MTLBuffer>)sl.buf_scales_offs offset:0 atIndex:1];
+                    [enc setBuffer:(id<MTLBuffer>)buf_mlp_gate_ offset:0 atIndex:2];
+                    [enc setBuffer:(id<MTLBuffer>)buf_sk_part_ offset:0 atIndex:3];
+                    [enc setBytes:&ap length:sizeof(ap) atIndex:4];
+                    [enc dispatchThreadgroups:MTLSizeMake(tgx_dn_sk, 1, sk_down)
+                        threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                    barrier();
+                } else {
+                    [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_ane_hf4_swiglu_bf16_];
+                    [enc setBuffer:(id<MTLBuffer>)sl.hwx_buf offset:0 atIndex:0];
+                    [enc setBuffer:(id<MTLBuffer>)sl.buf_scales_offs offset:0 atIndex:1];
+                    [enc setBuffer:(id<MTLBuffer>)buf_normed_ offset:x_off atIndex:2];
+                    [enc setBuffer:(id<MTLBuffer>)buf_mlp_gate_ offset:0 atIndex:3];
+                    [enc setBytes:&ap length:sizeof(ap) atIndex:4];
+                    [enc dispatchThreadgroups:MTLSizeMake(tgx_gu_m8, 1, 1)
+                        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                    barrier();
+
+                    [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_ane_hf4_down_sk4_bf16_];
+                    [enc setBuffer:(id<MTLBuffer>)sl.hwx_buf offset:0 atIndex:0];
+                    [enc setBuffer:(id<MTLBuffer>)sl.buf_scales_offs offset:0 atIndex:1];
+                    [enc setBuffer:(id<MTLBuffer>)buf_mlp_gate_ offset:0 atIndex:2];
+                    [enc setBuffer:(id<MTLBuffer>)buf_sk_part_ offset:0 atIndex:3];
+                    [enc setBytes:&ap length:sizeof(ap) atIndex:4];
+                    [enc dispatchThreadgroups:MTLSizeMake(tgx_dn_sk, 1, sk_down)
+                        threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                    barrier();
+                }
+                QmmSkParams sp{sub, static_cast<uint32_t>(hidden_size_), static_cast<uint32_t>(intermediate_size_), 1u, sk_down};
+                [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_mma_sk_reduce_];
+                [enc setBuffer:(id<MTLBuffer>)buf_sk_part_ offset:0 atIndex:0];
+                [enc setBuffer:(id<MTLBuffer>)hid_buf offset:y_off atIndex:1];
+                [enc setBytes:&sp length:sizeof(sp) atIndex:2];
+                [enc dispatchThreads:MTLSizeMake(sub * static_cast<uint32_t>(hidden_size_), 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                if (m0 + 8u < gm) barrier();
+            }
+        } else if (gm <= 160u && pso_ane_hf4_swiglu_tiled32_ != nil && pso_ane_hf4_down_tiled32_sk_ != nil) {
+            // Co-Exec / Short-Prompt Fused BM=32 double-buffered SwiGLU + Split-K down_proj!
+            // Binds buf_mlp_up_ (34 MiB, unused by fused swiglu_tiled32!) as partY -> NEVER buf_sk_part_!
+            AneShareParams ap = make_ane_share_params(sl, gm);
+            const uint32_t m_tiles  = ceil_div(gm, 32u);
+            const uint32_t tgx_gu32 = sl.n_subblocks * ceil_div(sl.sub_size / 8u, 4u);
+            const uint32_t tgx_dn32 = 16u * ceil_div(sl.hidden_size / 128u, 4u);
+            const uint32_t n_q      = 2u * sl.n_subblocks;
+            const uint32_t want_sk  = (gm <= 64u) ? 4u : 2u;
+            const size_t part_cap   = [(id<MTLBuffer>)buf_mlp_up_ length];
+            uint32_t sk = 1u;
+            for (uint32_t cand : {want_sk, 2u, 1u}) {
+                if (cand <= n_q && (n_q % cand == 0u) &&
+                    static_cast<size_t>(cand) * gm * hidden_size_ * sizeof(float) <= part_cap) {
+                    sk = cand;
+                    break;
+                }
+            }
+
+            [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_ane_hf4_swiglu_tiled32_];
+            [enc setBuffer:(id<MTLBuffer>)sl.hwx_buf offset:0 atIndex:0];
+            [enc setBuffer:(id<MTLBuffer>)sl.buf_scales_offs offset:0 atIndex:1];
+            [enc setBuffer:(id<MTLBuffer>)buf_normed_ offset:0 atIndex:2];
+            [enc setBuffer:(id<MTLBuffer>)buf_mlp_gate_ offset:0 atIndex:3];
+            [enc setBytes:&ap length:sizeof(ap) atIndex:4];
+            [enc dispatchThreadgroups:MTLSizeMake(tgx_gu32, m_tiles, 1u)
+                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            barrier();
+
+            [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_ane_hf4_down_tiled32_sk_];
+            [enc setBuffer:(id<MTLBuffer>)sl.hwx_buf offset:0 atIndex:0];
+            [enc setBuffer:(id<MTLBuffer>)sl.buf_scales_offs offset:0 atIndex:1];
+            [enc setBuffer:(id<MTLBuffer>)buf_mlp_gate_ offset:0 atIndex:2];
+            [enc setBuffer:(id<MTLBuffer>)buf_mlp_up_ offset:0 atIndex:3];
+            [enc setBytes:&ap length:sizeof(ap) atIndex:4];
+            [enc dispatchThreadgroups:MTLSizeMake(tgx_dn32, m_tiles, sk)
+                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            barrier();
+
+            QmmSkParams sp{gm, static_cast<uint32_t>(hidden_size_), static_cast<uint32_t>(intermediate_size_), 1u, sk};
+            [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_mma_sk_reduce_];
+            [enc setBuffer:(id<MTLBuffer>)buf_mlp_up_ offset:0 atIndex:0];
+            [enc setBuffer:(id<MTLBuffer>)hid_buf offset:tail_hid_off atIndex:1];
+            [enc setBytes:&sp length:sizeof(sp) atIndex:2];
+            [enc dispatchThreads:MTLSizeMake(gm * static_cast<uint32_t>(hidden_size_), 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        } else {
+            AneShareParams ap = make_ane_share_params(sl, gm);
+            const uint32_t m_tiles = ceil_div(gm, 64u);
+            const uint32_t tgx_tiled_gu = sl.n_subblocks * ceil_div(sl.sub_size / 8u, 8u);
+            const uint32_t tgx_tiled_dn = 16u * ceil_div(sl.hidden_size / 128u, 8u);
+
+            [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_ane_hf4_tiled_gateup_];
+            [enc setBuffer:(id<MTLBuffer>)sl.hwx_buf offset:0 atIndex:0];
+            [enc setBuffer:(id<MTLBuffer>)sl.buf_scales_offs offset:0 atIndex:1];
+            [enc setBuffer:(id<MTLBuffer>)buf_normed_ offset:0 atIndex:2];
+            [enc setBuffer:(id<MTLBuffer>)buf_mlp_gate_ offset:0 atIndex:3];
+            [enc setBuffer:(id<MTLBuffer>)buf_mlp_up_ offset:0 atIndex:4];
+            [enc setBytes:&ap length:sizeof(ap) atIndex:5];
+            [enc dispatchThreadgroups:MTLSizeMake(tgx_tiled_gu, m_tiles, 2u)
+                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            barrier();
+
+            uint32_t n_elem = gm * static_cast<uint32_t>(intermediate_size_);
+            [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_swiglu_f16_];
+            [enc setBuffer:(id<MTLBuffer>)buf_mlp_gate_ offset:0 atIndex:0];
+            [enc setBuffer:(id<MTLBuffer>)buf_mlp_up_ offset:0 atIndex:1];
+            [enc setBuffer:(id<MTLBuffer>)buf_mlp_gate_ offset:0 atIndex:2];
+            [enc setBytes:&n_elem length:sizeof(n_elem) atIndex:3];
+            [enc dispatchThreads:MTLSizeMake(n_elem, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            barrier();
+
+            [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_ane_hf4_tiled_down_];
+            [enc setBuffer:(id<MTLBuffer>)sl.hwx_buf offset:0 atIndex:0];
+            [enc setBuffer:(id<MTLBuffer>)sl.buf_scales_offs offset:0 atIndex:1];
+            [enc setBuffer:(id<MTLBuffer>)buf_mlp_gate_ offset:0 atIndex:2];
+            [enc setBuffer:(id<MTLBuffer>)hid_buf offset:tail_hid_off atIndex:3];
+            [enc setBytes:&ap length:sizeof(ap) atIndex:4];
+            [enc dispatchThreadgroups:MTLSizeMake(tgx_tiled_dn, m_tiles, 1u)
+                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        }
+    } else {
+        encode_qmm_q4_f16x(enc, lw.gate_proj, buf_normed_, 0, buf_mlp_gate_, 0, gm, false);
+        encode_qmm_q4_f16x(enc, lw.up_proj,   buf_normed_, 0, buf_mlp_up_,   0, gm, false);
+        barrier();
+        uint32_t n_elem = gm * static_cast<uint32_t>(intermediate_size_);
+        [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_swiglu_f16_];
+        [enc setBuffer:(id<MTLBuffer>)buf_mlp_gate_ offset:0 atIndex:0];
+        [enc setBuffer:(id<MTLBuffer>)buf_mlp_up_ offset:0 atIndex:1];
+        [enc setBuffer:(id<MTLBuffer>)buf_mlp_gate_ offset:0 atIndex:2];
+        [enc setBytes:&n_elem length:sizeof(n_elem) atIndex:3];
+        [enc dispatchThreads:MTLSizeMake(n_elem, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        barrier();
+        encode_qmm_q4_f16x(enc, lw.down_proj, buf_mlp_gate_, 0, hid_buf, tail_hid_off, gm, true);
+    }
+}
+
 void Qwen38Model::forward_ane_chunk(const int* tokens, int n_chunk, bool is_last, bool compute_argmax,
                                     const int* pos3d, const float* const* vis_ptrs) {
     // Two-Half Zero-Copy GPU || ANE Pipelined Prefill:
@@ -2149,17 +2846,89 @@ void Qwen38Model::forward_ane_chunk(const int* tokens, int n_chunk, bool is_last
     const int blk = ane_->block_rows(); // 256
     const int ane_max_half = AneMlpEngine::MAX_SUBS * blk; // 512
     const int n_pieces = ane_->num_pieces();
-    const int mA = n_chunk / 2;
-    const int mB = n_chunk - mA;
+    const int single_tail_max = 64; // <= 64 GPU tail rows absorbed onto Half B ONLY (keeps Half A exact 256/512!)
+    const int gpu_cores = ctx_.estimated_gpu_cores();
+    int mA = 0, mB = 0;
+    int ane_m[2] = { 0, 0 };
+    int gpu_m[2] = { 0, 0 };
+    if (gpu_cores >= 32 && pos_ < 4096 && n_chunk <= blk + 128) {
+        // Short-prompt asymmetric qs={1,0} split (176..384 on Max/Ultra):
+        // Keep mB=64 for 176..320 (1 Attn+GDN 64-tile + 185 ms M=8 AMX MLP = ~257 ms, 100% hidden inside ~355 ms ANE window -> N=256 ~470 tok/s!)
+        if (n_chunk <= blk + 64) {
+            mB = std::min(64, n_chunk / 2);
+            mA = n_chunk - mB;
+        } else {
+            // 321..384: fill ANE Half A to exact 256, put 65..128 on GPU Half B via fused tiled32!
+            mA = blk;
+            mB = n_chunk - blk;
+        }
+        ane_m[0] = mA; ane_m[1] = 0;
+        gpu_m[0] = 0;  gpu_m[1] = mB;
+    } else if (gpu_cores >= 18 && gpu_cores < 32 && pos_ < 4096 && n_chunk <= blk + 64) {
+        // Pro-tier asymmetric qs={1,0} split (96..320): smaller 64-tok GPU Half B fits inside ANE window!
+        mB = std::min(64, n_chunk / 2);
+        mA = n_chunk - mB;
+        ane_m[0] = mA; ane_m[1] = 0;
+        gpu_m[0] = 0;  gpu_m[1] = mB;
+    } else if (n_chunk <= 2 * blk) {
+        // <= 512: qs={1,1}, zero GPU tail
+        mA = n_chunk / 2;
+        mB = n_chunk - mA;
+        ane_m[0] = mA; ane_m[1] = mB;
+    } else if (n_chunk <= 2 * blk + single_tail_max) {
+        // 513..576 (e.g. 512+chat = 528): keep Half A exact 256 (0 extra 64-row M-tile!), put 1..64 tail on Half B ONLY!
+        mA = blk;
+        mB = n_chunk - blk;
+        ane_m[0] = blk; ane_m[1] = blk;
+        gpu_m[0] = 0;   gpu_m[1] = mB - blk;
+    } else if (n_chunk <= 3 * blk) {
+        // 577..768: asymmetric 3-sub-block split qs={1,2} (25% less ANE work & faster L0 Half-A pipeline start!)
+        mA = blk;
+        mB = n_chunk - blk;
+        ane_m[0] = mA; ane_m[1] = mB;
+    } else if (n_chunk <= 3 * blk + single_tail_max) {
+        // 769..832: qs={1,2} ({256,512} on ANE) + 1..64 GPU tail on Half B ONLY (Half A stays exact 256!)
+        mA = blk;
+        mB = n_chunk - blk;
+        ane_m[0] = blk;
+        ane_m[1] = 2 * blk;
+        gpu_m[0] = 0;
+        gpu_m[1] = mB - 2 * blk;
+    } else if (n_chunk <= 2 * ane_max_half) {
+        // 833..1024: qs={2,2}, zero GPU tail
+        mA = n_chunk / 2;
+        mB = n_chunk - mA;
+        ane_m[0] = mA; ane_m[1] = mB;
+    } else if (n_chunk <= 2 * ane_max_half + single_tail_max) {
+        // 1025..1088 (e.g. 4k+chat tail = 1040): keep Half A exact 512 (0 extra 64-row M-tile & FA-2 Q-tile!),
+        // put 1..64 tail on Half B ONLY (mB <= 576 fits C_attn)!
+        mA = ane_max_half;
+        mB = n_chunk - ane_max_half;
+        ane_m[0] = ane_max_half; ane_m[1] = ane_max_half;
+        gpu_m[0] = 0;            gpu_m[1] = mB - ane_max_half;
+    } else {
+        // 1089..1152: qs={2,2} with 512/half on ANE + split 65..128 tail across both halves (<= 64/half)
+        mA = n_chunk / 2;
+        mB = n_chunk - mA;
+        ane_m[0] = std::min(mA, ane_max_half);
+        ane_m[1] = std::min(mB, ane_max_half);
+        gpu_m[0] = mA - ane_m[0];
+        gpu_m[1] = mB - ane_m[1];
+    }
     const int ms[2] = { mA, mB };
-    const int ane_m[2] = { std::min(mA, ane_max_half), std::min(mB, ane_max_half) };
-    const int gpu_m[2] = { mA - ane_m[0], mB - ane_m[1] };
-    const int qs[2] = { (ane_m[0] + blk - 1) / blk, (ane_m[1] + blk - 1) / blk };
+    const int qs[2] = { (ane_m[0] > 0) ? ((ane_m[0] + blk - 1) / blk) : 0,
+                        (ane_m[1] > 0) ? ((ane_m[1] + blk - 1) / blk) : 0 };
     const int pos_off[2] = { pos_, pos_ + mA };
     const size_t tok_off[2] = { 0, static_cast<size_t>(mA) * sizeof(int) };
     id hid_bufs[2] = { buf_hidden_, buf_hidden_alt_ };
 
     std::memcpy([(id<MTLBuffer>)buf_token_ids_ contents], tokens, static_cast<size_t>(n_chunk) * sizeof(int));
+    if (use_cpu_embed_) {
+        cpu_embed_.gather_f32(tokens, ms[0], reinterpret_cast<float*>([(id<MTLBuffer>)buf_hidden_ contents]));
+        if (ms[1] > 0) {
+            cpu_embed_.gather_f32(tokens + mA, ms[1], reinterpret_cast<float*>([(id<MTLBuffer>)buf_hidden_alt_ contents]));
+        }
+    }
 
     // Optional Multimodal 3D M-RoPE + Vision Embedding Scatter setup (zero overhead on pure text!)
     size_t mrope_off[2] = { 0, static_cast<size_t>(mA) * 3 * sizeof(int) };
@@ -2250,7 +3019,7 @@ void Qwen38Model::forward_ane_chunk(const int* tokens, int n_chunk, bool is_last
 
     const bool prof = (std::getenv("ANE_PROF") != nullptr);
     double gpu_wait_ms = 0.0, ane_wait_ms = 0.0;
-    bool ane_inflight = false;
+    bool slot_inflight[2] = { false, false };
 
     auto encode_step_cb = [&](int L, int s) -> id<MTLCommandBuffer> {
         const LayerWeights& lw = layers_[L];
@@ -2264,16 +3033,18 @@ void Qwen38Model::forward_ane_chunk(const int* tokens, int n_chunk, bool is_last
 
         bool skip_norm = false;
         if (L == 0) {
-            EmbedParams ep{static_cast<uint32_t>(ms[s]), static_cast<uint32_t>(hidden_size_), rms_eps_};
-            [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_embed_];
-            [enc setBuffer:(id<MTLBuffer>)embed_tokens_.w.buffer offset:embed_tokens_.w.offset atIndex:0];
-            [enc setBuffer:(id<MTLBuffer>)embed_tokens_.s.buffer offset:embed_tokens_.s.offset atIndex:1];
-            [enc setBuffer:(id<MTLBuffer>)embed_tokens_.b.buffer offset:embed_tokens_.b.offset atIndex:2];
-            [enc setBuffer:(id<MTLBuffer>)buf_token_ids_ offset:tok_off[s] atIndex:3];
-            [enc setBuffer:(id<MTLBuffer>)hid_bufs[s] offset:0 atIndex:4];
-            [enc setBytes:&ep length:sizeof(ep) atIndex:5];
-            [enc dispatchThreads:MTLSizeMake(hidden_size_, ms[s], 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-            barrier();
+            if (!use_cpu_embed_) {
+                EmbedParams ep{static_cast<uint32_t>(ms[s]), static_cast<uint32_t>(hidden_size_), rms_eps_};
+                [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_embed_];
+                [enc setBuffer:(id<MTLBuffer>)embed_tokens_.w.buffer offset:embed_tokens_.w.offset atIndex:0];
+                [enc setBuffer:(id<MTLBuffer>)embed_tokens_.s.buffer offset:embed_tokens_.s.offset atIndex:1];
+                [enc setBuffer:(id<MTLBuffer>)embed_tokens_.b.buffer offset:embed_tokens_.b.offset atIndex:2];
+                [enc setBuffer:(id<MTLBuffer>)buf_token_ids_ offset:tok_off[s] atIndex:3];
+                [enc setBuffer:(id<MTLBuffer>)hid_bufs[s] offset:0 atIndex:4];
+                [enc setBytes:&ep length:sizeof(ep) atIndex:5];
+                [enc dispatchThreads:MTLSizeMake(hidden_size_, ms[s], 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                barrier();
+            }
             if (vis_count[s] > 0) {
                 ScatterEmbedParams sp{vis_count[s], static_cast<uint32_t>(hidden_size_)};
                 [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_scatter_embeds_];
@@ -2306,7 +3077,7 @@ void Qwen38Model::forward_ane_chunk(const int* tokens, int n_chunk, bool is_last
             size_t hid_off = static_cast<size_t>(row0) * hidden_size_ * sizeof(float);
             AnePackParams pp{
                 sub_m, static_cast<uint32_t>(blk), static_cast<uint32_t>(hidden_size_),
-                static_cast<uint32_t>(AneMlpEngine::PACKED_WIDTH), has_inv1, rms_eps_
+                static_cast<uint32_t>(ane_->packed_width()), has_inv1, rms_eps_
             };
             [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_ane_pack_];
             [enc setBuffer:(id<MTLBuffer>)hid_bufs[s] offset:hid_off atIndex:0];
@@ -2322,73 +3093,16 @@ void Qwen38Model::forward_ane_chunk(const int* tokens, int n_chunk, bool is_last
         if (gpu_m[s] > 0) {
             uint32_t gm = static_cast<uint32_t>(gpu_m[s]);
             size_t tail_hid_off = static_cast<size_t>(ane_m[s]) * hidden_size_ * sizeof(float);
-            const TensorView& pan = (lw.ane_share_idx >= 0) ? lw.post_attn_norm_share : lw.post_attn_norm;
-            NormParams np{gm, static_cast<uint32_t>(hidden_size_), rms_eps_};
-            [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_rmsnorm_f16_];
-            [enc setBuffer:(id<MTLBuffer>)hid_bufs[s] offset:tail_hid_off atIndex:0];
-            [enc setBuffer:(id<MTLBuffer>)pan.buffer offset:pan.offset atIndex:1];
-            [enc setBuffer:(id<MTLBuffer>)buf_normed_ offset:0 atIndex:2];
-            [enc setBytes:&np length:sizeof(np) atIndex:3];
-            [enc dispatchThreadgroups:MTLSizeMake(gm, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-            barrier();
-
-            if (lw.ane_share_idx >= 0 && ane_share_ && ane_share_->has_layer(lw.ane_share_idx)) {
-                const AneShareLayer& sl = ane_share_->layer(lw.ane_share_idx);
-                AneShareParams ap{};
-                ap.M = gm;
-                ap.hdr_words = sl.hdr_words;
-                std::memcpy(ap.lin_base_w, sl.lin_base_w, sizeof(ap.lin_base_w));
-                std::memcpy(ap.lin_chunk_w, sl.lin_chunk_w, sizeof(ap.lin_chunk_w));
-                const uint32_t m_tiles = ceil_div(gm, 64u);
-
-                [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_ane_hf4_tiled_gateup_];
-                [enc setBuffer:(id<MTLBuffer>)sl.hwx_buf offset:0 atIndex:0];
-                [enc setBuffer:(id<MTLBuffer>)sl.buf_scales_offs offset:0 atIndex:1];
-                [enc setBuffer:(id<MTLBuffer>)buf_normed_ offset:0 atIndex:2];
-                [enc setBuffer:(id<MTLBuffer>)buf_mlp_gate_ offset:0 atIndex:3];
-                [enc setBuffer:(id<MTLBuffer>)buf_mlp_up_ offset:0 atIndex:4];
-                [enc setBytes:&ap length:sizeof(ap) atIndex:5];
-                [enc dispatchThreadgroups:MTLSizeMake(272u, m_tiles, 2u)
-                    threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
-                barrier();
-
-                uint32_t n_elem = gm * static_cast<uint32_t>(intermediate_size_);
-                [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_swiglu_f16_];
-                [enc setBuffer:(id<MTLBuffer>)buf_mlp_gate_ offset:0 atIndex:0];
-                [enc setBuffer:(id<MTLBuffer>)buf_mlp_up_ offset:0 atIndex:1];
-                [enc setBuffer:(id<MTLBuffer>)buf_mlp_gate_ offset:0 atIndex:2];
-                [enc setBytes:&n_elem length:sizeof(n_elem) atIndex:3];
-                [enc dispatchThreads:MTLSizeMake(n_elem, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-                barrier();
-
-                [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_ane_hf4_tiled_down_];
-                [enc setBuffer:(id<MTLBuffer>)sl.hwx_buf offset:0 atIndex:0];
-                [enc setBuffer:(id<MTLBuffer>)sl.buf_scales_offs offset:0 atIndex:1];
-                [enc setBuffer:(id<MTLBuffer>)buf_mlp_gate_ offset:0 atIndex:2];
-                [enc setBuffer:(id<MTLBuffer>)hid_bufs[s] offset:tail_hid_off atIndex:3];
-                [enc setBytes:&ap length:sizeof(ap) atIndex:4];
-                [enc dispatchThreadgroups:MTLSizeMake(80u, m_tiles, 1u)
-                    threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
-            } else {
-                encode_qmm_q4_f16x(enc, lw.gate_proj, buf_normed_, 0, buf_mlp_gate_, 0, gm, false);
-                encode_qmm_q4_f16x(enc, lw.up_proj,   buf_normed_, 0, buf_mlp_up_,   0, gm, false);
-                barrier();
-                uint32_t n_elem = gm * static_cast<uint32_t>(intermediate_size_);
-                [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_swiglu_f16_];
-                [enc setBuffer:(id<MTLBuffer>)buf_mlp_gate_ offset:0 atIndex:0];
-                [enc setBuffer:(id<MTLBuffer>)buf_mlp_up_ offset:0 atIndex:1];
-                [enc setBuffer:(id<MTLBuffer>)buf_mlp_gate_ offset:0 atIndex:2];
-                [enc setBytes:&n_elem length:sizeof(n_elem) atIndex:3];
-                [enc dispatchThreads:MTLSizeMake(n_elem, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-                barrier();
-                encode_qmm_q4_f16x(enc, lw.down_proj, buf_mlp_gate_, 0, hid_bufs[s], tail_hid_off, gm, true);
-            }
+            encode_ane_tail_mlp(enc, lw, hid_bufs[s], tail_hid_off, gm);
         }
         [enc endEncoding];
         return cb;
     };
 
-    // Zero-bubble CPU/GPU/ANE pipeline: encode next CB on CPU WHILE current CB executes on GPU!
+    // Zero-bubble CPU/GPU/ANE pipeline with Cross-Slot Async ANE Ring Pipelining:
+    //   - Encode next CB on CPU while GPU executes cur_cb (hides 100% of CPU encoding latency)
+    //   - When ANE-bound, submit slot s BEFORE waiting on slot (1-s) so ANE hardware ring never drains!
+    //   - When GPU-bound (slot 1-s already done), commit next GPU CB BEFORE submitting slot s!
     @autoreleasepool {
         const int total_steps = num_layers_ * 2;
         id<MTLCommandBuffer> cur_cb = encode_step_cb(0, 0);
@@ -2398,6 +3112,7 @@ void Qwen38Model::forward_ane_chunk(const int* tokens, int n_chunk, bool is_last
         for (int step = 0; step < total_steps; ++step) {
             int L = step >> 1;
             int s = step & 1;
+            int other = 1 - s;
 
             // Pre-encode NEXT step on CPU while GPU executes cur_cb (hides 100% of CPU encoding latency!)
             id<MTLCommandBuffer> next_cb = nil;
@@ -2407,25 +3122,44 @@ void Qwen38Model::forward_ane_chunk(const int* tokens, int n_chunk, bool is_last
 
             [cur_cb waitUntilCompleted];
             if (cur_cb.error) {
+                if (slot_inflight[0]) { ane_->wait_slot(0); slot_inflight[0] = false; }
+                if (slot_inflight[1]) { ane_->wait_slot(1); slot_inflight[1] = false; }
                 throw std::runtime_error(std::string("Metal ANE-pipeline GPU error: ") +
                                          [[cur_cb.error localizedDescription] UTF8String]);
             }
             auto tg1 = std::chrono::steady_clock::now();
             if (prof) gpu_wait_ms += std::chrono::duration<double, std::milli>(tg1 - tg0).count();
 
-            // Wait for the other half's ANE MLP before submitting this half's ANE MLP and launching next GPU CB
-            if (ane_inflight) {
-                ane_->wait();
-            }
-            auto ta1 = std::chrono::steady_clock::now();
-            if (prof) ane_wait_ms += std::chrono::duration<double, std::milli>(ta1 - tg1).count();
-            ane_->submit(L, s, qs[s]);
-            ane_inflight = true;
-
-            if (next_cb != nil) {
-                tg0 = std::chrono::steady_clock::now();
-                [next_cb commit];
-                cur_cb = next_cb;
+            if (slot_inflight[other] && ane_->is_slot_done(other)) {
+                // GPU-bound: slot `other` already finished on ANE -> acquire & resume GPU immediately, then submit slot `s`!
+                ane_->wait_slot(other);
+                slot_inflight[other] = false;
+                if (next_cb != nil) {
+                    tg0 = std::chrono::steady_clock::now();
+                    [next_cb commit];
+                    cur_cb = next_cb;
+                }
+                if (qs[s] > 0) {
+                    ane_->submit_slot(L, s, qs[s]);
+                    slot_inflight[s] = true;
+                }
+            } else {
+                // ANE-bound (or step 0): queue slot `s` into ANE ring FIRST (zero drain gap!), then wait on slot `other`!
+                if (qs[s] > 0) {
+                    ane_->submit_slot(L, s, qs[s]);
+                    slot_inflight[s] = true;
+                }
+                if (slot_inflight[other]) {
+                    auto ta0 = std::chrono::steady_clock::now();
+                    ane_->wait_slot(other);
+                    slot_inflight[other] = false;
+                    if (prof) ane_wait_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ta0).count();
+                }
+                if (next_cb != nil) {
+                    tg0 = std::chrono::steady_clock::now();
+                    [next_cb commit];
+                    cur_cb = next_cb;
+                }
             }
         }
     }
@@ -2437,9 +3171,11 @@ void Qwen38Model::forward_ane_chunk(const int* tokens, int n_chunk, bool is_last
         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
         auto barrier = [&]() { [enc memoryBarrierWithScope:MTLBarrierScopeBuffers]; };
 
-        encode_ane_add(enc, 0);
+        if (qs[0] > 0) {
+            encode_ane_add(enc, 0);
+        }
         if (mtp_loaded_) {
-            barrier();
+            if (qs[0] > 0) barrier();
             encode_final_norm_and_mtp(enc, buf_hidden_, buf_token_ids_, 0,
                                       static_cast<uint32_t>(mA), pos_, false, false);
         }
@@ -2447,19 +3183,21 @@ void Qwen38Model::forward_ane_chunk(const int* tokens, int n_chunk, bool is_last
         [cb commit];
         [cb waitUntilCompleted];
         if (cb.error) {
+            if (slot_inflight[1]) { ane_->wait_slot(1); slot_inflight[1] = false; }
             throw std::runtime_error(std::string("Metal ANE finalize half0 error: ") +
                                      [[cb.error localizedDescription] UTF8String]);
         }
     }
 
-    if (ane_inflight) {
+    if (slot_inflight[1]) {
         auto ta0 = std::chrono::steady_clock::now();
-        ane_->wait();
+        ane_->wait_slot(1);
+        slot_inflight[1] = false;
         if (prof) ane_wait_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ta0).count();
     }
     if (prof) {
-        std::fprintf(stderr, "[ane_prof] chunk=%d (mA=%d,mB=%d): gpu_cb=%.1f ms | ane_extra_wait=%.1f ms\n",
-                     n_chunk, mA, mB, gpu_wait_ms, ane_wait_ms);
+        std::fprintf(stderr, "[ane_prof] chunk=%d (mA=%d[a%d,g%d],mB=%d[a%d,g%d]): gpu_cb=%.1f ms | ane_extra_wait=%.1f ms\n",
+                     n_chunk, mA, ane_m[0], gpu_m[0], mB, ane_m[1], gpu_m[1], gpu_wait_ms, ane_wait_ms);
     }
 
     // Finalize Half 1 (L63 add + final RMSNorm + lm_head + Half 1 MTP priming)
@@ -2468,9 +3206,11 @@ void Qwen38Model::forward_ane_chunk(const int* tokens, int n_chunk, bool is_last
         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
         auto barrier = [&]() { [enc memoryBarrierWithScope:MTLBarrierScopeBuffers]; };
 
-        encode_ane_add(enc, 1);
+        if (qs[1] > 0) {
+            encode_ane_add(enc, 1);
+        }
         if (mtp_loaded_ || is_last) {
-            barrier();
+            if (qs[1] > 0) barrier();
             encode_final_norm_and_mtp(enc, buf_hidden_alt_, buf_token_ids_, tok_off[1],
                                       static_cast<uint32_t>(mB), pos_ + mA, is_last, is_last && compute_argmax);
         }
@@ -2490,11 +3230,15 @@ void Qwen38Model::forward_ane_chunk(const int* tokens, int n_chunk, bool is_last
 void Qwen38Model::encode_full_attn_layer(
     id enc_id, const LayerWeights& lw, id k_cache, id v_cache, uint32_t M, int start_pos,
     id k_sb, id v_sb, bool skip_input_norm, const TensorView* next_norm, id dual_out_f32,
-    id k_bounds, int* quest_built_pages
+    id k_bounds, int* quest_built_pages, bool is_mtp, bool use_tree_buf
 ) {
     id<MTLComputeCommandEncoder> enc = enc_id;
     const bool use_f16 = (M > 24u) || (M <= 8u);
     auto barrier = [&]() { [enc memoryBarrierWithScope:MTLBarrierScopeBuffers]; };
+    auto bind_tree = [&](uint32_t idx) {
+        if (use_tree_buf) [enc setBuffer:(id<MTLBuffer>)buf_tree_params_ offset:0 atIndex:idx];
+        else              [enc setBytes:&cur_tree_ length:sizeof(cur_tree_) atIndex:idx];
+    };
     auto qmm = [&](const Q4Weight& w, id xb, size_t xo, id yb, size_t yo, bool add_r) {
         if (use_f16) encode_qmm_q4_f16x(enc, w, xb, xo, yb, yo, M, add_r);
         else         encode_qmm_q4(enc, w, xb, xo, yb, yo, M, add_r);
@@ -2520,13 +3264,16 @@ void Qwen38Model::encode_full_attn_layer(
 
     uint32_t kv_len = static_cast<uint32_t>(start_pos + static_cast<int>(M));
     bool use_vsplit = ((M <= 8u || (cur_tree_.is_tree != 0u && M <= 16u)) && kv_len >= 128u && head_dim_ == 256 && (num_heads_ % num_kv_heads_ == 0));
-    bool use_gqa6 = use_vsplit && (num_heads_ == num_kv_heads_ * 6) && (kv_len >= 4096u);
+    bool use_gqa6 = use_vsplit && (num_heads_ == num_kv_heads_ * 6) && (kv_len >= 1024u);
+    // Full dense attention on 1-layer MTP KV4 preserves 100% long-context (8k-128k) acceptance rate (~0.35 ms/step at 128k).
+    uint32_t win_sink   = 0u;
+    uint32_t win_recent = 0u;
     uint32_t total_pages = ceil_div(kv_len, QUEST_PAGE_SIZE);
     uint32_t budget_pages = (sparse_kv_budget_ > 0)
         ? std::clamp<uint32_t>(static_cast<uint32_t>(sparse_kv_budget_) / QUEST_PAGE_SIZE,
                                QUEST_SINK_PAGES + QUEST_RECENT_PAGES + 16u, QUEST_MAX_ACTIVE_PAGES)
         : 0u;
-    bool use_quest = use_gqa6 && (sparse_kv_budget_ > 0) && (k_bounds != nil) && (quest_built_pages != nullptr) &&
+    bool use_quest = (!is_mtp) && use_gqa6 && (sparse_kv_budget_ > 0) && (k_bounds != nil) && (quest_built_pages != nullptr) &&
                      (total_pages > budget_pages + 64u) && (total_pages <= QUEST_SCORE_STRIDE);
     uint32_t splits = use_quest
         ? ((budget_pages > 512u) ? 128u : 64u)
@@ -2538,20 +3285,37 @@ void Qwen38Model::encode_full_attn_layer(
         M, static_cast<uint32_t>(num_heads_), static_cast<uint32_t>(num_kv_heads_),
         static_cast<uint32_t>(head_dim_), static_cast<uint32_t>(rotary_dim_),
         static_cast<uint32_t>(start_pos), kv_len, rope_theta_, rms_eps_,
-        1.0f / std::sqrt(static_cast<float>(head_dim_)), splits, rope_delta_
+        1.0f / std::sqrt(static_cast<float>(head_dim_)), splits, rope_delta_,
+        win_sink, win_recent
     };
 
     const bool qkv = (k_sb != nil);
     const bool is_tree = (cur_tree_.is_tree != 0u);
+    const uint32_t M_pad = (M + 63u) & ~63u;
+    const bool use_hier = (!use_vsplit) && (!is_tree) && (splits <= 1u) && use_f16 && (M >= 64u) && (M <= 1024u) &&
+                          (head_dim_ == 256) && (start_pos >= 1024) && (num_heads_ % num_kv_heads_ == 0) &&
+                          (static_cast<size_t>(M_pad) * num_heads_ * head_dim_ * 2u <= [(id<MTLBuffer>)buf_qkv_conv_ length]) &&
+                          (static_cast<size_t>(M) * num_heads_ * head_dim_ * 4u <= [(id<MTLBuffer>)buf_split_o_ length]);
     if (cur_mrope_buf_ != nil) {
-        [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_fa_q_prep_mrope_];
-        [enc setBuffer:(id<MTLBuffer>)buf_qkv_ offset:0 atIndex:0];
-        [enc setBuffer:(id<MTLBuffer>)lw.q_norm.buffer offset:lw.q_norm.offset atIndex:1];
-        [enc setBuffer:(id<MTLBuffer>)buf_q_ offset:0 atIndex:2];
-        [enc setBuffer:(id<MTLBuffer>)buf_z_ offset:0 atIndex:3];
-        [enc setBytes:&fp length:sizeof(fp) atIndex:4];
-        [enc setBuffer:(id<MTLBuffer>)cur_mrope_buf_ offset:cur_mrope_off_ atIndex:5];
-        [enc dispatchThreadgroups:MTLSizeMake(num_heads_, M, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        if (use_hier) {
+            [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_fa_q_prep_mrope_hier_];
+            [enc setBuffer:(id<MTLBuffer>)buf_qkv_ offset:0 atIndex:0];
+            [enc setBuffer:(id<MTLBuffer>)lw.q_norm.buffer offset:lw.q_norm.offset atIndex:1];
+            [enc setBuffer:(id<MTLBuffer>)buf_qkv_conv_ offset:0 atIndex:2];
+            [enc setBuffer:(id<MTLBuffer>)buf_z_ offset:0 atIndex:3];
+            [enc setBytes:&fp length:sizeof(fp) atIndex:4];
+            [enc setBuffer:(id<MTLBuffer>)cur_mrope_buf_ offset:cur_mrope_off_ atIndex:5];
+            [enc dispatchThreadgroups:MTLSizeMake(num_heads_, M_pad, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        } else {
+            [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_fa_q_prep_mrope_];
+            [enc setBuffer:(id<MTLBuffer>)buf_qkv_ offset:0 atIndex:0];
+            [enc setBuffer:(id<MTLBuffer>)lw.q_norm.buffer offset:lw.q_norm.offset atIndex:1];
+            [enc setBuffer:(id<MTLBuffer>)buf_q_ offset:0 atIndex:2];
+            [enc setBuffer:(id<MTLBuffer>)buf_z_ offset:0 atIndex:3];
+            [enc setBytes:&fp length:sizeof(fp) atIndex:4];
+            [enc setBuffer:(id<MTLBuffer>)cur_mrope_buf_ offset:cur_mrope_off_ atIndex:5];
+            [enc dispatchThreadgroups:MTLSizeMake(num_heads_, M, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        }
 
         if (qkv) {
             [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_fa_kv_prep_mrope_q_];
@@ -2583,11 +3347,11 @@ void Qwen38Model::encode_full_attn_layer(
         [enc setBuffer:(id<MTLBuffer>)buf_q_ offset:0 atIndex:2];
         [enc setBuffer:(id<MTLBuffer>)buf_z_ offset:0 atIndex:3];
         [enc setBytes:&fp length:sizeof(fp) atIndex:4];
-        [enc setBytes:&cur_tree_ length:sizeof(cur_tree_) atIndex:5];
+        bind_tree(5u);
         [enc dispatchThreadgroups:MTLSizeMake(num_heads_, M, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
 
         if (qkv) {
-            [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_fa_kv_prep_q_tree_];
+            [enc setComputePipelineState:(id<MTLComputePipelineState>)(is_mtp ? pso_mtp_kv_prep_tree_ : pso_fa_kv_prep_q_tree_)];
             [enc setBuffer:(id<MTLBuffer>)buf_k_ offset:0 atIndex:0];
             [enc setBuffer:(id<MTLBuffer>)buf_v_ offset:0 atIndex:1];
             [enc setBuffer:(id<MTLBuffer>)lw.k_norm.buffer offset:lw.k_norm.offset atIndex:2];
@@ -2596,7 +3360,7 @@ void Qwen38Model::encode_full_attn_layer(
             [enc setBuffer:(id<MTLBuffer>)k_sb offset:0 atIndex:5];
             [enc setBuffer:(id<MTLBuffer>)v_sb offset:0 atIndex:6];
             [enc setBytes:&fp length:sizeof(fp) atIndex:7];
-            [enc setBytes:&cur_tree_ length:sizeof(cur_tree_) atIndex:8];
+            bind_tree(8u);
             [enc dispatchThreadgroups:MTLSizeMake(num_kv_heads_, M, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
         } else {
             [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_fa_kv_prep_tree_];
@@ -2606,20 +3370,30 @@ void Qwen38Model::encode_full_attn_layer(
             [enc setBuffer:(id<MTLBuffer>)k_cache offset:0 atIndex:3];
             [enc setBuffer:(id<MTLBuffer>)v_cache offset:0 atIndex:4];
             [enc setBytes:&fp length:sizeof(fp) atIndex:5];
-            [enc setBytes:&cur_tree_ length:sizeof(cur_tree_) atIndex:6];
+            bind_tree(6u);
             [enc dispatchThreadgroups:MTLSizeMake(num_kv_heads_, M, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
         }
     } else {
-        [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_fa_q_prep_];
-        [enc setBuffer:(id<MTLBuffer>)buf_qkv_ offset:0 atIndex:0];
-        [enc setBuffer:(id<MTLBuffer>)lw.q_norm.buffer offset:lw.q_norm.offset atIndex:1];
-        [enc setBuffer:(id<MTLBuffer>)buf_q_ offset:0 atIndex:2];
-        [enc setBuffer:(id<MTLBuffer>)buf_z_ offset:0 atIndex:3];
-        [enc setBytes:&fp length:sizeof(fp) atIndex:4];
-        [enc dispatchThreadgroups:MTLSizeMake(num_heads_, M, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        if (use_hier) {
+            [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_fa_q_prep_hier_];
+            [enc setBuffer:(id<MTLBuffer>)buf_qkv_ offset:0 atIndex:0];
+            [enc setBuffer:(id<MTLBuffer>)lw.q_norm.buffer offset:lw.q_norm.offset atIndex:1];
+            [enc setBuffer:(id<MTLBuffer>)buf_qkv_conv_ offset:0 atIndex:2];
+            [enc setBuffer:(id<MTLBuffer>)buf_z_ offset:0 atIndex:3];
+            [enc setBytes:&fp length:sizeof(fp) atIndex:4];
+            [enc dispatchThreadgroups:MTLSizeMake(num_heads_, M_pad, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        } else {
+            [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_fa_q_prep_];
+            [enc setBuffer:(id<MTLBuffer>)buf_qkv_ offset:0 atIndex:0];
+            [enc setBuffer:(id<MTLBuffer>)lw.q_norm.buffer offset:lw.q_norm.offset atIndex:1];
+            [enc setBuffer:(id<MTLBuffer>)buf_q_ offset:0 atIndex:2];
+            [enc setBuffer:(id<MTLBuffer>)buf_z_ offset:0 atIndex:3];
+            [enc setBytes:&fp length:sizeof(fp) atIndex:4];
+            [enc dispatchThreadgroups:MTLSizeMake(num_heads_, M, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        }
 
         if (qkv) {
-            [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_fa_kv_prep_q_];
+            [enc setComputePipelineState:(id<MTLComputePipelineState>)(is_mtp ? pso_mtp_kv_prep_ : pso_fa_kv_prep_q_)];
             [enc setBuffer:(id<MTLBuffer>)buf_k_ offset:0 atIndex:0];
             [enc setBuffer:(id<MTLBuffer>)buf_v_ offset:0 atIndex:1];
             [enc setBuffer:(id<MTLBuffer>)lw.k_norm.buffer offset:lw.k_norm.offset atIndex:2];
@@ -2693,8 +3467,9 @@ void Qwen38Model::encode_full_attn_layer(
             if (M == 1u) {
                 pso = use_quest
                     ? (is_tree ? pso_fa_gqa6_m1_sp_tree_ : pso_fa_gqa6_m1_sp_)
-                    : (is_tree ? (qkv ? pso_fa_gqa6_m1_q_tree_ : pso_fa_gqa6_m1_tree_)
-                               : (qkv ? pso_fa_gqa6_m1_q_      : pso_fa_gqa6_m1_));
+                    : (qkv ? (is_mtp ? (is_tree ? pso_mtp_gqa6_m1_tree_ : pso_mtp_gqa6_m1_)
+                                     : (is_tree ? pso_fa_gqa6_m1_q_tree_ : pso_fa_gqa6_m1_q_))
+                           : (is_tree ? pso_fa_gqa6_m1_tree_ : pso_fa_gqa6_m1_));
                 tg_thr = 128u;
             } else if (M == 2u) {
                 [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_pack_q_p2_];
@@ -2705,8 +3480,9 @@ void Qwen38Model::encode_full_attn_layer(
                 barrier();
                 pso = use_quest
                     ? (is_tree ? pso_fa_gqa6_m2_sp_tree_ : pso_fa_gqa6_m2_sp_)
-                    : (is_tree ? (qkv ? pso_fa_gqa6_m2_q_tree_ : pso_fa_gqa6_m2_tree_)
-                               : (qkv ? pso_fa_gqa6_m2_q_      : pso_fa_gqa6_m2_));
+                    : (qkv ? (is_mtp ? (is_tree ? pso_mtp_gqa6_m2_tree_ : pso_mtp_gqa6_m2_)
+                                     : (is_tree ? pso_fa_gqa6_m2_q_tree_ : pso_fa_gqa6_m2_q_))
+                           : (is_tree ? pso_fa_gqa6_m2_tree_ : pso_fa_gqa6_m2_));
                 q_buf = buf_q_h_;
                 tg_thr = 128u;
             } else if (M <= 4u) {
@@ -2718,8 +3494,9 @@ void Qwen38Model::encode_full_attn_layer(
                 barrier();
                 pso = use_quest
                     ? (is_tree ? pso_fa_gqa6_m4_sp_tree_ : pso_fa_gqa6_m4_sp_)
-                    : (is_tree ? (qkv ? pso_fa_gqa6_m4_q_tree_ : pso_fa_gqa6_m4_tree_)
-                               : (qkv ? pso_fa_gqa6_m4_q_      : pso_fa_gqa6_m4_));
+                    : (qkv ? (is_mtp ? (is_tree ? pso_mtp_gqa6_m4_tree_ : pso_mtp_gqa6_m4_)
+                                     : (is_tree ? pso_fa_gqa6_m4_q_tree_ : pso_fa_gqa6_m4_q_))
+                           : (is_tree ? pso_fa_gqa6_m4_tree_ : pso_fa_gqa6_m4_));
                 q_buf = buf_q_h_;
                 tg_thr = 128u;
             } else {
@@ -2732,8 +3509,9 @@ void Qwen38Model::encode_full_attn_layer(
                 barrier();
                 pso = use_quest
                     ? (is_tree ? pso_fa_gqa6_v_sp_tree_ : pso_fa_gqa6_v_sp_)
-                    : (is_tree ? (qkv ? pso_fa_gqa6_v_q_tree_ : pso_fa_gqa6_v_tree_)
-                               : (qkv ? pso_fa_gqa6_v_q_      : pso_fa_gqa6_v_));
+                    : (qkv ? (is_mtp ? (is_tree ? pso_mtp_gqa6_v_tree_ : pso_mtp_gqa6_v_)
+                                     : (is_tree ? pso_fa_gqa6_v_q_tree_ : pso_fa_gqa6_v_q_))
+                           : (is_tree ? pso_fa_gqa6_v_tree_ : pso_fa_gqa6_v_));
                 q_buf = buf_q_h_;
                 tg_thr = 192u;
             }
@@ -2748,7 +3526,7 @@ void Qwen38Model::encode_full_attn_layer(
                 [enc setBuffer:(id<MTLBuffer>)buf_split_m_ offset:0 atIndex:6];
                 [enc setBuffer:(id<MTLBuffer>)buf_split_l_ offset:0 atIndex:7];
                 [enc setBytes:&fp length:sizeof(fp) atIndex:8];
-                if (is_tree) [enc setBytes:&cur_tree_ length:sizeof(cur_tree_) atIndex:9];
+                if (is_tree) bind_tree(9u);
                 if (use_quest) {
                     uint32_t ap_idx = is_tree ? 10u : 9u;
                     [enc setBuffer:(id<MTLBuffer>)buf_quest_pages_ offset:0 atIndex:ap_idx];
@@ -2759,7 +3537,7 @@ void Qwen38Model::encode_full_attn_layer(
                 [enc setBuffer:(id<MTLBuffer>)buf_split_m_ offset:0 atIndex:4];
                 [enc setBuffer:(id<MTLBuffer>)buf_split_l_ offset:0 atIndex:5];
                 [enc setBytes:&fp length:sizeof(fp) atIndex:6];
-                if (is_tree) [enc setBytes:&cur_tree_ length:sizeof(cur_tree_) atIndex:7];
+                if (is_tree) bind_tree(7u);
                 if (use_quest) {
                     uint32_t ap_idx = is_tree ? 8u : 7u;
                     [enc setBuffer:(id<MTLBuffer>)buf_quest_pages_ offset:0 atIndex:ap_idx];
@@ -2773,7 +3551,10 @@ void Qwen38Model::encode_full_attn_layer(
             uint32_t num_pairs = static_cast<uint32_t>(num_kv_heads_) * ((gqa + 1u) / 2u);
             uint32_t z_tiles = is_tree ? ceil_div(M, 8u) : 1u;
             if (qkv) {
-                [enc setComputePipelineState:(id<MTLComputePipelineState>)(is_tree ? pso_fa_vsplit1_q_tree_ : pso_fa_vsplit1_q_)];
+                id vsp_pso = is_mtp
+                    ? (is_tree ? pso_mtp_vsplit1_tree_ : pso_mtp_vsplit1_)
+                    : (is_tree ? pso_fa_vsplit1_q_tree_ : pso_fa_vsplit1_q_);
+                [enc setComputePipelineState:(id<MTLComputePipelineState>)vsp_pso];
                 [enc setBuffer:(id<MTLBuffer>)buf_q_ offset:0 atIndex:0];
                 [enc setBuffer:(id<MTLBuffer>)k_cache offset:0 atIndex:1];
                 [enc setBuffer:(id<MTLBuffer>)v_cache offset:0 atIndex:2];
@@ -2783,7 +3564,7 @@ void Qwen38Model::encode_full_attn_layer(
                 [enc setBuffer:(id<MTLBuffer>)buf_split_m_ offset:0 atIndex:6];
                 [enc setBuffer:(id<MTLBuffer>)buf_split_l_ offset:0 atIndex:7];
                 [enc setBytes:&fp length:sizeof(fp) atIndex:8];
-                if (is_tree) [enc setBytes:&cur_tree_ length:sizeof(cur_tree_) atIndex:9];
+                if (is_tree) bind_tree(9u);
             } else {
                 [enc setComputePipelineState:(id<MTLComputePipelineState>)(is_tree ? pso_fa_vsplit1_tree_ : pso_fa_vsplit1_)];
                 [enc setBuffer:(id<MTLBuffer>)buf_q_ offset:0 atIndex:0];
@@ -2793,7 +3574,7 @@ void Qwen38Model::encode_full_attn_layer(
                 [enc setBuffer:(id<MTLBuffer>)buf_split_m_ offset:0 atIndex:4];
                 [enc setBuffer:(id<MTLBuffer>)buf_split_l_ offset:0 atIndex:5];
                 [enc setBytes:&fp length:sizeof(fp) atIndex:6];
-                if (is_tree) [enc setBytes:&cur_tree_ length:sizeof(cur_tree_) atIndex:7];
+                if (is_tree) bind_tree(7u);
             }
             [enc dispatchThreadgroups:MTLSizeMake(num_pairs, splits, z_tiles) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
         }
@@ -2806,10 +3587,10 @@ void Qwen38Model::encode_full_attn_layer(
         [enc setBuffer:(id<MTLBuffer>)buf_z_ offset:0 atIndex:3];
         [enc setBuffer:(id<MTLBuffer>)buf_attn_out_ offset:0 atIndex:4];
         [enc setBytes:&fp length:sizeof(fp) atIndex:5];
-        [enc dispatchThreadgroups:MTLSizeMake(num_heads_, M, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        [enc dispatchThreadgroups:MTLSizeMake(num_heads_, M, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
     } else if (is_tree) {
         if (qkv) {
-            [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_fa_attn_q_tree_f16_];
+            [enc setComputePipelineState:(id<MTLComputePipelineState>)(is_mtp ? pso_mtp_attn_tree_f16_ : pso_fa_attn_q_tree_f16_)];
             [enc setBuffer:(id<MTLBuffer>)buf_q_ offset:0 atIndex:0];
             [enc setBuffer:(id<MTLBuffer>)buf_z_ offset:0 atIndex:1];
             [enc setBuffer:(id<MTLBuffer>)k_cache offset:0 atIndex:2];
@@ -2818,7 +3599,7 @@ void Qwen38Model::encode_full_attn_layer(
             [enc setBuffer:(id<MTLBuffer>)v_sb offset:0 atIndex:5];
             [enc setBuffer:(id<MTLBuffer>)buf_attn_out_ offset:0 atIndex:6];
             [enc setBytes:&fp length:sizeof(fp) atIndex:7];
-            [enc setBytes:&cur_tree_ length:sizeof(cur_tree_) atIndex:8];
+            bind_tree(8u);
         } else {
             [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_fa_attn_tree_f16_];
             [enc setBuffer:(id<MTLBuffer>)buf_q_ offset:0 atIndex:0];
@@ -2827,7 +3608,7 @@ void Qwen38Model::encode_full_attn_layer(
             [enc setBuffer:(id<MTLBuffer>)v_cache offset:0 atIndex:3];
             [enc setBuffer:(id<MTLBuffer>)buf_attn_out_ offset:0 atIndex:4];
             [enc setBytes:&fp length:sizeof(fp) atIndex:5];
-            [enc setBytes:&cur_tree_ length:sizeof(cur_tree_) atIndex:6];
+            bind_tree(6u);
         }
         [enc dispatchThreadgroups:MTLSizeMake(num_heads_, M, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
     } else if (splits > 1u) {
@@ -2864,17 +3645,8 @@ void Qwen38Model::encode_full_attn_layer(
         [enc setBytes:&fp length:sizeof(fp) atIndex:5];
         [enc dispatchThreadgroups:MTLSizeMake(num_heads_, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
     } else if (M >= 16u && head_dim_ == 256) {
-        const bool use_hier = use_f16 && (M >= 64u) && (M <= 1024u) && (start_pos >= 1024) &&
-                              (num_heads_ % num_kv_heads_ == 0);
         if (use_hier) {
-            uint32_t M_pad = (M + 63u) & ~63u;
             uint32_t gqa = static_cast<uint32_t>(num_heads_ / num_kv_heads_);
-            [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_pack_q_pf_h_];
-            [enc setBuffer:(id<MTLBuffer>)buf_q_ offset:0 atIndex:0];
-            [enc setBuffer:(id<MTLBuffer>)buf_qkv_conv_ offset:0 atIndex:1];
-            [enc setBytes:&fp length:sizeof(fp) atIndex:2];
-            [enc dispatchThreadgroups:MTLSizeMake(num_heads_, M_pad, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
-            barrier();
             if (qkv) {
                 [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_fa_prefill_hier_q_f16_];
                 [enc setBuffer:(id<MTLBuffer>)buf_qkv_conv_ offset:0 atIndex:0];
@@ -2951,7 +3723,10 @@ void Qwen38Model::encode_full_attn_layer(
         }
     } else {
         if (qkv) {
-            [enc setComputePipelineState:(id<MTLComputePipelineState>)(use_f16 ? pso_fa_attn_q_f16_ : pso_fa_attn_q_)];
+            id attn_pso = is_mtp
+                ? (use_f16 ? pso_mtp_attn_f16_ : pso_fa_attn_q_)
+                : (use_f16 ? pso_fa_attn_q_f16_ : pso_fa_attn_q_);
+            [enc setComputePipelineState:(id<MTLComputePipelineState>)attn_pso];
             [enc setBuffer:(id<MTLBuffer>)buf_q_ offset:0 atIndex:0];
             [enc setBuffer:(id<MTLBuffer>)buf_z_ offset:0 atIndex:1];
             [enc setBuffer:(id<MTLBuffer>)k_cache offset:0 atIndex:2];
@@ -2997,12 +3772,16 @@ void Qwen38Model::encode_full_attn_layer(
 
 void Qwen38Model::encode_chunk(
     id enc_id, int M_int, int start_pos, bool compute_logits, bool compute_argmax,
-    bool verify_all_logits, bool record_gdn, float compact_margin
+    bool verify_all_logits, bool record_gdn, float compact_margin, bool use_tree_buf
 ) {
     id<MTLComputeCommandEncoder> enc = enc_id;
     uint32_t M = static_cast<uint32_t>(M_int);
     const bool use_f16 = (M > 24u) || (M <= 8u);
     auto barrier = [&]() { [enc memoryBarrierWithScope:MTLBarrierScopeBuffers]; };
+    auto bind_tree = [&](uint32_t idx) {
+        if (use_tree_buf) [enc setBuffer:(id<MTLBuffer>)buf_tree_params_ offset:0 atIndex:idx];
+        else              [enc setBytes:&cur_tree_ length:sizeof(cur_tree_) atIndex:idx];
+    };
     auto qmm = [&](const Q4Weight& w, id xb, size_t xo, id yb, size_t yo, bool add_r) {
         if (use_f16) encode_qmm_q4_f16x(enc, w, xb, xo, yb, yo, M, add_r);
         else         encode_qmm_q4(enc, w, xb, xo, yb, yo, M, add_r);
@@ -3010,16 +3789,18 @@ void Qwen38Model::encode_chunk(
 
     // 1. Embedding lookup
     {
-        EmbedParams ep{M, static_cast<uint32_t>(hidden_size_), rms_eps_};
-        [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_embed_];
-        [enc setBuffer:(id<MTLBuffer>)embed_tokens_.w.buffer offset:embed_tokens_.w.offset atIndex:0];
-        [enc setBuffer:(id<MTLBuffer>)embed_tokens_.s.buffer offset:embed_tokens_.s.offset atIndex:1];
-        [enc setBuffer:(id<MTLBuffer>)embed_tokens_.b.buffer offset:embed_tokens_.b.offset atIndex:2];
-        [enc setBuffer:(id<MTLBuffer>)buf_token_ids_ offset:0 atIndex:3];
-        [enc setBuffer:(id<MTLBuffer>)buf_hidden_ offset:0 atIndex:4];
-        [enc setBytes:&ep length:sizeof(ep) atIndex:5];
-        [enc dispatchThreads:MTLSizeMake(hidden_size_, M, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-        barrier();
+        if (!use_cpu_embed_) {
+            EmbedParams ep{M, static_cast<uint32_t>(hidden_size_), rms_eps_};
+            [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_embed_];
+            [enc setBuffer:(id<MTLBuffer>)embed_tokens_.w.buffer offset:embed_tokens_.w.offset atIndex:0];
+            [enc setBuffer:(id<MTLBuffer>)embed_tokens_.s.buffer offset:embed_tokens_.s.offset atIndex:1];
+            [enc setBuffer:(id<MTLBuffer>)embed_tokens_.b.buffer offset:embed_tokens_.b.offset atIndex:2];
+            [enc setBuffer:(id<MTLBuffer>)buf_token_ids_ offset:0 atIndex:3];
+            [enc setBuffer:(id<MTLBuffer>)buf_hidden_ offset:0 atIndex:4];
+            [enc setBytes:&ep length:sizeof(ep) atIndex:5];
+            [enc dispatchThreads:MTLSizeMake(hidden_size_, M, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            barrier();
+        }
         if (cur_vis_count_ > 0 && cur_vis_emb_buf_ != nil && cur_vis_rows_buf_ != nil) {
             ScatterEmbedParams sp{cur_vis_count_, static_cast<uint32_t>(hidden_size_)};
             [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_scatter_embeds_];
@@ -3055,7 +3836,8 @@ void Qwen38Model::encode_chunk(
 
         if (!lw.is_linear) {
             encode_full_attn_layer(enc, lw, st.k_cache, st.v_cache, M, start_pos, st.k_sb, st.v_sb,
-                                   skip_in_norm, next_in_norm, dual_f32, st.k_bounds, &st.quest_built_pages);
+                                   skip_in_norm, next_in_norm, dual_f32, st.k_bounds, &st.quest_built_pages,
+                                   /*is_mtp=*/false, use_tree_buf);
             continue;
         }
 
@@ -3121,7 +3903,8 @@ void Qwen38Model::encode_chunk(
                 [enc setBuffer:(id<MTLBuffer>)buf_beta_ offset:0 atIndex:14];
                 [enc setBytes:&pp length:sizeof(pp) atIndex:15];
                 [enc setBytes:&lazy_pr length:sizeof(lazy_pr) atIndex:16];
-                [enc setBytes:&cur_tree_ length:sizeof(cur_tree_) atIndex:17];
+                if (use_tree_buf && is_tree) bind_tree(17u);
+                else                         [enc setBytes:&cur_tree_ length:sizeof(cur_tree_) atIndex:17];
                 [enc dispatchThreadgroups:MTLSizeMake(2 * lin_num_k_heads_ + lin_num_v_heads_, 1, 1)
                     threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
                 barrier();
@@ -3141,7 +3924,7 @@ void Qwen38Model::encode_chunk(
                 [enc setBuffer:(id<MTLBuffer>)buf_g_ offset:0 atIndex:11];
                 [enc setBuffer:(id<MTLBuffer>)buf_beta_ offset:0 atIndex:12];
                 [enc setBytes:&pp length:sizeof(pp) atIndex:13];
-                [enc setBytes:&cur_tree_ length:sizeof(cur_tree_) atIndex:14];
+                bind_tree(14u);
                 [enc dispatchThreadgroups:MTLSizeMake(2 * lin_num_k_heads_ + lin_num_v_heads_, 1, 1)
                     threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
                 barrier();
@@ -3222,7 +4005,11 @@ void Qwen38Model::encode_chunk(
                             static_cast<uint32_t>(lin_head_k_dim_), static_cast<uint32_t>(lin_head_v_dim_),
                             static_cast<uint32_t>(lin_conv_dim_)};
             if (record_gdn) {
-                [enc setComputePipelineState:(id<MTLComputePipelineState>)(is_tree ? pso_gdn_rec_tree_lazy_ : pso_gdn_rec_lazy_)];
+                id rec_pso = is_tree
+                    ? ((cur_tree_.pad0 <= 1u) ? pso_gdn_rec_tree_lazy_s1_
+                                              : ((cur_tree_.pad0 == 2u) ? pso_gdn_rec_tree_lazy_s2_ : pso_gdn_rec_tree_lazy_))
+                    : pso_gdn_rec_lazy_;
+                [enc setComputePipelineState:(id<MTLComputePipelineState>)rec_pso];
                 [enc setBuffer:(id<MTLBuffer>)buf_q_ offset:0 atIndex:0];
                 [enc setBuffer:(id<MTLBuffer>)buf_k_ offset:0 atIndex:1];
                 [enc setBuffer:(id<MTLBuffer>)buf_qkv_conv_ offset:0 atIndex:2];
@@ -3232,7 +4019,7 @@ void Qwen38Model::encode_chunk(
                 [enc setBuffer:(id<MTLBuffer>)buf_attn_out_ offset:0 atIndex:6];
                 [enc setBytes:&rp length:sizeof(rp) atIndex:7];
                 [enc setBytes:&lazy_pr length:sizeof(lazy_pr) atIndex:8];
-                if (is_tree) [enc setBytes:&cur_tree_ length:sizeof(cur_tree_) atIndex:9];
+                if (is_tree) bind_tree(9u);
             } else {
                 [enc setComputePipelineState:(id<MTLComputePipelineState>)(is_tree ? pso_gdn_rec_tree_ : pso_gdn_rec_)];
                 [enc setBuffer:(id<MTLBuffer>)buf_q_ offset:0 atIndex:0];
@@ -3244,7 +4031,7 @@ void Qwen38Model::encode_chunk(
                 [enc setBuffer:(id<MTLBuffer>)buf_attn_out_ offset:0 atIndex:6];
                 [enc setBytes:&rp length:sizeof(rp) atIndex:7];
                 [enc setBuffer:(id<MTLBuffer>)st.ssm_state offset:0 atIndex:8];
-                if (is_tree) [enc setBytes:&cur_tree_ length:sizeof(cur_tree_) atIndex:9];
+                if (is_tree) bind_tree(9u);
             }
             [enc dispatchThreads:MTLSizeMake(32, lin_head_v_dim_ / 4, lin_num_v_heads_)
                 threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
@@ -3297,7 +4084,8 @@ void Qwen38Model::encode_chunk(
         if (M >= 2u && M <= 8u) {
             // Note: Layer 63 already produced FP32 buf_mtp_verify_hid_ + FP16 buf_normed_ via fuse_final_dual!
             if (compute_argmax || compact_margin > 0.0f) {
-                QmmParams qp{M, lm_head_.out_dim, lm_head_.in_dim, 0u};
+                const uint32_t skip_logits = (compute_argmax && compact_margin == 0.0f) ? 1u : 0u;
+                QmmParams qp{M, lm_head_.out_dim, lm_head_.in_dim, skip_logits};
                 n_tg_am = ceil_div(lm_head_.out_dim, 32u);
                 [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_mma_lmhead_max_f16x_];
                 [enc setBuffer:(id<MTLBuffer>)lm_head_.w.buffer offset:lm_head_.w.offset atIndex:0];
@@ -3565,7 +4353,7 @@ void Qwen38Model::encode_mtp_kv_prime(
     };
     const bool qkv = (mtp_k_sb_ != nil);
     if (qkv) {
-        [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_fa_kv_prep_q_];
+        [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_mtp_kv_prep_];
         [enc setBuffer:(id<MTLBuffer>)buf_k_ offset:0 atIndex:0];
         [enc setBuffer:(id<MTLBuffer>)buf_v_ offset:0 atIndex:1];
         [enc setBuffer:(id<MTLBuffer>)lw.k_norm.buffer offset:lw.k_norm.offset atIndex:2];
@@ -3683,7 +4471,7 @@ void Qwen38Model::encode_mtp_steps(
             1.0f / std::sqrt(static_cast<float>(head_dim_)), 1u, rope_delta_
         };
         if (qkv) {
-            [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_fa_kv_prep_q_];
+            [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_mtp_kv_prep_];
             [enc setBuffer:(id<MTLBuffer>)buf_k_ offset:0 atIndex:0];
             [enc setBuffer:(id<MTLBuffer>)buf_v_ offset:0 atIndex:1];
             [enc setBuffer:(id<MTLBuffer>)lw.k_norm.buffer offset:lw.k_norm.offset atIndex:2];
@@ -3704,7 +4492,9 @@ void Qwen38Model::encode_mtp_steps(
         [enc dispatchThreadgroups:MTLSizeMake(num_kv_heads_, M, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
 
         bool use_vsplit = (kv_len >= 128u && head_dim_ == 256 && (num_heads_ % num_kv_heads_ == 0));
-        bool use_gqa6   = use_vsplit && (num_heads_ == num_kv_heads_ * 6) && (kv_len >= 4096u);
+        bool use_gqa6   = use_vsplit && (num_heads_ == num_kv_heads_ * 6) && (kv_len >= 1024u);
+        uint32_t win_sink   = 0u;
+        uint32_t win_recent = 0u;
         uint32_t total_pages = ceil_div(kv_len, QUEST_PAGE_SIZE);
         uint32_t budget_pages = (sparse_kv_budget_ > 0)
             ? std::clamp<uint32_t>(static_cast<uint32_t>(sparse_kv_budget_) / QUEST_PAGE_SIZE,
@@ -3722,7 +4512,8 @@ void Qwen38Model::encode_mtp_steps(
             1u, static_cast<uint32_t>(num_heads_), static_cast<uint32_t>(num_kv_heads_),
             static_cast<uint32_t>(head_dim_), static_cast<uint32_t>(rotary_dim_),
             q_pos, kv_len, rope_theta_, rms_eps_,
-            1.0f / std::sqrt(static_cast<float>(head_dim_)), splits, rope_delta_
+            1.0f / std::sqrt(static_cast<float>(head_dim_)), splits, rope_delta_,
+            win_sink, win_recent
         };
         [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_fa_q_prep_];
         [enc setBuffer:(id<MTLBuffer>)buf_qkv_ offset:0 atIndex:0];
@@ -3773,7 +4564,7 @@ void Qwen38Model::encode_mtp_steps(
                     [enc dispatchThreadgroups:MTLSizeMake(num_kv_heads_, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
                     barrier();
                 }
-                id pso = use_quest ? pso_fa_gqa6_m1_sp_ : (qkv ? pso_fa_gqa6_m1_q_ : pso_fa_gqa6_m1_);
+                id pso = use_quest ? pso_fa_gqa6_m1_sp_ : (qkv ? pso_mtp_gqa6_m1_ : pso_fa_gqa6_m1_);
                 [enc setComputePipelineState:(id<MTLComputePipelineState>)pso];
                 [enc setBuffer:(id<MTLBuffer>)buf_q_ offset:0 atIndex:0];
                 [enc setBuffer:(id<MTLBuffer>)mtp_k_cache_ offset:0 atIndex:1];
@@ -3803,7 +4594,7 @@ void Qwen38Model::encode_mtp_steps(
             } else {
                 uint32_t gqa = static_cast<uint32_t>(num_heads_ / num_kv_heads_);
                 uint32_t num_pairs = static_cast<uint32_t>(num_kv_heads_) * ((gqa + 1u) / 2u);
-                [enc setComputePipelineState:(id<MTLComputePipelineState>)(qkv ? pso_fa_vsplit1_q_ : pso_fa_vsplit1_)];
+                [enc setComputePipelineState:(id<MTLComputePipelineState>)(qkv ? pso_mtp_vsplit1_ : pso_fa_vsplit1_)];
                 [enc setBuffer:(id<MTLBuffer>)buf_q_ offset:0 atIndex:0];
                 [enc setBuffer:(id<MTLBuffer>)mtp_k_cache_ offset:0 atIndex:1];
                 [enc setBuffer:(id<MTLBuffer>)mtp_v_cache_ offset:0 atIndex:2];
@@ -3830,9 +4621,9 @@ void Qwen38Model::encode_mtp_steps(
             [enc setBuffer:(id<MTLBuffer>)buf_z_ offset:0 atIndex:3];
             [enc setBuffer:(id<MTLBuffer>)buf_attn_out_ offset:0 atIndex:4];
             [enc setBytes:&fp length:sizeof(fp) atIndex:5];
-            [enc dispatchThreadgroups:MTLSizeMake(num_heads_, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            [enc dispatchThreadgroups:MTLSizeMake(num_heads_, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
         } else {
-            [enc setComputePipelineState:(id<MTLComputePipelineState>)(qkv ? pso_fa_attn_q_f16_ : pso_fa_attn_f16_)];
+            [enc setComputePipelineState:(id<MTLComputePipelineState>)(qkv ? pso_mtp_attn_f16_ : pso_fa_attn_f16_)];
             [enc setBuffer:(id<MTLBuffer>)buf_q_ offset:0 atIndex:0];
             [enc setBuffer:(id<MTLBuffer>)buf_z_ offset:0 atIndex:1];
             [enc setBuffer:(id<MTLBuffer>)mtp_k_cache_ offset:0 atIndex:2];
@@ -3867,7 +4658,7 @@ void Qwen38Model::encode_mtp_steps(
         id saved_mrope = cur_mrope_buf_;
         cur_mrope_buf_ = nil;
         encode_full_attn_layer(enc, mtp_.layer, mtp_k_cache_, mtp_v_cache_, M, start_pos, mtp_k_sb_, mtp_v_sb_,
-                               false, nullptr, nil, mtp_k_bounds_, &mtp_quest_built_pages_);
+                               false, nullptr, nil, nil, nullptr, /*is_mtp=*/true, /*use_tree_buf=*/false);
         cur_mrope_buf_ = saved_mrope;
     }
 
@@ -3952,6 +4743,7 @@ Qwen38Model::TreeParams Qwen38Model::make_tree_params(const int* parents, int n_
     }
     bool slot_used[4] = {};
     int slot_of[16];
+    uint32_t max_slot = 0u;
     for (int t = 0; t < 16; ++t) slot_of[t] = -1;
     for (int t = 0; t < n_nodes; ++t) {
         if (t > 0) {
@@ -3974,8 +4766,10 @@ Qwen38Model::TreeParams Qwen38Model::make_tree_params(const int* parents, int n_
             slot_used[s] = true;
             slot_of[t] = s;
             tp.gdn_save[t] = s;
+            max_slot = std::max(max_slot, static_cast<uint32_t>(s + 1));
         }
     }
+    tp.pad0 = max_slot;
     return tp;
 }
 
@@ -4249,19 +5043,21 @@ const float* Qwen38Model::forward(const int* tokens, int n_tokens, int* out_argm
 
     auto t0 = std::chrono::steady_clock::now();
     int offset = 0;
-    const int coexec_g = (ane_ && ane_->ready() && std::getenv("MI_COEXEC_G"))
-        ? std::clamp(std::atoi(std::getenv("MI_COEXEC_G")), 0, 64)
+    const char* env_coexec_str = std::getenv("MI_COEXEC_G");
+    const int cur_coexec_g = (ane_ && ane_->ready() && env_coexec_str)
+        ? std::clamp(std::atoi(env_coexec_str), 0, 64)
         : 0;
-    const int ane_max_chunk = (ane_ && ane_->ready()) ? (2 * (AneMlpEngine::MAX_SUBS * ane_->block_rows() + coexec_g)) : 0;
-    const int ane_min = 176;
+    const int ane_base_chunk = (ane_ && ane_->ready()) ? (2 * AneMlpEngine::MAX_SUBS * ane_->block_rows()) : 0;
+    const int ane_max_chunk = (ane_base_chunk > 0) ? (ane_base_chunk + 2 * cur_coexec_g) : 0;
+    const int ane_min = ane_min_;
     bool used_ane = false;
     while (offset < n_tokens) {
         int rem = n_tokens - offset;
         if (ane_max_chunk > 0 && rem >= ane_min) {
             int m = std::min(ane_max_chunk, rem);
-            // Auto tail-absorption co-execution: when rem is 1025..1152 (just over 1 full 1024-tok ANE chunk),
+            // Auto tail-absorption co-execution: when rem is 1025..1152 and cur_coexec_g == 0,
             // absorb the <=128-tok tail onto GPU in the SAME 64-layer ANE pass (1.48x faster than 2 ANE passes!)
-            if (coexec_g == 0 && rem > ane_max_chunk && rem <= ane_max_chunk + 128) {
+            if (cur_coexec_g == 0 && rem > ane_max_chunk && rem <= ane_base_chunk + 128) {
                 m = rem;
             } else if (rem > ane_max_chunk && rem - m < ane_min && rem <= 2 * ane_max_chunk) {
                 // Avoid leaving a tiny tail < ane_min when we can split evenly across two ANE chunks
@@ -4278,6 +5074,9 @@ const float* Qwen38Model::forward(const int* tokens, int n_tokens, int* out_argm
         int m = std::min(chunk_size_, rem);
         bool is_last = (offset + m == n_tokens);
         std::memcpy([(id<MTLBuffer>)buf_token_ids_ contents], tokens + offset, static_cast<size_t>(m) * sizeof(int));
+        if (use_cpu_embed_) {
+            cpu_embed_.gather_f32(tokens + offset, m, reinterpret_cast<float*>([(id<MTLBuffer>)buf_hidden_ contents]));
+        }
 
         @autoreleasepool {
             id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)ctx_.queue() commandBuffer];
@@ -4302,7 +5101,7 @@ const float* Qwen38Model::forward(const int* tokens, int n_tokens, int* out_argm
         int n_reg = 0, n_gt32 = 0, n_gt64 = 0, n_gt152 = 0;
         for (int i = 0; i < n_tokens; ++i) {
             int tk = tokens[i];
-            if (tk < 0 || tk >= 248000) continue;
+            if (tk < 0 || static_cast<uint32_t>(tk) >= special_tok_lo_) continue;
             ++n_reg;
             if (tk >= static_cast<int>(FAST_DRAFT_VOCAB)) ++n_gt32;
             if (tk >= static_cast<int>(MED_DRAFT_VOCAB))  ++n_gt64;
@@ -4396,18 +5195,25 @@ const float* Qwen38Model::forward_multimodal(
 
     // 2. Process in ANE (GPU || ANE overlap!) or GPU chunks with M-RoPE + vision embedding scatter
     int offset = 0;
-    const int ane_max_chunk = (ane_ && ane_->ready()) ? (2 * AneMlpEngine::MAX_SUBS * ane_->block_rows()) : 0;
+    const char* env_coexec_str = std::getenv("MI_COEXEC_G");
+    const int cur_coexec_g = (ane_ && ane_->ready() && env_coexec_str)
+        ? std::clamp(std::atoi(env_coexec_str), 0, 64)
+        : 0;
+    const int ane_base_chunk = (ane_ && ane_->ready()) ? (2 * AneMlpEngine::MAX_SUBS * ane_->block_rows()) : 0;
+    const int ane_max_chunk = (ane_base_chunk > 0) ? (ane_base_chunk + 2 * cur_coexec_g) : 0;
     const size_t max_vis_c = std::max<size_t>(
         static_cast<size_t>(chunk_size_),
-        ane_max_chunk > 0 ? static_cast<size_t>(ane_max_chunk) : static_cast<size_t>(chunk_size_)
+        ane_base_chunk > 0 ? static_cast<size_t>(ane_base_chunk + 128) : static_cast<size_t>(chunk_size_)
     );
 
-    const int ane_min = 176;
+    const int ane_min = ane_min_;
     while (offset < n_tokens) {
         int rem = n_tokens - offset;
         if (ane_max_chunk > 0 && rem >= ane_min) {
             int m = std::min(ane_max_chunk, rem);
-            if (rem > ane_max_chunk && rem - m < ane_min && rem <= 2 * ane_max_chunk) {
+            if (cur_coexec_g == 0 && rem > ane_max_chunk && rem <= ane_base_chunk + 128) {
+                m = rem;
+            } else if (rem > ane_max_chunk && rem - m < ane_min && rem <= 2 * ane_max_chunk) {
                 m = rem / 2;
             }
             bool is_last = (offset + m == n_tokens);
@@ -4421,6 +5227,9 @@ const float* Qwen38Model::forward_multimodal(
         int m = std::min(chunk_size_, rem);
         bool is_last = (offset + m == n_tokens);
         std::memcpy([(id<MTLBuffer>)buf_token_ids_ contents], tokens + offset, static_cast<size_t>(m) * sizeof(int));
+        if (use_cpu_embed_) {
+            cpu_embed_.gather_f32(tokens + offset, m, reinterpret_cast<float*>([(id<MTLBuffer>)buf_hidden_ contents]));
+        }
 
         if (!buf_mrope_pos_)  buf_mrope_pos_  = ctx_.alloc_shared(max_vis_c * 3 * sizeof(int));
         if (!buf_vis_embeds_) buf_vis_embeds_ = ctx_.alloc_shared(max_vis_c * hidden_size_ * sizeof(float));
@@ -4715,7 +5524,7 @@ void Qwen38Model::encode_mtp_tree_expand(
                                kv_mask[batch[0]] == ((1u << depth[batch[0]]) - 1u));
         cur_tree_ = is_linear_step ? TreeParams{} : mtp_tp;
         encode_full_attn_layer(enc, mtp_.layer, mtp_k_cache_, mtp_v_cache_, static_cast<uint32_t>(B), step_kv_pos,
-                               mtp_k_sb_, mtp_v_sb_, false, nullptr, nil, mtp_k_bounds_, &mtp_quest_built_pages_);
+                               mtp_k_sb_, mtp_v_sb_, false, nullptr, nil, nil, nullptr, /*is_mtp=*/true, /*use_tree_buf=*/false);
         cur_tree_ = saved_tree;
         cur_mrope_buf_ = saved_mrope;
 
@@ -4963,9 +5772,7 @@ void Qwen38Model::forward_mtp_tree_impl(int anchor_token, Sampler* sampler, std:
                 if (cb.error) throw std::runtime_error(std::string("Metal T7 suffix-fast error: ") + [[cb.error localizedDescription] UTF8String]);
             }
         } else {
-        // Adaptive B=3 Tri-Branch Probe in CB #1: with BitScreen, B=3 costs 0.89 ms vs 0.76 ms for B=1 (+0.13 ms!!),
-        // expanding c0 -> {c1, a1_0}, a0 -> a0_c1, AND a1 -> a1_c1 simultaneously! Unlocks ZERO-CB2a-wave M=8 trees
-        // (t3_zero, r4w) and 1-wave r3w (hidden behind CPU encode) at ALL context lengths!
+        // Adaptive B=3 Tri-Branch Probe in CB #1 + Concurrent CB #2 Pre-Encoding (hides ~0.65 ms CPU encode behind CB #1!):
         const float tri_ema_thresh = std::getenv("MI_TRI_EMA") ? std::strtof(std::getenv("MI_TRI_EMA"), nullptr) : 0.78f;
         const bool tri_probe = (bs_enabled_ ? (mtp_alpha_ema_ < tri_ema_thresh)
                                             : (mtp_alpha_ema_ < 0.78f && pre_pos >= 8192));
@@ -4981,281 +5788,311 @@ void Qwen38Model::forward_mtp_tree_impl(int anchor_token, Sampler* sampler, std:
                                    scfg_topk, draft_top_p, round_seed, nullptr, 1, 2, 0, nullptr, nullptr, true);
             [enc1 endEncoding];
             [cb1 commit];
+
+            // D2: Speculatively pre-encode CB #2 on CPU while GPU executes CB #1!
+            // Uncommitted cb2_pre costs 0 GPU work on mispredict and uses dynamic buf_tree_params_ for exact tree reuse.
+            const bool allow_pre_cb2 = (sparse_kv_budget_ == 0);
+            const int pre_M = (last_t7_m_ > 0) ? last_t7_m_ : ((pre_pos >= 32768) ? 4 : 8);
+            const bool pre_tree = (last_t7_m_ > 0) ? last_t7_tree_ : true;
+            const int saved_rec_slot = rec_slot_;
+            const int saved_pending_replay_m = pending_replay_m_;
+            id<MTLCommandBuffer> cb2_pre = nil;
+            if (allow_pre_cb2) {
+                cb2_pre = [(id<MTLCommandQueue>)ctx_.queue() commandBuffer];
+                id<MTLComputeCommandEncoder> enc_pre = [cb2_pre computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+                if (pre_tree) {
+                    TreeParams dummy_tp{};
+                    dummy_tp.is_tree = 1u;
+                    dummy_tp.n_nodes = static_cast<uint32_t>(pre_M);
+                    dummy_tp.mask_base_pos = static_cast<uint32_t>(pre_pos);
+                    dummy_tp.pad0 = 2u; // _s2 (8 KB SRAM, 4 TGs/core) handles both 1-slot and 2-slot T7 trees!
+                    cur_tree_ = dummy_tp;
+                }
+                encode_chunk(enc_pre, pre_M, pre_pos, true, is_greedy, true, true, v_margin, /*use_tree_buf=*/pre_tree);
+                cur_tree_ = TreeParams{};
+                [enc_pre endEncoding];
+            }
+
             [cb1 waitUntilCompleted];
             if (cb1.error) throw std::runtime_error(std::string("Metal T7 cb1 error: ") + [[cb1.error localizedDescription] UTF8String]);
-        }
 
-        DraftDist* all_dd_mut = reinterpret_cast<DraftDist*>([(id<MTLBuffer>)buf_draft_dists_ contents]);
-        const DraftDist& d0 = all_dd_mut[0];
-        const DraftDist& d1 = all_dd_mut[1];
-        const float q0 = d0.q_top1;
-        const float q1 = d1.q_top1;
-        const int c0 = static_cast<int>(d0.sampled_id);
-        const int c1 = static_cast<int>(d1.sampled_id);
-        const int a0 = static_cast<int>(d0.alt_id[0]);
-        const int a1 = static_cast<int>(d0.alt_id[1]);
-        const int a2 = static_cast<int>(d0.alt_id[2]);
-        const uint32_t ac0 = d0.alt_count;
-        const int a1_0 = static_cast<int>(d1.alt_id[0]);
-        const uint32_t ac1 = d1.alt_count;
-        const float a = std::clamp(mtp_alpha_ema_, 0.50f, 0.92f);
-        const float q1_a0 = (tri_probe && ac0 >= 1u) ? all_dd_mut[4].q_top1 : a;
-        const int a0_c1   = (tri_probe && ac0 >= 1u) ? static_cast<int>(all_dd_mut[4].sampled_id) : -1;
-        const float q1_a1 = (tri_probe && ac0 >= 2u) ? all_dd_mut[6].q_top1 : a;
-        const int a1_c1   = (tri_probe && ac0 >= 2u) ? static_cast<int>(all_dd_mut[6].sampled_id) : -1;
+            DraftDist* all_dd_mut = reinterpret_cast<DraftDist*>([(id<MTLBuffer>)buf_draft_dists_ contents]);
+            const DraftDist& d0 = all_dd_mut[0];
+            const DraftDist& d1 = all_dd_mut[1];
+            const float q0 = d0.q_top1;
+            const float q1 = d1.q_top1;
+            const int c0 = static_cast<int>(d0.sampled_id);
+            const int c1 = static_cast<int>(d1.sampled_id);
+            const int a0 = static_cast<int>(d0.alt_id[0]);
+            const int a1 = static_cast<int>(d0.alt_id[1]);
+            const int a2 = static_cast<int>(d0.alt_id[2]);
+            const uint32_t ac0 = d0.alt_count;
+            const int a1_0 = static_cast<int>(d1.alt_id[0]);
+            const uint32_t ac1 = d1.alt_count;
+            const float a = std::clamp(mtp_alpha_ema_, 0.50f, 0.92f);
+            const float q1_a0 = (tri_probe && ac0 >= 1u) ? all_dd_mut[4].q_top1 : a;
+            const int a0_c1   = (tri_probe && ac0 >= 1u) ? static_cast<int>(all_dd_mut[4].sampled_id) : -1;
+            const float q1_a1 = (tri_probe && ac0 >= 2u) ? all_dd_mut[6].q_top1 : a;
+            const int a1_c1   = (tri_probe && ac0 >= 2u) ? static_cast<int>(all_dd_mut[6].sampled_id) : -1;
 
-        const float fork_bias = std::getenv("TREE_FBIAS") ? std::strtof(std::getenv("TREE_FBIAS"), nullptr) : 1.15f;
-        auto lookup_prob = [](const DraftDist& dd, int tok) -> float {
-            for (uint32_t i = 0; i < dd.count && i < 256u; ++i) {
-                if (static_cast<int>(dd.cands[i].id) == tok) return dd.cands[i].val;
-            }
-            return 0.0f;
-        };
-        const float p0_a0 = (ac0 >= 1u) ? lookup_prob(d0, a0) : 0.0f;
-        const float p0_a1 = (ac0 >= 2u) ? lookup_prob(d0, a1) : 0.0f;
-        const float p0_a2 = (ac0 >= 3u) ? lookup_prob(d0, a2) : 0.0f;
-        const float p1_a0 = (ac1 >= 1u) ? lookup_prob(d1, a1_0) : 0.0f;
-
-        SuffixResult sr = pld_enabled_ ? suffix_cache_.lookup(token_history_, anchor_token, c0) : SuffixResult{};
-
-        int skip_expand[16] = {};
-        int exp_start_d = 1;
-        int exp_kv_cur = tri_probe ? 3 : 1;
-        int exp_kv_slot[16];
-        int exp_hid_alias[16];
-        uint32_t exp_kv_mask[16] = {};
-        for (int i = 0; i < 16; ++i) { exp_kv_slot[i] = -1; exp_hid_alias[i] = -1; }
-        exp_kv_slot[1] = 0;
-        exp_kv_mask[1] = 1u;
-        skip_expand[1] = 1;
-        skip_expand[2] = 1; // tid[2] = c1 already drafted in cb1!
-
-        bool do_hybrid_pld = false;
-        // Post-CB1 Suffix Confirmation:
-        // - Greedy: accept match_len>=4 with c0 agreement OR match_len==3 with (c0,c1) double agreement.
-        // - Sampled: require match_len>=4 with c0 agreement (or repo match with c0+c1 double agreement) AND preserve
-        //   cb1's calibrated DraftDist for d=0 (prefilled[1]=0) and d=1 (prefilled[2]=0 when cont[1]==c1)!
-        bool s1_hit = (sr.n_branches >= 1 && sr.b[0].cont_len >= 3 && sr.b[0].cont[0] == c0 &&
-                       (is_greedy
-                           ? (sr.b[0].match_len >= 4 || (sr.b[0].match_len == 3 && sr.b[0].cont_len >= 4 && sr.b[0].cont[1] == c1))
-                           : ((sr.b[0].from_session && sr.b[0].match_len >= 4 && (q0 >= 0.85f || (sr.b[0].cont_len >= 2 && sr.b[0].cont[1] == c1))) ||
-                              (!sr.b[0].from_session && sr.b[0].match_len >= 5 && sr.b[0].cont_len >= 4 && sr.b[0].cont[1] == c1))));
-        if (s1_hit && sr.n_branches >= 2 && sr.b[0].match_len >= 4 && sr.b[0].cont_len >= 4 &&
-            sr.b[1].match_len >= 4 && sr.b[1].cont_len >= 3 && q0 < 0.88f) {
-            // Tier S2: 2-Branch Suffix Tree (4+3, ZERO cb2 MTP expansion; preserves d=0/d=1 DraftDist!)
-            used_pld = true;
-            const int t43[8] = {-1, 0, 1, 2, 3, 0, 5, 6};
-            std::memcpy(parents, t43, sizeof(t43));
-            for (int j = 0; j < 4; ++j) {
-                tid_ptr[1 + j] = sr.b[0].cont[j];
-                prefilled[1 + j] = (j == 0 || (j == 1 && sr.b[0].cont[1] == c1)) ? 0 : 1;
-            }
-            for (int j = 0; j < 3; ++j) { tid_ptr[5 + j] = sr.b[1].cont[j]; prefilled[5 + j] = 1; }
-        } else if (s1_hit) {
-            // Tier S1: MTP-confirmed linear Suffix match (ZERO cb2 MTP expansion; preserves d=0/d=1 DraftDist!)
-            used_pld = true;
-            linear_fast = true;
-            M = sr.b[0].cont_len + 1;
-            for (int d = 0; d < sr.b[0].cont_len; ++d) {
-                tid_ptr[d + 1] = sr.b[0].cont[d];
-                prefilled[d + 1] = (d == 0 || (d == 1 && sr.b[0].cont[1] == c1)) ? 0 : 1;
-            }
-            for (int i = 0; i < M; ++i) parents[i] = i - 1;
-        } else if (sr.n_branches >= 1 && sr.b[0].cont_len >= 3 && sr.b[0].cont[0] != c0 &&
-                   ((sr.b[0].match_len >= 4 && q0 < 0.985f) ||
-                    (sr.b[0].from_session && sr.b[0].match_len == 3 && q0 < 0.95f))) {
-            // Tier S3: Hybrid MTP (4 tok, reusing d=1!) || Suffix (3 tok) Parallel Tree!
-            const int t_hyb[8] = {-1, 0, 1, 2, 3, 0, 5, 6};
-            std::memcpy(parents, t_hyb, sizeof(t_hyb));
-            tid_ptr[5] = sr.b[0].cont[0]; prefilled[5] = 1; skip_expand[5] = 1;
-            tid_ptr[6] = sr.b[0].cont[1]; prefilled[6] = 1; skip_expand[6] = 1;
-            tid_ptr[7] = sr.b[0].cont[2]; prefilled[7] = 1; skip_expand[7] = 1;
-            exp_start_d = 2;
-            do_hybrid_pld = true;
-            used_pld = true;
-        } else {
-            // Context-Aware Bayesian E[accepted tokens] / ms(topo) across 9 M=8 (incl. 0-wave t3_zero & r4w!) + 5 M=4 topologies!
-            // Uses exact M4 Max silicon timings (verify M=8: 40.65 ms; BitScreen waves: B1=0.76, B2=B3=0.89 ms; CPU overlap=0.65 ms).
-            const int eff_kv = (sparse_kv_budget_ > 0 && pre_pos > sparse_kv_budget_ + 2048)
-                ? sparse_kv_budget_
-                : pre_pos;
-            const float ctx_frac = static_cast<float>(eff_kv) / 126976.0f;
-            const float kv_scale = (kv_bits_ == 16) ? 1.65f : ((kv_bits_ == 4) ? 0.68f : 1.0f);
-            const float quest_ovh = (sparse_kv_budget_ > 0 && pre_pos > sparse_kv_budget_ + 2048) ? (0.5f * static_cast<float>(pre_pos) / 126976.0f) : 0.0f;
-            const float attn_m8  = (eff_kv >= 4096) ? (36.8f * ctx_frac * kv_scale + quest_ovh) : (1.5f * static_cast<float>(eff_kv) / 4096.0f);
-            const float attn_m4  = (eff_kv >= 4096) ? (19.5f * ctx_frac * kv_scale + quest_ovh) : (1.3f * static_cast<float>(eff_kv) / 4096.0f);
-            const float mtp_cb1  = 1.9f + ((eff_kv >= 4096) ? ((tri_probe ? 2.4f : 2.0f) * ctx_frac * kv_scale) : (tri_probe ? 0.13f : 0.0f));
-            const float cpu_ovl  = 0.65f; // CB #2a executes on GPU in parallel with CB #2b 64-layer CPU encode!
-            const float verify_m8 = 40.65f + attn_m8 + mtp_cb1;
-            const float verify_m4 = 38.85f + attn_m4 + mtp_cb1;
-            const float wave_b1  = (bs_enabled_ ? 0.76f : 0.80f) + ((eff_kv >= 4096) ? (0.76f * ctx_frac * kv_scale) : 0.0f);
-            const float wave_b2  = (bs_enabled_ ? 0.89f : 1.02f) + ((eff_kv >= 4096) ? (1.06f * ctx_frac * kv_scale) : 0.0f);
-            const float wave_b3  = (bs_enabled_ ? 0.89f : 1.10f) + ((eff_kv >= 4096) ? (1.25f * ctx_frac * kv_scale) : 0.0f);
-            auto m8_cost = [&](float w_ms) { return verify_m8 + std::max(cpu_ovl, w_ms); };
-            auto m4_cost = [&](float w_ms) { return verify_m4 + std::max(cpu_ovl, w_ms); };
-
-            const float p01 = q0 * q1;
-            const float a2p = a * a, a3 = a2p * a, a4 = a3 * a, a5 = a4 * a;
-
-            float e_lin7 = 1.0f + q0 + p01 * (1.0f + a + a2p + a3 + a4 + a5);
-            float r_lin7 = e_lin7 / m8_cost(5.0f * wave_b1);
-            float e_lin5 = 1.0f + q0 + p01 * (1.0f + a + a2p + a3);
-            float r_lin5 = e_lin5 / m8_cost(3.0f * wave_b1);
-            float e_f1   = 1.0f + q0 + p01 * (1.0f + a + a2p) + fork_bias * q0 * p1_a0 * (1.0f + a + a2p);
-            float r_f1   = (ac1 >= 1u && p1_a0 > 0.03f) ? (e_f1 / m8_cost(2.0f * wave_b2)) : -1.0f;
-            float e_r52  = 1.0f + q0 + p01 * (1.0f + a + a2p + a3) + fork_bias * p0_a0 * (1.0f + q1_a0);
-            float c_r52  = tri_probe ? m8_cost(3.0f * wave_b1) : m8_cost(wave_b2 + 2.0f * wave_b1);
-            float r_r52  = (ac0 >= 1u && p0_a0 > 0.03f) ? (e_r52 / c_r52) : -1.0f;
-            float e_r43  = 1.0f + q0 + p01 * (1.0f + a + a2p) + fork_bias * p0_a0 * (1.0f + q1_a0 * (1.0f + a));
-            float c_r43  = tri_probe ? m8_cost(wave_b2 + wave_b1) : m8_cost(2.0f * wave_b2);
-            float r_r43  = (ac0 >= 1u && p0_a0 > 0.03f) ? (e_r43 / c_r43) : -1.0f;
-            float e_df   = 1.0f + q0 + p01 * (1.0f + a + a2p) + fork_bias * (q0 * p1_a0 + p0_a0 * (1.0f + q1_a0));
-            float c_df   = tri_probe ? m8_cost(2.0f * wave_b1) : m8_cost(wave_b2 + wave_b1);
-            float r_df   = (ac0 >= 1u && ac1 >= 1u && p0_a0 > 0.03f && p1_a0 > 0.03f) ? (e_df / c_df) : -1.0f;
-            float e_r3w  = 1.0f + q0 + p01 * (1.0f + a) + fork_bias * (p0_a0 * (1.0f + q1_a0) + p0_a1 * (1.0f + q1_a1));
-            float c_r3w  = tri_probe ? m8_cost(wave_b1) : m8_cost(wave_b3);
-            float r_r3w  = (ac0 >= 2u && p0_a1 > 0.03f) ? (e_r3w / c_r3w) : -1.0f;
-            // Zero-CB2a-Wave M=8 Trees (unlocked by tri_probe — 0.00 ms CB #2a!)
-            float e_t3z  = 1.0f + q0 + p01 + fork_bias * (q0 * p1_a0 + p0_a0 * (1.0f + q1_a0) + p0_a1 * (1.0f + q1_a1));
-            float r_t3z  = (tri_probe && ac0 >= 2u && ac1 >= 1u && p0_a1 > 0.03f && p1_a0 > 0.03f) ? (e_t3z / m8_cost(0.0f)) : -1.0f;
-            float e_r4w  = 1.0f + q0 + p01 + fork_bias * (p0_a0 * (1.0f + q1_a0) + p0_a1 * (1.0f + q1_a1) + p0_a2);
-            float r_r4w  = (tri_probe && ac0 >= 3u && p0_a2 > 0.03f) ? (e_r4w / m8_cost(0.0f)) : -1.0f;
-
-            // M=4 Fast-Verify Topologies (half target attention FLOPs at >=4k; 0 CB #2 draft waves for rf21/rf12/df1/r3w!)
-            float e_m4_l3   = 1.0f + q0 + p01 * (1.0f + a);
-            float r_m4_l3   = (pre_pos >= 4096) ? (e_m4_l3 / m4_cost(wave_b1)) : -1.0f;
-            float e_m4_rf21 = 1.0f + q0 + p01 + fork_bias * p0_a0;
-            float r_m4_rf21 = (pre_pos >= 4096 && ac0 >= 1u && p0_a0 > 0.03f) ? (e_m4_rf21 / m4_cost(0.0f)) : -1.0f;
-            float e_m4_df1  = 1.0f + q0 + p01 + fork_bias * q0 * p1_a0;
-            float r_m4_df1  = (pre_pos >= 4096 && ac1 >= 1u && p1_a0 > 0.03f) ? (e_m4_df1 / m4_cost(0.0f)) : -1.0f;
-            float e_m4_r3w  = 1.0f + q0 + fork_bias * (p0_a0 + p0_a1);
-            float r_m4_r3w  = (pre_pos >= 4096 && ac0 >= 2u && p0_a1 > 0.03f) ? (e_m4_r3w / m4_cost(0.0f)) : -1.0f;
-            float e_m4_rf12 = 1.0f + q0 + fork_bias * p0_a0 * (1.0f + q1_a0);
-            float r_m4_rf12 = (pre_pos >= 4096 && tri_probe && ac0 >= 1u && p0_a0 > 0.03f) ? (e_m4_rf12 / m4_cost(0.0f)) : -1.0f;
-
-            float scores[14] = {r_lin7, r_lin5, r_f1, r_r52, r_r43, r_df, r_r3w, r_t3z, r_r4w,
-                                r_m4_l3, r_m4_rf21, r_m4_df1, r_m4_r3w, r_m4_rf12};
-            int best = 0;
-            for (int k = 1; k < 14; ++k) if (scores[k] > scores[best]) best = k;
-
-            if (best == 0) {
-                linear_fast = true; M = 8;
-                for (int i = 0; i < M; ++i) parents[i] = i - 1;
-                exp_start_d = 2;
-            } else if (best == 1) {
-                linear_fast = true; M = 6;
-                for (int i = 0; i < M; ++i) parents[i] = i - 1;
-                exp_start_d = 2;
-            } else if (best == 2) {
-                const int tf1[8] = {-1, 0, 1, 2, 3, 1, 5, 6};
-                std::memcpy(parents, tf1, sizeof(tf1));
-                tid_ptr[5] = a1_0; skip_expand[5] = 1;
-                exp_start_d = 2;
-            } else if (best == 3) {
-                const int t52[8] = {-1, 0, 1, 2, 3, 4, 0, 6};
-                std::memcpy(parents, t52, sizeof(t52));
-                tid_ptr[6] = a0; skip_expand[6] = 1;
-                if (tri_probe) {
-                    tid_ptr[7] = a0_c1; skip_expand[7] = 1;
-                    all_dd_mut[6] = all_dd_mut[4];
-                    exp_start_d = 2;
-                } else {
-                    exp_start_d = 1;
+            const float fork_bias = std::getenv("TREE_FBIAS") ? std::strtof(std::getenv("TREE_FBIAS"), nullptr) : 1.15f;
+            auto lookup_prob = [](const DraftDist& dd, int tok) -> float {
+                for (uint32_t i = 0; i < dd.count && i < 256u; ++i) {
+                    if (static_cast<int>(dd.cands[i].id) == tok) return dd.cands[i].val;
                 }
-            } else if (best == 4) {
+                return 0.0f;
+            };
+            const float p0_a0 = (ac0 >= 1u) ? lookup_prob(d0, a0) : 0.0f;
+            const float p0_a1 = (ac0 >= 2u) ? lookup_prob(d0, a1) : 0.0f;
+            const float p0_a2 = (ac0 >= 3u) ? lookup_prob(d0, a2) : 0.0f;
+            const float p1_a0 = (ac1 >= 1u) ? lookup_prob(d1, a1_0) : 0.0f;
+
+            SuffixResult sr = pld_enabled_ ? suffix_cache_.lookup(token_history_, anchor_token, c0) : SuffixResult{};
+
+            int skip_expand[16] = {};
+            int exp_start_d = 1;
+            int exp_kv_cur = tri_probe ? 3 : 1;
+            int exp_kv_slot[16];
+            int exp_hid_alias[16];
+            uint32_t exp_kv_mask[16] = {};
+            for (int i = 0; i < 16; ++i) { exp_kv_slot[i] = -1; exp_hid_alias[i] = -1; }
+            exp_kv_slot[1] = 0;
+            exp_kv_mask[1] = 1u;
+            skip_expand[1] = 1;
+            skip_expand[2] = 1; // tid[2] = c1 already drafted in cb1!
+
+            bool do_hybrid_pld = false;
+            // Post-CB1 Suffix Confirmation:
+            // - Greedy: accept match_len>=4 with c0 agreement OR match_len==3 with (c0,c1) double agreement.
+            // - Sampled: require match_len>=4 with c0 agreement (or repo match with c0+c1 double agreement) AND preserve
+            //   cb1's calibrated DraftDist for d=0 (prefilled[1]=0) and d=1 (prefilled[2]=0 when cont[1]==c1)!
+            bool s1_hit = (sr.n_branches >= 1 && sr.b[0].cont_len >= 3 && sr.b[0].cont[0] == c0 &&
+                           (is_greedy
+                               ? (sr.b[0].match_len >= 4 || (sr.b[0].match_len == 3 && sr.b[0].cont_len >= 4 && sr.b[0].cont[1] == c1))
+                               : ((sr.b[0].from_session && sr.b[0].match_len >= 4 && (q0 >= 0.85f || (sr.b[0].cont_len >= 2 && sr.b[0].cont[1] == c1))) ||
+                                  (!sr.b[0].from_session && sr.b[0].match_len >= 5 && sr.b[0].cont_len >= 4 && sr.b[0].cont[1] == c1))));
+            if (s1_hit && sr.n_branches >= 2 && sr.b[0].match_len >= 4 && sr.b[0].cont_len >= 4 &&
+                sr.b[1].match_len >= 4 && sr.b[1].cont_len >= 3 && q0 < 0.88f) {
+                // Tier S2: 2-Branch Suffix Tree (4+3, ZERO cb2 MTP expansion; preserves d=0/d=1 DraftDist!)
+                used_pld = true;
                 const int t43[8] = {-1, 0, 1, 2, 3, 0, 5, 6};
                 std::memcpy(parents, t43, sizeof(t43));
-                tid_ptr[5] = a0; skip_expand[5] = 1;
-                if (tri_probe) {
-                    tid_ptr[6] = a0_c1; skip_expand[6] = 1;
-                    all_dd_mut[5] = all_dd_mut[4];
-                    exp_kv_slot[5] = 1;
-                    exp_kv_mask[5] = 2u;
-                    exp_hid_alias[5] = 4; // node 5 (a0)'s MTP hidden sits in seed_hid[4] from CB #1!
-                    exp_start_d = 2;
-                } else {
-                    exp_start_d = 1;
+                for (int j = 0; j < 4; ++j) {
+                    tid_ptr[1 + j] = sr.b[0].cont[j];
+                    prefilled[1 + j] = (j == 0 || (j == 1 && sr.b[0].cont[1] == c1)) ? 0 : 1;
                 }
-            } else if (best == 5) {
-                const int tdf[8] = {-1, 0, 1, 2, 3, 1, 0, 6};
-                std::memcpy(parents, tdf, sizeof(tdf));
-                tid_ptr[5] = a1_0; skip_expand[5] = 1;
-                tid_ptr[6] = a0;   skip_expand[6] = 1;
-                if (tri_probe) {
-                    tid_ptr[7] = a0_c1; skip_expand[7] = 1;
-                    all_dd_mut[6] = all_dd_mut[4];
-                    exp_start_d = 2;
-                } else {
-                    exp_start_d = 1;
+                for (int j = 0; j < 3; ++j) { tid_ptr[5 + j] = sr.b[1].cont[j]; prefilled[5 + j] = 1; }
+            } else if (s1_hit) {
+                // Tier S1: MTP-confirmed linear Suffix match (ZERO cb2 MTP expansion; preserves d=0/d=1 DraftDist!)
+                used_pld = true;
+                linear_fast = true;
+                M = sr.b[0].cont_len + 1;
+                for (int d = 0; d < sr.b[0].cont_len; ++d) {
+                    tid_ptr[d + 1] = sr.b[0].cont[d];
+                    prefilled[d + 1] = (d == 0 || (d == 1 && sr.b[0].cont[1] == c1)) ? 0 : 1;
                 }
-            } else if (best == 6) {
-                const int t3w[8] = {-1, 0, 1, 2, 0, 4, 0, 6};
-                std::memcpy(parents, t3w, sizeof(t3w));
-                tid_ptr[4] = a0; skip_expand[4] = 1;
-                tid_ptr[6] = a1; skip_expand[6] = 1;
-                if (tri_probe) {
-                    tid_ptr[5] = a0_c1; skip_expand[5] = 1;
-                    tid_ptr[7] = a1_c1; skip_expand[7] = 1;
-                    exp_start_d = 2; // ONLY 1 B=1 wave (2->3), hidden behind CPU encode!
-                } else {
-                    exp_start_d = 1;
-                }
-            } else if (best == 7) {
-                // t3_zero: 0 -> { c0 -> {c1, a1_0}, a0 -> a0_c1, a1 -> a1_c1 } (ALL 8 nodes & dists already in place!)
-                std::memcpy(parents, probe3_p, sizeof(probe3_p));
-                exp_start_d = 16; // 0 CB #2a waves!
-            } else if (best == 8) {
-                // r4w: 0 -> { c0 -> c1, a0 -> a0_c1, a1 -> a1_c1, a2 } (4-way root coverage, 0 CB #2a waves!)
-                const int tr4w[8] = {-1, 0, 1, 0, 3, 0, 5, 0};
-                std::memcpy(parents, tr4w, sizeof(tr4w));
-                DraftDist dd_a0 = all_dd_mut[4];
-                DraftDist dd_a1 = all_dd_mut[6];
-                tid_ptr[3] = a0;    skip_expand[3] = 1;
-                tid_ptr[4] = a0_c1; skip_expand[4] = 1;
-                tid_ptr[5] = a1;    skip_expand[5] = 1;
-                tid_ptr[6] = a1_c1; skip_expand[6] = 1;
-                tid_ptr[7] = a2;    skip_expand[7] = 1;
-                all_dd_mut[3] = dd_a0;
-                all_dd_mut[5] = dd_a1;
-                exp_start_d = 16; // 0 CB #2a waves!
-            } else if (best == 9) {
-                linear_fast = true; M = 4;
                 for (int i = 0; i < M; ++i) parents[i] = i - 1;
+            } else if (sr.n_branches >= 1 && sr.b[0].cont_len >= 3 && sr.b[0].cont[0] != c0 &&
+                       ((sr.b[0].match_len >= 4 && q0 < 0.985f) ||
+                        (sr.b[0].from_session && sr.b[0].match_len == 3 && q0 < 0.95f))) {
+                // Tier S3: Hybrid MTP (4 tok, reusing d=1!) || Suffix (3 tok) Parallel Tree!
+                const int t_hyb[8] = {-1, 0, 1, 2, 3, 0, 5, 6};
+                std::memcpy(parents, t_hyb, sizeof(t_hyb));
+                tid_ptr[5] = sr.b[0].cont[0]; prefilled[5] = 1; skip_expand[5] = 1;
+                tid_ptr[6] = sr.b[0].cont[1]; prefilled[6] = 1; skip_expand[6] = 1;
+                tid_ptr[7] = sr.b[0].cont[2]; prefilled[7] = 1; skip_expand[7] = 1;
                 exp_start_d = 2;
-            } else if (best == 10) {
-                M = 4;
-                const int tm4rf[4] = {-1, 0, 1, 0};
-                std::memcpy(parents, tm4rf, sizeof(tm4rf));
-                tid_ptr[3] = a0; skip_expand[3] = 1;
-                exp_start_d = 16; // 0 CB #2 MTP waves!
-            } else if (best == 11) {
-                M = 4;
-                const int tm4df[4] = {-1, 0, 1, 1};
-                std::memcpy(parents, tm4df, sizeof(tm4df));
-                tid_ptr[3] = a1_0; skip_expand[3] = 1;
-                exp_start_d = 16; // 0 CB #2 MTP waves!
-            } else if (best == 12) {
-                M = 4;
-                const int tm4w[4] = {-1, 0, 0, 0};
-                std::memcpy(parents, tm4w, sizeof(tm4w));
-                tid_ptr[2] = a0; skip_expand[2] = 1;
-                tid_ptr[3] = a1; skip_expand[3] = 1;
-                exp_start_d = 16; // 0 CB #2 MTP waves!
+                do_hybrid_pld = true;
+                used_pld = true;
             } else {
-                M = 4;
-                const int tm4rf12[4] = {-1, 0, 0, 2};
-                std::memcpy(parents, tm4rf12, sizeof(tm4rf12));
-                tid_ptr[2] = a0;    skip_expand[2] = 1;
-                tid_ptr[3] = a0_c1; skip_expand[3] = 1;
-                all_dd_mut[2] = all_dd_mut[4];
-                exp_start_d = 16; // 0 CB #2 MTP waves!
-            }
-        }
+                // D3: Hardware-Adaptive Bayesian E[accepted tokens] / ms(topo) across 9 M=8 + 5 M=4 topologies!
+                // Scales priors by GPU bandwidth, tracks live CB #2 GPU time via EMA, and reflects full-context MTP KV4!
+                const float bw_scale = 546.0f / std::clamp(static_cast<float>(ctx_.estimated_bandwidth_gbs()), 60.0f, 1200.0f);
+                const int eff_kv = (sparse_kv_budget_ > 0 && pre_pos > sparse_kv_budget_ + 2048)
+                    ? sparse_kv_budget_
+                    : pre_pos;
+                const float ctx_frac = static_cast<float>(eff_kv) / 126976.0f;
+                const float kv_scale = (kv_bits_ == 16) ? 1.65f : ((kv_bits_ == 4) ? 0.68f : 1.0f);
+                const float quest_ovh = (sparse_kv_budget_ > 0 && pre_pos > sparse_kv_budget_ + 2048) ? (0.5f * static_cast<float>(pre_pos) / 126976.0f) : 0.0f;
+                const float attn_m8  = (eff_kv >= 1024) ? (36.8f * ctx_frac * kv_scale * bw_scale + quest_ovh) : (0.5f * static_cast<float>(eff_kv) / 1024.0f);
+                const float attn_m4  = (eff_kv >= 1024) ? (19.2f * ctx_frac * kv_scale * bw_scale + quest_ovh) : (0.4f * static_cast<float>(eff_kv) / 1024.0f);
+                const int eff_mtp_kv = eff_kv;
+                const float mtp_frac = static_cast<float>(eff_mtp_kv) / 126976.0f;
+                const float mtp_kv_scale = (mtp_kv_bits_ == 4) ? 0.68f : kv_scale;
+                const float mtp_cb1  = (1.9f * bw_scale) + ((eff_mtp_kv >= 1024) ? ((tri_probe ? 2.4f : 2.0f) * mtp_frac * mtp_kv_scale * bw_scale) : (tri_probe ? 0.13f : 0.0f));
+                const float cpu_ovl  = allow_pre_cb2 ? 0.05f : 0.65f; // D2 hides CB #2 CPU encode behind CB #1!
+                // Shared non-attention base EMA (prevents 2-arm bandit inversion where a single cold M=4 sample poisons base_m4 > base_m8!)
+                const float prior_m8 = 38.0f * bw_scale;
+                const float base_m8  = (ema_cb2_ms_[1] > 0.0f) ? ema_cb2_ms_[1] : prior_m8;
+                const float base_m4  = std::max(5.0f, base_m8 - 1.5f * bw_scale);
+                const float verify_m8 = base_m8 + attn_m8 + mtp_cb1;
+                const float verify_m4 = base_m4 + attn_m4 + mtp_cb1;
+                const float wave_b1  = (bs_enabled_ ? 0.76f : 0.80f) * bw_scale + ((eff_mtp_kv >= 1024) ? (0.76f * mtp_frac * mtp_kv_scale * bw_scale) : 0.0f);
+                const float wave_b2  = (bs_enabled_ ? 0.89f : 1.02f) * bw_scale + ((eff_mtp_kv >= 1024) ? (1.06f * mtp_frac * mtp_kv_scale * bw_scale) : 0.0f);
+                const float wave_b3  = (bs_enabled_ ? 0.89f : 1.10f) * bw_scale + ((eff_mtp_kv >= 1024) ? (1.25f * mtp_frac * mtp_kv_scale * bw_scale) : 0.0f);
+                auto m8_cost = [&](float w_ms) { return verify_m8 + std::max(cpu_ovl, w_ms); };
+                auto m4_cost = [&](float w_ms) { return verify_m4 + std::max(cpu_ovl, w_ms); };
 
-        // CB #2: Pipelined split -> commit CB #2a (MTP tree expand) immediately so GPU executes CB #2a
-        // in parallel while CPU encodes the 64-layer target verify into CB #2b (eliminates ~0.65 ms CPU bubble)!
-        double prof_cb2a_gpu = 0.0, prof_cb2b_gpu = 0.0;
-        @autoreleasepool {
+                const float p01 = q0 * q1;
+                const float a2p = a * a, a3 = a2p * a, a4 = a3 * a, a5 = a4 * a;
+
+                float e_lin7 = 1.0f + q0 + p01 * (1.0f + a + a2p + a3 + a4 + a5);
+                float r_lin7 = e_lin7 / m8_cost(5.0f * wave_b1);
+                float e_lin5 = 1.0f + q0 + p01 * (1.0f + a + a2p + a3);
+                float r_lin5 = e_lin5 / m8_cost(3.0f * wave_b1);
+                float e_f1   = 1.0f + q0 + p01 * (1.0f + a + a2p) + fork_bias * q0 * p1_a0 * (1.0f + a + a2p);
+                float r_f1   = (ac1 >= 1u && p1_a0 > 0.03f) ? (e_f1 / m8_cost(2.0f * wave_b2)) : -1.0f;
+                float e_r52  = 1.0f + q0 + p01 * (1.0f + a + a2p + a3) + fork_bias * p0_a0 * (1.0f + q1_a0);
+                float c_r52  = tri_probe ? m8_cost(3.0f * wave_b1) : m8_cost(wave_b2 + 2.0f * wave_b1);
+                float r_r52  = (ac0 >= 1u && p0_a0 > 0.03f) ? (e_r52 / c_r52) : -1.0f;
+                float e_r43  = 1.0f + q0 + p01 * (1.0f + a + a2p) + fork_bias * p0_a0 * (1.0f + q1_a0 * (1.0f + a));
+                float c_r43  = tri_probe ? m8_cost(wave_b2 + wave_b1) : m8_cost(2.0f * wave_b2);
+                float r_r43  = (ac0 >= 1u && p0_a0 > 0.03f) ? (e_r43 / c_r43) : -1.0f;
+                float e_df   = 1.0f + q0 + p01 * (1.0f + a + a2p) + fork_bias * (q0 * p1_a0 + p0_a0 * (1.0f + q1_a0));
+                float c_df   = tri_probe ? m8_cost(2.0f * wave_b1) : m8_cost(wave_b2 + wave_b1);
+                float r_df   = (ac0 >= 1u && ac1 >= 1u && p0_a0 > 0.03f && p1_a0 > 0.03f) ? (e_df / c_df) : -1.0f;
+                float e_r3w  = 1.0f + q0 + p01 * (1.0f + a) + fork_bias * (p0_a0 * (1.0f + q1_a0) + p0_a1 * (1.0f + q1_a1));
+                float c_r3w  = tri_probe ? m8_cost(wave_b1) : m8_cost(wave_b3);
+                float r_r3w  = (ac0 >= 2u && p0_a1 > 0.03f) ? (e_r3w / c_r3w) : -1.0f;
+                // Zero-CB2a-Wave M=8 Trees (unlocked by tri_probe — 0.00 ms CB #2a!)
+                float e_t3z  = 1.0f + q0 + p01 + fork_bias * (q0 * p1_a0 + p0_a0 * (1.0f + q1_a0) + p0_a1 * (1.0f + q1_a1));
+                float r_t3z  = (tri_probe && ac0 >= 2u && ac1 >= 1u && p0_a1 > 0.03f && p1_a0 > 0.03f) ? (e_t3z / m8_cost(0.0f)) : -1.0f;
+                float e_r4w  = 1.0f + q0 + p01 + fork_bias * (p0_a0 * (1.0f + q1_a0) + p0_a1 * (1.0f + q1_a1) + p0_a2);
+                float r_r4w  = (tri_probe && ac0 >= 3u && p0_a2 > 0.03f) ? (e_r4w / m8_cost(0.0f)) : -1.0f;
+
+                // M=4 Fast-Verify Topologies (half target attention FLOPs at >=4k; 0 CB #2 draft waves for rf21/rf12/df1/r3w!)
+                float e_m4_l3   = 1.0f + q0 + p01 * (1.0f + a);
+                float r_m4_l3   = (pre_pos >= 4096) ? (e_m4_l3 / m4_cost(wave_b1)) : -1.0f;
+                float e_m4_rf21 = 1.0f + q0 + p01 + fork_bias * p0_a0;
+                float r_m4_rf21 = (pre_pos >= 4096 && ac0 >= 1u && p0_a0 > 0.03f) ? (e_m4_rf21 / m4_cost(0.0f)) : -1.0f;
+                float e_m4_df1  = 1.0f + q0 + p01 + fork_bias * q0 * p1_a0;
+                float r_m4_df1  = (pre_pos >= 4096 && ac1 >= 1u && p1_a0 > 0.03f) ? (e_m4_df1 / m4_cost(0.0f)) : -1.0f;
+                float e_m4_r3w  = 1.0f + q0 + fork_bias * (p0_a0 + p0_a1);
+                float r_m4_r3w  = (pre_pos >= 4096 && ac0 >= 2u && p0_a1 > 0.03f) ? (e_m4_r3w / m4_cost(0.0f)) : -1.0f;
+                float e_m4_rf12 = 1.0f + q0 + fork_bias * p0_a0 * (1.0f + q1_a0);
+                float r_m4_rf12 = (pre_pos >= 4096 && tri_probe && ac0 >= 1u && p0_a0 > 0.03f) ? (e_m4_rf12 / m4_cost(0.0f)) : -1.0f;
+
+                float scores[14] = {r_lin7, r_lin5, r_f1, r_r52, r_r43, r_df, r_r3w, r_t3z, r_r4w,
+                                    r_m4_l3, r_m4_rf21, r_m4_df1, r_m4_r3w, r_m4_rf12};
+                int best = 0;
+                for (int k = 1; k < 14; ++k) if (scores[k] > scores[best]) best = k;
+
+                if (best == 0) {
+                    linear_fast = true; M = 8;
+                    for (int i = 0; i < M; ++i) parents[i] = i - 1;
+                    exp_start_d = 2;
+                } else if (best == 1) {
+                    linear_fast = true; M = 6;
+                    for (int i = 0; i < M; ++i) parents[i] = i - 1;
+                    exp_start_d = 2;
+                } else if (best == 2) {
+                    const int tf1[8] = {-1, 0, 1, 2, 3, 1, 5, 6};
+                    std::memcpy(parents, tf1, sizeof(tf1));
+                    tid_ptr[5] = a1_0; skip_expand[5] = 1;
+                    exp_start_d = 2;
+                } else if (best == 3) {
+                    const int t52[8] = {-1, 0, 1, 2, 3, 4, 0, 6};
+                    std::memcpy(parents, t52, sizeof(t52));
+                    tid_ptr[6] = a0; skip_expand[6] = 1;
+                    if (tri_probe) {
+                        tid_ptr[7] = a0_c1; skip_expand[7] = 1;
+                        all_dd_mut[6] = all_dd_mut[4];
+                        exp_start_d = 2;
+                    } else {
+                        exp_start_d = 1;
+                    }
+                } else if (best == 4) {
+                    const int t43[8] = {-1, 0, 1, 2, 3, 0, 5, 6};
+                    std::memcpy(parents, t43, sizeof(t43));
+                    tid_ptr[5] = a0; skip_expand[5] = 1;
+                    if (tri_probe) {
+                        tid_ptr[6] = a0_c1; skip_expand[6] = 1;
+                        all_dd_mut[5] = all_dd_mut[4];
+                        exp_kv_slot[5] = 1;
+                        exp_kv_mask[5] = 2u;
+                        exp_hid_alias[5] = 4; // node 5 (a0)'s MTP hidden sits in seed_hid[4] from CB #1!
+                        exp_start_d = 2;
+                    } else {
+                        exp_start_d = 1;
+                    }
+                } else if (best == 5) {
+                    const int tdf[8] = {-1, 0, 1, 2, 3, 1, 0, 6};
+                    std::memcpy(parents, tdf, sizeof(tdf));
+                    tid_ptr[5] = a1_0; skip_expand[5] = 1;
+                    tid_ptr[6] = a0;   skip_expand[6] = 1;
+                    if (tri_probe) {
+                        tid_ptr[7] = a0_c1; skip_expand[7] = 1;
+                        all_dd_mut[6] = all_dd_mut[4];
+                        exp_start_d = 2;
+                    } else {
+                        exp_start_d = 1;
+                    }
+                } else if (best == 6) {
+                    const int t3w[8] = {-1, 0, 1, 2, 0, 4, 0, 6};
+                    std::memcpy(parents, t3w, sizeof(t3w));
+                    tid_ptr[4] = a0; skip_expand[4] = 1;
+                    tid_ptr[6] = a1; skip_expand[6] = 1;
+                    if (tri_probe) {
+                        tid_ptr[5] = a0_c1; skip_expand[5] = 1;
+                        tid_ptr[7] = a1_c1; skip_expand[7] = 1;
+                        exp_start_d = 2; // ONLY 1 B=1 wave (2->3), hidden behind CPU encode!
+                    } else {
+                        exp_start_d = 1;
+                    }
+                } else if (best == 7) {
+                    // t3_zero: 0 -> { c0 -> {c1, a1_0}, a0 -> a0_c1, a1 -> a1_c1 } (ALL 8 nodes & dists already in place!)
+                    std::memcpy(parents, probe3_p, sizeof(probe3_p));
+                    exp_start_d = 16; // 0 CB #2a waves!
+                } else if (best == 8) {
+                    // r4w: 0 -> { c0 -> c1, a0 -> a0_c1, a1 -> a1_c1, a2 } (4-way root coverage, 0 CB #2a waves!)
+                    const int tr4w[8] = {-1, 0, 1, 0, 3, 0, 5, 0};
+                    std::memcpy(parents, tr4w, sizeof(tr4w));
+                    DraftDist dd_a0 = all_dd_mut[4];
+                    DraftDist dd_a1 = all_dd_mut[6];
+                    tid_ptr[3] = a0;    skip_expand[3] = 1;
+                    tid_ptr[4] = a0_c1; skip_expand[4] = 1;
+                    tid_ptr[5] = a1;    skip_expand[5] = 1;
+                    tid_ptr[6] = a1_c1; skip_expand[6] = 1;
+                    tid_ptr[7] = a2;    skip_expand[7] = 1;
+                    all_dd_mut[3] = dd_a0;
+                    all_dd_mut[5] = dd_a1;
+                    exp_start_d = 16; // 0 CB #2a waves!
+                } else if (best == 9) {
+                    linear_fast = true; M = 4;
+                    for (int i = 0; i < M; ++i) parents[i] = i - 1;
+                    exp_start_d = 2;
+                } else if (best == 10) {
+                    M = 4;
+                    const int tm4rf[4] = {-1, 0, 1, 0};
+                    std::memcpy(parents, tm4rf, sizeof(tm4rf));
+                    tid_ptr[3] = a0; skip_expand[3] = 1;
+                    exp_start_d = 16; // 0 CB #2 MTP waves!
+                } else if (best == 11) {
+                    M = 4;
+                    const int tm4df[4] = {-1, 0, 1, 1};
+                    std::memcpy(parents, tm4df, sizeof(tm4df));
+                    tid_ptr[3] = a1_0; skip_expand[3] = 1;
+                    exp_start_d = 16; // 0 CB #2 MTP waves!
+                } else if (best == 12) {
+                    M = 4;
+                    const int tm4w[4] = {-1, 0, 0, 0};
+                    std::memcpy(parents, tm4w, sizeof(tm4w));
+                    tid_ptr[2] = a0; skip_expand[2] = 1;
+                    tid_ptr[3] = a1; skip_expand[3] = 1;
+                    exp_start_d = 16; // 0 CB #2 MTP waves!
+                } else {
+                    M = 4;
+                    const int tm4rf12[4] = {-1, 0, 0, 2};
+                    std::memcpy(parents, tm4rf12, sizeof(tm4rf12));
+                    tid_ptr[2] = a0;    skip_expand[2] = 1;
+                    tid_ptr[3] = a0_c1; skip_expand[3] = 1;
+                    all_dd_mut[2] = all_dd_mut[4];
+                    exp_start_d = 16; // 0 CB #2 MTP waves!
+                }
+            }
+
+            // CB #2: Pipelined split + D2 instant commit of pre-encoded cb2_pre on (M, is_tree) hit!
+            double prof_cb2a_gpu = 0.0, prof_cb2b_gpu = 0.0;
             const bool need_expand = (!used_pld || do_hybrid_pld) && (exp_start_d < 16);
             id<MTLCommandBuffer> cb2a = nil;
             if (need_expand) {
@@ -5266,27 +6103,63 @@ void Qwen38Model::forward_mtp_tree_impl(int anchor_token, Sampler* sampler, std:
                 [enc2a endEncoding];
                 [cb2a commit];
             }
-            id<MTLCommandBuffer> cb2 = [(id<MTLCommandQueue>)ctx_.queue() commandBuffer];
-            id<MTLComputeCommandEncoder> enc2 = [cb2 computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+            TreeParams final_tp{};
             if (!linear_fast) {
-                cur_tree_ = make_tree_params(parents, M, static_cast<uint32_t>(pre_pos));
+                final_tp = make_tree_params(parents, M, static_cast<uint32_t>(pre_pos));
             }
-            encode_chunk(enc2, M, pre_pos, true, is_greedy, true, true, v_margin);
-            cur_tree_ = TreeParams{};
-            [enc2 endEncoding];
-            [cb2 commit];
+            const bool pre_hit = (cb2_pre != nil) && (M == pre_M) && ((!linear_fast) == pre_tree) &&
+                                 (!pre_tree || final_tp.pad0 <= 2u);
+            id<MTLCommandBuffer> cb2 = nil;
+            if (pre_hit) {
+                if (pre_tree) {
+                    std::memcpy([(id<MTLBuffer>)buf_tree_params_ contents], &final_tp, sizeof(final_tp));
+                }
+                cb2 = cb2_pre;
+                [cb2 commit];
+            } else {
+                if (cb2_pre != nil) {
+                    rec_slot_ = saved_rec_slot;
+                    pending_replay_m_ = saved_pending_replay_m;
+                }
+                cb2 = [(id<MTLCommandQueue>)ctx_.queue() commandBuffer];
+                id<MTLComputeCommandEncoder> enc2 = [cb2 computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+                if (!linear_fast) cur_tree_ = final_tp;
+                encode_chunk(enc2, M, pre_pos, true, is_greedy, true, true, v_margin, /*use_tree_buf=*/false);
+                cur_tree_ = TreeParams{};
+                [enc2 endEncoding];
+                [cb2 commit];
+            }
+            last_t7_m_ = M;
+            last_t7_tree_ = !linear_fast;
             [cb2 waitUntilCompleted];
             if (cb2a && cb2a.error) throw std::runtime_error(std::string("Metal T7 expand error: ") + [[cb2a.error localizedDescription] UTF8String]);
             if (cb2.error) throw std::runtime_error(std::string("Metal T7 verify error: ") + [[cb2.error localizedDescription] UTF8String]);
+
+            // D3: Update shared CB #2 non-attention base EMA smoothly from prior (immune to Round-1 cold outliers & M=4/M=8 inversion!)
+            const double cb2_ms = (cb2.GPUEndTime - cb2.GPUStartTime) * 1000.0;
+            if (cb2_ms > 2.0 && cb2_ms < 500.0 && (M == 4 || M == 8)) {
+                const float bw_s = 546.0f / std::clamp(static_cast<float>(ctx_.estimated_bandwidth_gbs()), 60.0f, 1200.0f);
+                const int ekv = (sparse_kv_budget_ > 0 && pre_pos > sparse_kv_budget_ + 2048) ? sparse_kv_budget_ : pre_pos;
+                const float kvs = (kv_bits_ == 16) ? 1.65f : ((kv_bits_ == 4) ? 0.68f : 1.0f);
+                const float est_a = (ekv >= 1024)
+                    ? (((M == 4) ? 19.2f : 36.8f) * (static_cast<float>(ekv) / 126976.0f) * kvs * bw_s)
+                    : (0.4f * static_cast<float>(ekv) / 1024.0f);
+                const float prior_m8 = 38.0f * bw_s;
+                const float obs_raw = static_cast<float>(cb2_ms) - est_a + ((M == 4) ? (1.5f * bw_s) : 0.0f);
+                const float obs = std::clamp(obs_raw, 0.70f * prior_m8, 1.50f * prior_m8);
+                const float cur = (ema_cb2_ms_[1] > 0.0f) ? ema_cb2_ms_[1] : prior_m8;
+                ema_cb2_ms_[1] = 0.85f * cur + 0.15f * obs;
+            }
+
             static const bool kMtpProf = (std::getenv("MTP_PROF") != nullptr);
             if (kMtpProf) {
                 if (cb2a) prof_cb2a_gpu = (cb2a.GPUEndTime - cb2a.GPUStartTime) * 1000.0;
-                prof_cb2b_gpu = (cb2.GPUEndTime - cb2.GPUStartTime) * 1000.0;
+                prof_cb2b_gpu = cb2_ms;
                 const uint32_t* pr0 = reinterpret_cast<const uint32_t*>([(id<MTLBuffer>)buf_mtp_argmax_ contents]);
                 int tgt0 = static_cast<int>(pr0[0]);
                 int hit_rank = (tgt0 == c0) ? 0 : ((ac0 >= 1u && tgt0 == a0) ? 1 : ((ac0 >= 2u && tgt0 == a1) ? 2 : ((ac0 >= 3u && tgt0 == static_cast<int>(d0.alt_id[2])) ? 3 : -1)));
-                std::fprintf(stderr, "[mtp_prof] pos=%d M=%d lin=%d pld=%d q0=%.3f p0a0=%.3f p0a1=%.3f q1=%.3f ema=%.3f hit0=%d cb2a=%.2f cb2b=%.2f\n",
-                             pre_pos, M, linear_fast ? 1 : 0, used_pld ? 1 : 0, q0, p0_a0, p0_a1, q1, mtp_alpha_ema_, hit_rank, prof_cb2a_gpu, prof_cb2b_gpu);
+                std::fprintf(stderr, "[mtp_prof] pos=%d M=%d lin=%d pld=%d pre=%d q0=%.3f p0a0=%.3f p0a1=%.3f q1=%.3f ema=%.3f hit0=%d cb2a=%.2f cb2b=%.2f\n",
+                             pre_pos, M, linear_fast ? 1 : 0, used_pld ? 1 : 0, pre_hit ? 1 : 0, q0, p0_a0, p0_a1, q1, mtp_alpha_ema_, hit_rank, prof_cb2a_gpu, prof_cb2b_gpu);
             }
         }
         } // end !pre_cb1_suffix
@@ -5937,13 +6810,14 @@ bool Qwen38Model::save_state_to_file(const std::string& path, const std::vector<
     size_t elem_div = (kv_bits_ == 16) ? 1ull : ((kv_bits_ == 8) ? 2ull : 4ull);
     size_t kv_active = (static_cast<size_t>(pos_) * num_kv_heads_ * head_dim_ * sizeof(uint16_t)) / elem_div;
     size_t sb_active = (kv_bits_ < 16)
-        ? (static_cast<size_t>(pos_) * num_kv_heads_ * (head_dim_ / 64) * 2 * sizeof(float))
+        ? (static_cast<size_t>(pos_) * num_kv_heads_ * (head_dim_ / 64) * 2 * sizeof(uint16_t))
         : 0;
+    size_t mtp_elem_div = (mtp_kv_bits_ == 16) ? 1ull : ((mtp_kv_bits_ == 8) ? 2ull : 4ull);
     size_t mtp_kv_active = mtp_loaded_
-        ? ((static_cast<size_t>(mtp_pos_) * num_kv_heads_ * head_dim_ * sizeof(uint16_t)) / elem_div)
+        ? ((static_cast<size_t>(mtp_pos_) * num_kv_heads_ * head_dim_ * sizeof(uint16_t)) / mtp_elem_div)
         : 0;
-    size_t mtp_sb_active = (mtp_loaded_ && kv_bits_ < 16)
-        ? (static_cast<size_t>(mtp_pos_) * num_kv_heads_ * (head_dim_ / 64) * 2 * sizeof(float))
+    size_t mtp_sb_active = (mtp_loaded_ && mtp_kv_bits_ < 16)
+        ? (static_cast<size_t>(mtp_pos_) * num_kv_heads_ * (head_dim_ / 64) * 2 * sizeof(uint16_t))
         : 0;
     size_t mtp_hid_bytes = mtp_loaded_ ? (static_cast<size_t>(hidden_size_) * sizeof(float)) : 0;
 
@@ -6004,7 +6878,7 @@ bool Qwen38Model::save_state_to_file(const std::string& path, const std::vector<
         hdr.model_hash = compute_model_hash(info_);
         hdr.pos = static_cast<uint32_t>(pos_);
         hdr.reserved = mtp_loaded_
-            ? (0x80000000u | (kv_bits_ < 16 ? 0x40000000u : 0u) | static_cast<uint32_t>(mtp_pos_))
+            ? (0x80000000u | (mtp_kv_bits_ < 16 ? 0x40000000u : 0u) | (mtp_kv_bits_ == 4 ? 0x20000000u : 0u) | (static_cast<uint32_t>(mtp_pos_) & 0x1FFFFFFFu))
             : 0u;
         hdr.state_bytes = total_state;
         MultimodalCacheMeta meta{static_cast<int32_t>(rope_delta_), static_cast<uint32_t>(image_hashes.size())};
@@ -6145,22 +7019,34 @@ bool Qwen38Model::load_state_from_file(const std::string& path, std::vector<int>
     size_t elem_div = (kv_bits_ == 16) ? 1ull : ((kv_bits_ == 8) ? 2ull : 4ull);
     size_t kv_active = (static_cast<size_t>(hdr.pos) * num_kv_heads_ * head_dim_ * sizeof(uint16_t)) / elem_div;
     size_t sb_active = (kv_bits_ < 16)
-        ? (static_cast<size_t>(hdr.pos) * num_kv_heads_ * (head_dim_ / 64) * 2 * sizeof(float))
+        ? (static_cast<size_t>(hdr.pos) * num_kv_heads_ * (head_dim_ / 64) * 2 * sizeof(uint16_t))
         : 0;
     bool has_mtp_payload = (hdr.reserved & 0x80000000u) != 0u;
     bool mtp_is_q        = (hdr.reserved & 0x40000000u) != 0u;
-    uint32_t saved_mtp_pos = hdr.reserved & 0x3FFFFFFFu;
-    if (has_mtp_payload && mtp_loaded_ && (mtp_is_q != (kv_bits_ < 16))) {
+    bool mtp_is_q4       = (hdr.reserved & 0x20000000u) != 0u;
+    uint32_t saved_mtp_pos = hdr.reserved & 0x1FFFFFFFu;
+    int saved_mtp_bits   = mtp_is_q ? (mtp_is_q4 ? 4 : 8) : 16;
+    if (has_mtp_payload && mtp_loaded_ && (saved_mtp_bits != mtp_kv_bits_)) {
         unmap_guard();
         return false;
     }
+    size_t mtp_elem_div = (saved_mtp_bits == 16) ? 1ull : ((saved_mtp_bits == 8) ? 2ull : 4ull);
     size_t mtp_kv_active = has_mtp_payload
-        ? ((static_cast<size_t>(saved_mtp_pos) * num_kv_heads_ * head_dim_ * sizeof(uint16_t)) / (mtp_is_q ? elem_div : 1ull))
+        ? ((static_cast<size_t>(saved_mtp_pos) * num_kv_heads_ * head_dim_ * sizeof(uint16_t)) / mtp_elem_div)
         : 0;
     size_t mtp_sb_active = (has_mtp_payload && mtp_is_q)
-        ? (static_cast<size_t>(saved_mtp_pos) * num_kv_heads_ * (head_dim_ / 64) * 2 * sizeof(float))
+        ? (static_cast<size_t>(saved_mtp_pos) * num_kv_heads_ * (head_dim_ / 64) * 2 * sizeof(uint16_t))
         : 0;
     size_t mtp_hid_bytes = has_mtp_payload ? (static_cast<size_t>(hidden_size_) * sizeof(float)) : 0;
+    size_t expected_state = 0;
+    for (int i = 0; i < num_layers_; ++i) {
+        expected_state += layers_[i].is_linear ? (cs_bytes + ss_bytes) : (2 * kv_active + 2 * sb_active);
+    }
+    if (has_mtp_payload) expected_state += 2 * mtp_kv_active + 2 * mtp_sb_active + mtp_hid_bytes;
+    if (expected_state != hdr.state_bytes) {
+        unmap_guard();
+        return false;
+    }
 
     @autoreleasepool {
         // Zero-copy mmap -> MTLBuffer (eliminates 750 MB CPU memcpy on prefix cache restore!)
@@ -6244,7 +7130,7 @@ bool Qwen38Model::load_state_from_file(const std::string& path, std::vector<int>
     if (out_tokens.size() >= 16) {
         int n_reg = 0, n_gt32 = 0, n_gt64 = 0, n_gt152 = 0;
         for (int tk : out_tokens) {
-            if (tk < 0 || tk >= 248000) continue;
+            if (tk < 0 || static_cast<uint32_t>(tk) >= special_tok_lo_) continue;
             ++n_reg;
             if (tk >= static_cast<int>(FAST_DRAFT_VOCAB)) ++n_gt32;
             if (tk >= static_cast<int>(MED_DRAFT_VOCAB))  ++n_gt64;
@@ -6313,9 +7199,11 @@ void Qwen38Model::profile_ops() {
 
     // 1. Whole-pass baselines (M=8 verify vs M=1 greedy at pos=512)
     double t_full_m8 = bench_gpu("FULL M=8 verify (64L + lm_head + argmax)", 0.0, [&](id<MTLComputeCommandEncoder> enc) {
+        if (use_cpu_embed_) cpu_embed_.gather_f32(tid_ptr, 8, reinterpret_cast<float*>([(id<MTLBuffer>)buf_hidden_ contents]));
         encode_chunk(enc, 8, 512, false, true, true, true, 0.0f);
     });
     double t_full_m1 = bench_gpu("FULL M=1 greedy (64L + lm_head + argmax)", 0.0, [&](id<MTLComputeCommandEncoder> enc) {
+        if (use_cpu_embed_) cpu_embed_.gather_f32(tid_ptr, 1, reinterpret_cast<float*>([(id<MTLBuffer>)buf_hidden_ contents]));
         encode_chunk(enc, 1, 512, true, true, false, false, 0.0f);
     });
     std::printf("\n--- Isolated Op Families across all 64 real layers (M=8, pos=512) ---\n");
@@ -6325,24 +7213,22 @@ void Qwen38Model::profile_ops() {
 
     // 2. 64x MLP gate+up
     double gb_gateup = 64.0 * 2.0 * hidden_size_ * intermediate_size_ * (bpw_mlp / 8.0) / 1e9;
-    sum_ops += bench_gpu(has_share ? "64x MLP gate+up (ane_hf4_swiglu_bf16, M=8)" : "64x MLP gate+up (g64 mma_swiglu_f16, M=8)",
+    sum_ops += bench_gpu(has_share
+            ? (ane_share_nonuniform_lut_ ? "64x MLP gate+up (ane_lut4_swiglu_bf16, M=8)" : "64x MLP gate+up (ane_hf4_swiglu_bf16, M=8)")
+            : "64x MLP gate+up (g64 mma_swiglu_f16, M=8)",
         gb_gateup, [&](id<MTLComputeCommandEncoder> enc) {
             for (int i = 0; i < num_layers_; ++i) {
                 const LayerWeights& lw = layers_[i];
                 if (lw.ane_share_idx >= 0 && ane_share_ && ane_share_->has_layer(lw.ane_share_idx)) {
                     const AneShareLayer& sl = ane_share_->layer(lw.ane_share_idx);
-                    AneShareParams ap{};
-                    ap.M = M;
-                    ap.hdr_words = sl.hdr_words;
-                    std::memcpy(ap.lin_base_w, sl.lin_base_w, sizeof(ap.lin_base_w));
-                    std::memcpy(ap.lin_chunk_w, sl.lin_chunk_w, sizeof(ap.lin_chunk_w));
+                    AneShareParams ap = make_ane_share_params(sl, M);
                     [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_ane_hf4_swiglu_bf16_];
                     [enc setBuffer:(id<MTLBuffer>)sl.hwx_buf offset:0 atIndex:0];
                     [enc setBuffer:(id<MTLBuffer>)sl.buf_scales_offs offset:0 atIndex:1];
                     [enc setBuffer:(id<MTLBuffer>)buf_normed_ offset:0 atIndex:2];
                     [enc setBuffer:(id<MTLBuffer>)buf_mlp_gate_ offset:0 atIndex:3];
                     [enc setBytes:&ap length:sizeof(ap) atIndex:4];
-                    [enc dispatchThreadgroups:MTLSizeMake(static_cast<uint32_t>(intermediate_size_) / 16u, 1, 1)
+                    [enc dispatchThreadgroups:MTLSizeMake(sl.intermediate_size / 16u, 1, 1)
                         threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
                 } else {
                     QmmParams qp{M, lw.gate_proj.out_dim, lw.gate_proj.in_dim, 0u};
@@ -6365,25 +7251,23 @@ void Qwen38Model::profile_ops() {
 
     // 3. 64x MLP down_proj
     double gb_down = 64.0 * hidden_size_ * intermediate_size_ * (bpw_mlp / 8.0) / 1e9;
-    sum_ops += bench_gpu(has_share ? "64x MLP down_proj (ane_hf4_down_sk, M=8)" : "64x MLP down_proj (g64 mma_qmm8_sk, M=8)",
+    sum_ops += bench_gpu(has_share
+            ? (ane_share_nonuniform_lut_ ? "64x MLP down_proj (ane_lut4_down_sk4, M=8)" : "64x MLP down_proj (ane_hf4_down_sk4, M=8)")
+            : "64x MLP down_proj (g64 mma_qmm8_sk, M=8)",
         gb_down, [&](id<MTLComputeCommandEncoder> enc) {
             for (int i = 0; i < num_layers_; ++i) {
                 const LayerWeights& lw = layers_[i];
                 if (lw.ane_share_idx >= 0 && ane_share_ && ane_share_->has_layer(lw.ane_share_idx)) {
                     const AneShareLayer& sl = ane_share_->layer(lw.ane_share_idx);
-                    AneShareParams ap{};
-                    ap.M = M;
-                    ap.hdr_words = sl.hdr_words;
-                    std::memcpy(ap.lin_base_w, sl.lin_base_w, sizeof(ap.lin_base_w));
-                    std::memcpy(ap.lin_chunk_w, sl.lin_chunk_w, sizeof(ap.lin_chunk_w));
-                    [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_ane_hf4_down_sk_bf16_];
+                    AneShareParams ap = make_ane_share_params(sl, M);
+                    [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_ane_hf4_down_sk4_bf16_];
                     [enc setBuffer:(id<MTLBuffer>)sl.hwx_buf offset:0 atIndex:0];
                     [enc setBuffer:(id<MTLBuffer>)sl.buf_scales_offs offset:0 atIndex:1];
                     [enc setBuffer:(id<MTLBuffer>)buf_mlp_gate_ offset:0 atIndex:2];
                     [enc setBuffer:(id<MTLBuffer>)buf_sk_part_ offset:0 atIndex:3];
                     [enc setBytes:&ap length:sizeof(ap) atIndex:4];
-                    [enc dispatchThreadgroups:MTLSizeMake(static_cast<uint32_t>(hidden_size_) / 32u, 1, 8)
-                        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                    [enc dispatchThreadgroups:MTLSizeMake(16u * ceil_div(sl.hidden_size / 128u, 4u), 1, 2u * sl.n_subblocks)
+                        threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
                 } else {
                     QmmSkParams sp{M, lw.down_proj.out_dim, lw.down_proj.in_dim, 1u, 8u};
                     [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_mma_qmm8_f16x_sk_];
@@ -6615,7 +7499,7 @@ void Qwen38Model::profile_ops() {
             [enc setBuffer:(id<MTLBuffer>)buf_z_ offset:0 atIndex:3];
             [enc setBuffer:(id<MTLBuffer>)buf_attn_out_ offset:0 atIndex:4];
             [enc setBytes:&fp length:sizeof(fp) atIndex:5];
-            [enc dispatchThreadgroups:MTLSizeMake(num_heads_, M, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            [enc dispatchThreadgroups:MTLSizeMake(num_heads_, M, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
         }
     });
@@ -6635,10 +7519,10 @@ void Qwen38Model::profile_ops() {
         }
     });
 
-    // 11. lm_head + argmax2 (M=8)
+    // 11. lm_head + argmax2 (M=8, greedy write-skip)
     double gb_lmh = double(lm_head_.out_dim) * lm_head_.in_dim * (bpw_g64 / 8.0) / 1e9;
     sum_ops += bench_gpu("1x lm_head_max_f16x + argmax2 (M=8)", gb_lmh, [&](id<MTLComputeCommandEncoder> enc) {
-        QmmParams qp{M, lm_head_.out_dim, lm_head_.in_dim, 0u};
+        QmmParams qp{M, lm_head_.out_dim, lm_head_.in_dim, 1u};
         uint32_t n_tg_am = ceil_div(lm_head_.out_dim, 32u);
         [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_mma_lmhead_max_f16x_];
         [enc setBuffer:(id<MTLBuffer>)lm_head_.w.buffer offset:lm_head_.w.offset atIndex:0];
@@ -6659,6 +7543,37 @@ void Qwen38Model::profile_ops() {
 
     std::printf("\n  SUM of isolated op families:                   %6.2f ms  (vs FULL M=8 %.2f ms, M=1 %.2f ms)\n",
                 sum_ops, t_full_m8, t_full_m1);
+
+    if (has_share) {
+        bench_gpu(ane_share_nonuniform_lut_ ? "64x MLP M=4 (ane_lut4_swiglu_bf16 + down_sk4)" : "64x MLP M=4 (ane_hf4_swiglu_bf16 + down_sk4)",
+            gb_gateup + gb_down, [&](id<MTLComputeCommandEncoder> enc) {
+                for (int i = 0; i < num_layers_; ++i) {
+                    const LayerWeights& lw = layers_[i];
+                    if (lw.ane_share_idx >= 0 && ane_share_->has_layer(lw.ane_share_idx)) {
+                        const AneShareLayer& sl = ane_share_->layer(lw.ane_share_idx);
+                        AneShareParams ap = make_ane_share_params(sl, 4u);
+                        [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_ane_hf4_swiglu_bf16_];
+                        [enc setBuffer:(id<MTLBuffer>)sl.hwx_buf offset:0 atIndex:0];
+                        [enc setBuffer:(id<MTLBuffer>)sl.buf_scales_offs offset:0 atIndex:1];
+                        [enc setBuffer:(id<MTLBuffer>)buf_normed_ offset:0 atIndex:2];
+                        [enc setBuffer:(id<MTLBuffer>)buf_mlp_gate_ offset:0 atIndex:3];
+                        [enc setBytes:&ap length:sizeof(ap) atIndex:4];
+                        [enc dispatchThreadgroups:MTLSizeMake(sl.intermediate_size / 16u, 1, 1)
+                            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                        [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_ane_hf4_down_sk4_bf16_];
+                        [enc setBuffer:(id<MTLBuffer>)sl.hwx_buf offset:0 atIndex:0];
+                        [enc setBuffer:(id<MTLBuffer>)sl.buf_scales_offs offset:0 atIndex:1];
+                        [enc setBuffer:(id<MTLBuffer>)buf_mlp_gate_ offset:0 atIndex:2];
+                        [enc setBuffer:(id<MTLBuffer>)buf_sk_part_ offset:0 atIndex:3];
+                        [enc setBytes:&ap length:sizeof(ap) atIndex:4];
+                        [enc dispatchThreadgroups:MTLSizeMake(16u * ceil_div(sl.hidden_size / 128u, 4u), 1, 2u * sl.n_subblocks)
+                            threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                    }
+                }
+            });
+    }
 
     // 12. MTP drafting & Prefill GPU vs ANE component timings
     if (mtp_loaded_) {

@@ -627,8 +627,8 @@ kernel void qmm_q4_g64_tiled(
     }
 }
 // ============================================================================
-// 1c-f16. Round 21: 14.2+ TFLOPS BM=64, BN=64, BK=32 Hardware AMX Prefill GEMM (FP16 X!)
-//         9.2 KB TG mem (3 TGs/core residency!) + pre-folded bi_adj + zero register spill!
+// 1c-f16. Prefill AMX GEMM (BM=64, BN=64, BK=32, FP16 X):
+//         k0+=64 scale/bias hoisting + GROUP_M=8 L2 tile swizzling + double-buffered sA/sB (18 KB)!
 // ============================================================================
 
 kernel void qmm_q4_g64_tiled_f16x(
@@ -639,26 +639,38 @@ kernel void qmm_q4_g64_tiled_f16x(
     device float*        Y     [[buffer(4)]],
     constant QmmParams&  p     [[buffer(5)]],
     uint2 tgid                 [[threadgroup_position_in_grid]],
+    uint2 n_tg                 [[threadgroups_per_grid]],
     uint  tid                  [[thread_index_in_threadgroup]],
     uint  lane                 [[thread_index_in_simdgroup]],
     uint  sg                   [[simdgroup_index_in_threadgroup]]
 ) {
-    uint m0 = tgid.y * 64u;
-    uint n0 = tgid.x * 64u;
-    if (m0 >= p.M || n0 >= p.N) return;
+    // Column-blocked L2 tile swizzling (GROUP_M=8): keeps 184 KB W strips hot across M-tiles!
+    constexpr uint GROUP_M = 8u;
+    uint linear_id       = tgid.y * n_tg.x + tgid.x;
+    uint tiles_per_strip = n_tg.x * GROUP_M;
+    uint strip_id        = linear_id / tiles_per_strip;
+    uint first_m         = strip_id * GROUP_M;
+    uint cur_gm          = min(GROUP_M, n_tg.y - first_m);
+    uint rem             = linear_id - strip_id * tiles_per_strip;
+    uint n_tile          = rem / cur_gm;
+    uint m_tile          = first_m + (rem - n_tile * cur_gm);
+
+    uint m0 = m_tile * 64u;
+    uint n0 = n_tile * 64u;
+    if (m0 >= p.M || n0 >= p.N || p.K == 0u) return;
 
     uint KW = p.K >> 3;
     uint KG = p.K >> 6;
 
-    // 9,216 bytes total -> fits 3 full threadgroups simultaneously per M4 Max core!
-    threadgroup half sA[64][36];
-    threadgroup half sB[64][36];
+    // 18,432 bytes total -> double-buffered sA/sB cuts barriers 2x while keeping 3 TGs/core on Apple9+!
+    threadgroup half sA[2][64][36];
+    threadgroup half sB[2][64][36];
 
     simdgroup_float8x8 acc[4][4];
     #pragma clang loop unroll(full)
-    for (uint im = 0; im < 4u; im++)
+    for (uint im = 0u; im < 4u; im++)
     #pragma clang loop unroll(full)
-    for (uint in_ = 0; in_ < 4u; in_++) {
+    for (uint in_ = 0u; in_ < 4u; in_++) {
         acc[im][in_] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
     }
 
@@ -673,29 +685,30 @@ kernel void qmm_q4_g64_tiled_f16x(
     bool gm_ok = gm_ld < p.M;
     bool gn_ok = gn_ld < p.N;
 
-    threadgroup half4* sa_dst = (threadgroup half4*)(&sA[r_loc][c_blk]);
-    threadgroup half4* sb_dst = (threadgroup half4*)(&sB[r_loc][c_blk]);
-    const device uint*   w_base = W + (ulong)gn_ld * KW;
-    const device ushort* s_base = S + (ulong)gn_ld * KG;
-    const device ushort* b_base = B + (ulong)gn_ld * KG;
-    const device half*   x_base = X + (ulong)gm_ld * p.K;
+    const device uint*   w_base = W + (ulong)(gn_ok ? gn_ld : 0u) * KW;
+    const device ushort* s_base = S + (ulong)(gn_ok ? gn_ld : 0u) * KG;
+    const device ushort* b_base = B + (ulong)(gn_ok ? gn_ld : 0u) * KG;
+    const device half*   x_base = X + (ulong)(gm_ok ? gm_ld : 0u) * p.K;
 
-    for (uint k0 = 0; k0 < p.K; k0 += 32u) {
+    // Prologue: load first K=0..31 into buf 0 and hoist group-0 scale/bias across hg=0..1
+    half2 sc_h = half2(0.0h);
+    half2 bi_h = half2(0.0h);
+    {
+        threadgroup half4* sa_dst = (threadgroup half4*)(&sA[0][r_loc][c_blk]);
+        threadgroup half4* sb_dst = (threadgroup half4*)(&sB[0][r_loc][c_blk]);
         if (gm_ok) {
-            const device half4* xp = (const device half4*)(x_base + k0 + c_blk);
+            const device half4* xp = (const device half4*)(x_base + c_blk);
             sa_dst[0] = xp[0]; sa_dst[1] = xp[1]; sa_dst[2] = xp[2]; sa_dst[3] = xp[3];
         } else {
             sa_dst[0] = half4(0.0h); sa_dst[1] = half4(0.0h); sa_dst[2] = half4(0.0h); sa_dst[3] = half4(0.0h);
         }
-
         if (gn_ok) {
-            uint g = k0 >> 6;
-            half2 sc_h = half2(half(bf16_to_f32(s_base[g])));
-            half2 bi_h = fma(half2(-1024.0h), sc_h, half2(half(bf16_to_f32(b_base[g]))));
-            uint2 uq = *((const device uint2*)(w_base + (k0 >> 3) + h_idx * 2u));
+            sc_h = half2(half(bf16_to_f32(s_base[0])));
+            bi_h = fma(half2(-1024.0h), sc_h, half2(half(bf16_to_f32(b_base[0]))));
+            uint2 uq = *((const device uint2*)(w_base + h_idx * 2u));
             uint ws[2] = {uq.x, uq.y};
             #pragma clang loop unroll(full)
-            for (uint w = 0; w < 2u; w++) {
+            for (uint w = 0u; w < 2u; w++) {
                 uint u = ws[w];
                 half2 h0 = fma(as_type<half2>(( u        & 0x000F000Fu) | 0x64006400u), sc_h, bi_h);
                 half2 h1 = fma(as_type<half2>(((u >> 4)  & 0x000F000Fu) | 0x64006400u), sc_h, bi_h);
@@ -707,25 +720,112 @@ kernel void qmm_q4_g64_tiled_f16x(
         } else {
             sb_dst[0] = half4(0.0h); sb_dst[1] = half4(0.0h); sb_dst[2] = half4(0.0h); sb_dst[3] = half4(0.0h);
         }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint k0 = 0u; k0 < p.K; k0 += 64u) {
+        // ---- Sub-step hg=0: compute on buf 0 while prefetching k0+32 (reuses hoisted sc_h/bi_h!) ----
+        half4 px0 = half4(0.0h), px1 = half4(0.0h), px2 = half4(0.0h), px3 = half4(0.0h);
+        if (gm_ok) {
+            const device half4* xp = (const device half4*)(x_base + k0 + 32u + c_blk);
+            px0 = xp[0]; px1 = xp[1]; px2 = xp[2]; px3 = xp[3];
+        }
+        uint2 puq = gn_ok ? *((const device uint2*)(w_base + (k0 >> 3) + 4u + h_idx * 2u)) : uint2(0u);
 
         #pragma clang loop unroll(full)
-        for (uint kk = 0; kk < 32u; kk += 8u) {
+        for (uint kk = 0u; kk < 32u; kk += 8u) {
             simdgroup_half8x8 a[4], b[4];
             #pragma clang loop unroll(full)
-            for (uint im = 0; im < 4u; im++) simdgroup_load(a[im], &sA[sg_m + 8u * im][kk], 36);
+            for (uint im = 0u; im < 4u; im++) simdgroup_load(a[im], &sA[0][sg_m + 8u * im][kk], 36);
             #pragma clang loop unroll(full)
-            for (uint in_ = 0; in_ < 4u; in_++) simdgroup_load(b[in_], &sB[sg_n + 8u * in_][kk], 36, ulong2(0, 0), true);
+            for (uint in_ = 0u; in_ < 4u; in_++) simdgroup_load(b[in_], &sB[0][sg_n + 8u * in_][kk], 36, ulong2(0, 0), true);
             #pragma clang loop unroll(full)
-            for (uint im = 0; im < 4u; im++)
+            for (uint im = 0u; im < 4u; im++)
             #pragma clang loop unroll(full)
-            for (uint in_ = 0; in_ < 4u; in_++) {
+            for (uint in_ = 0u; in_ < 4u; in_++) {
                 simdgroup_multiply_accumulate(acc[im][in_], a[im], b[in_], acc[im][in_]);
             }
         }
 
+        {
+            threadgroup half4* sa_dst = (threadgroup half4*)(&sA[1][r_loc][c_blk]);
+            threadgroup half4* sb_dst = (threadgroup half4*)(&sB[1][r_loc][c_blk]);
+            sa_dst[0] = px0; sa_dst[1] = px1; sa_dst[2] = px2; sa_dst[3] = px3;
+            if (gn_ok) {
+                uint ws[2] = {puq.x, puq.y};
+                #pragma clang loop unroll(full)
+                for (uint w = 0u; w < 2u; w++) {
+                    uint u = ws[w];
+                    half2 h0 = fma(as_type<half2>(( u        & 0x000F000Fu) | 0x64006400u), sc_h, bi_h);
+                    half2 h1 = fma(as_type<half2>(((u >> 4)  & 0x000F000Fu) | 0x64006400u), sc_h, bi_h);
+                    half2 h2 = fma(as_type<half2>(((u >> 8)  & 0x000F000Fu) | 0x64006400u), sc_h, bi_h);
+                    half2 h3 = fma(as_type<half2>(((u >> 12) & 0x000F000Fu) | 0x64006400u), sc_h, bi_h);
+                    sb_dst[w * 2u + 0u] = half4(h0.x, h1.x, h2.x, h3.x);
+                    sb_dst[w * 2u + 1u] = half4(h0.y, h1.y, h2.y, h3.y);
+                }
+            } else {
+                sb_dst[0] = half4(0.0h); sb_dst[1] = half4(0.0h); sb_dst[2] = half4(0.0h); sb_dst[3] = half4(0.0h);
+            }
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // ---- Sub-step hg=1: compute on buf 1 while prefetching next group k0+64 ----
+        const uint k_nxt = k0 + 64u;
+        const bool has_nxt = k_nxt < p.K;
+        half4 nx0 = half4(0.0h), nx1 = half4(0.0h), nx2 = half4(0.0h), nx3 = half4(0.0h);
+        uint2 nuq = uint2(0u);
+        ushort ns_raw = 0u, nb_raw = 0u;
+        if (has_nxt) {
+            if (gm_ok) {
+                const device half4* xp = (const device half4*)(x_base + k_nxt + c_blk);
+                nx0 = xp[0]; nx1 = xp[1]; nx2 = xp[2]; nx3 = xp[3];
+            }
+            if (gn_ok) {
+                uint g_nxt = k_nxt >> 6;
+                ns_raw = s_base[g_nxt];
+                nb_raw = b_base[g_nxt];
+                nuq = *((const device uint2*)(w_base + (k_nxt >> 3) + h_idx * 2u));
+            }
+        }
+
+        #pragma clang loop unroll(full)
+        for (uint kk = 0u; kk < 32u; kk += 8u) {
+            simdgroup_half8x8 a[4], b[4];
+            #pragma clang loop unroll(full)
+            for (uint im = 0u; im < 4u; im++) simdgroup_load(a[im], &sA[1][sg_m + 8u * im][kk], 36);
+            #pragma clang loop unroll(full)
+            for (uint in_ = 0u; in_ < 4u; in_++) simdgroup_load(b[in_], &sB[1][sg_n + 8u * in_][kk], 36, ulong2(0, 0), true);
+            #pragma clang loop unroll(full)
+            for (uint im = 0u; im < 4u; im++)
+            #pragma clang loop unroll(full)
+            for (uint in_ = 0u; in_ < 4u; in_++) {
+                simdgroup_multiply_accumulate(acc[im][in_], a[im], b[in_], acc[im][in_]);
+            }
+        }
+
+        if (has_nxt) {
+            threadgroup half4* sa_dst = (threadgroup half4*)(&sA[0][r_loc][c_blk]);
+            threadgroup half4* sb_dst = (threadgroup half4*)(&sB[0][r_loc][c_blk]);
+            sa_dst[0] = nx0; sa_dst[1] = nx1; sa_dst[2] = nx2; sa_dst[3] = nx3;
+            if (gn_ok) {
+                sc_h = half2(half(bf16_to_f32(ns_raw)));
+                bi_h = fma(half2(-1024.0h), sc_h, half2(half(bf16_to_f32(nb_raw))));
+                uint ws[2] = {nuq.x, nuq.y};
+                #pragma clang loop unroll(full)
+                for (uint w = 0u; w < 2u; w++) {
+                    uint u = ws[w];
+                    half2 h0 = fma(as_type<half2>(( u        & 0x000F000Fu) | 0x64006400u), sc_h, bi_h);
+                    half2 h1 = fma(as_type<half2>(((u >> 4)  & 0x000F000Fu) | 0x64006400u), sc_h, bi_h);
+                    half2 h2 = fma(as_type<half2>(((u >> 8)  & 0x000F000Fu) | 0x64006400u), sc_h, bi_h);
+                    half2 h3 = fma(as_type<half2>(((u >> 12) & 0x000F000Fu) | 0x64006400u), sc_h, bi_h);
+                    sb_dst[w * 2u + 0u] = half4(h0.x, h1.x, h2.x, h3.x);
+                    sb_dst[w * 2u + 1u] = half4(h0.y, h1.y, h2.y, h3.y);
+                }
+            } else {
+                sb_dst[0] = half4(0.0h); sb_dst[1] = half4(0.0h); sb_dst[2] = half4(0.0h); sb_dst[3] = half4(0.0h);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
     }
 
     uint qid = lane >> 2;
@@ -733,12 +833,12 @@ kernel void qmm_q4_g64_tiled_f16x(
     uint fn  = (qid & 2u) * 2u + (lane & 1u) * 2u;
 
     #pragma clang loop unroll(full)
-    for (uint im = 0; im < 4u; im++) {
+    for (uint im = 0u; im < 4u; im++) {
         uint gm = m0 + sg_m + 8u * im + fm;
         if (gm < p.M) {
             device float* yr = Y + (ulong)gm * p.N;
             #pragma clang loop unroll(full)
-            for (uint in_ = 0; in_ < 4u; in_++) {
+            for (uint in_ = 0u; in_ < 4u; in_++) {
                 uint gn0 = n0 + sg_n + 8u * in_ + fn;
                 float2 vv = float2(acc[im][in_].thread_elements()[0], acc[im][in_].thread_elements()[1]);
                 if (gn0 + 1u < p.N) {
@@ -812,16 +912,16 @@ kernel void qmm_q4_g64_smalln_f16x(
         if (gn_ok) {
             uint g = k0 >> 6;
             half2 sc_h = half2(half(bf16_to_f32(s_base[g])));
-            half2 bi_h = half2(half(bf16_to_f32(b_base[g])));
+            half2 bi_h = fma(half2(-1024.0h), sc_h, half2(half(bf16_to_f32(b_base[g]))));
             uint2 uq = *((const device uint2*)(w_base + (k0 >> 3) + bh * 2u));
             uint ws[2] = {uq.x, uq.y};
             #pragma clang loop unroll(full)
             for (uint w = 0; w < 2u; w++) {
                 uint u = ws[w];
-                half2 h0 = fma(as_type<half2>(( u        & 0x000F000Fu) | 0x64006400u) - half2(1024.0h), sc_h, bi_h);
-                half2 h1 = fma(as_type<half2>(((u >> 4)  & 0x000F000Fu) | 0x64006400u) - half2(1024.0h), sc_h, bi_h);
-                half2 h2 = fma(as_type<half2>(((u >> 8)  & 0x000F000Fu) | 0x64006400u) - half2(1024.0h), sc_h, bi_h);
-                half2 h3 = fma(as_type<half2>(((u >> 12) & 0x000F000Fu) | 0x64006400u) - half2(1024.0h), sc_h, bi_h);
+                half2 h0 = fma(as_type<half2>(( u        & 0x000F000Fu) | 0x64006400u), sc_h, bi_h);
+                half2 h1 = fma(as_type<half2>(((u >> 4)  & 0x000F000Fu) | 0x64006400u), sc_h, bi_h);
+                half2 h2 = fma(as_type<half2>(((u >> 8)  & 0x000F000Fu) | 0x64006400u), sc_h, bi_h);
+                half2 h3 = fma(as_type<half2>(((u >> 12) & 0x000F000Fu) | 0x64006400u), sc_h, bi_h);
                 sb_dst[w * 2u + 0u] = half4(h0.x, h1.x, h2.x, h3.x);
                 sb_dst[w * 2u + 1u] = half4(h0.y, h1.y, h2.y, h3.y);
             }
@@ -1308,7 +1408,7 @@ kernel void mma_qmm8_q4_g64_f16x(
     }
 }
 
-// Split-K along tgid.z for small-N, large-K decode projections (down_proj 5120x17408 sk=4 -> 365 GB/s; out_proj 5120x6144 sk=2 -> 322 GB/s)
+// Split-K along tgid.z for small-N, large-K decode projections (down_proj 5120x17408 sk=4/8; out_proj 5120x6144 sk=2)
 kernel void mma_qmm8_q4_g64_f16x_sk(
     const device uint*   W     [[buffer(0)]],
     const device ushort* S     [[buffer(1)]],
@@ -1440,7 +1540,7 @@ kernel void mma_qmm8_sk_reduce(
     uint total = p.M * p.N;
     if (gid >= total) return;
     float s = p.add_residual ? Y[gid] : 0.0f;
-    for (uint k = 0; k < p.sk; k++) s += partY[(ulong)k * total + gid];
+    for (uint k = 0u; k < p.sk; k++) s += partY[(ulong)k * total + gid];
     Y[gid] = s;
 }
 
@@ -1453,8 +1553,7 @@ struct QmmSkNormParams {
     float eps;
 };
 
-// Round 8: Fused Split-K Reduce + Residual Add + RMSNorm-F16 (1 TG/row, 256 threads, registers-only!)
-// Eliminates 127 kernel launches, 127 barriers, and 127 buf_hidden_ re-reads per decode round!
+// Fused Split-K Reduce + Residual Add + RMSNorm-F16 (float4 vectorized loads/stores + unrolled sk=8/2!)
 kernel void mma_qmm8_sk_reduce_rmsnorm_f16(
     const device float*       partY  [[buffer(0)]],
     device float*             hid    [[buffer(1)]],
@@ -1473,49 +1572,91 @@ kernel void mma_qmm8_sk_reduce_rmsnorm_f16(
 
     threadgroup float smem[32];
     const uint sg = tid >> 5, lane = tid & 31u, nsg = tg_size >> 5;
+    const uint n4 = p.N >> 2;
 
-    if (p.N == 5120u && tg_size == 1024u) {
-        float vals[5];
+    if ((p.N & 3u) == 0u && n4 <= tg_size * 2u) {
+        const ulong total4 = total >> 2;
+        const ulong row_off4 = row_off >> 2;
+        const device float4* partY4 = (const device float4*)partY;
+        device float4* hp4 = (device float4*)hp;
+        device half4*  np4 = (device half4*)np;
+
+        float4 v0 = float4(0.0f), v1 = float4(0.0f);
         float sq = 0.0f;
-        #pragma clang loop unroll(full)
-        for (uint k = 0; k < 5u; k++) {
-            uint idx = k * 1024u + tid;
-            float acc = p.add_residual ? hp[idx] : 0.0f;
-            for (uint s = 0; s < p.sk; s++) {
-                acc += partY[(ulong)s * total + row_off + idx];
+        const bool ok0 = tid < n4;
+        const uint tid1 = tid + tg_size;
+        const bool ok1 = tid1 < n4;
+
+        if (ok0) {
+            float4 acc = p.add_residual ? hp4[tid] : float4(0.0f);
+            if (p.sk == 8u) {
+                #pragma clang loop unroll(full)
+                for (uint s = 0u; s < 8u; ++s) acc += partY4[(ulong)s * total4 + row_off4 + tid];
+            } else if (p.sk == 2u) {
+                acc += partY4[row_off4 + tid] + partY4[total4 + row_off4 + tid];
+            } else {
+                for (uint s = 0u; s < p.sk; ++s) acc += partY4[(ulong)s * total4 + row_off4 + tid];
             }
-            hp[idx] = acc;
-            vals[k] = acc;
-            sq = fma(acc, acc, sq);
+            hp4[tid] = acc;
+            v0 = acc;
+            sq = fma(acc.x, acc.x, fma(acc.y, acc.y, fma(acc.z, acc.z, fma(acc.w, acc.w, sq))));
         }
+        if (ok1) {
+            float4 acc = p.add_residual ? hp4[tid1] : float4(0.0f);
+            if (p.sk == 8u) {
+                #pragma clang loop unroll(full)
+                for (uint s = 0u; s < 8u; ++s) acc += partY4[(ulong)s * total4 + row_off4 + tid1];
+            } else if (p.sk == 2u) {
+                acc += partY4[row_off4 + tid1] + partY4[total4 + row_off4 + tid1];
+            } else {
+                for (uint s = 0u; s < p.sk; ++s) acc += partY4[(ulong)s * total4 + row_off4 + tid1];
+            }
+            hp4[tid1] = acc;
+            v1 = acc;
+            sq = fma(acc.x, acc.x, fma(acc.y, acc.y, fma(acc.z, acc.z, fma(acc.w, acc.w, sq))));
+        }
+
         sq = simd_sum(sq);
         if (lane == 0u) smem[sg] = sq;
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (sg == 0u) {
-            float tot = simd_sum(smem[lane]);
+            float tot = simd_sum((lane < nsg) ? smem[lane] : 0.0f);
             if (lane == 0u) smem[0] = rsqrt(tot / float(p.N) + p.eps);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         float inv_rms = smem[0];
 
-        #pragma clang loop unroll(full)
-        for (uint k = 0; k < 5u; k++) {
-            uint idx = k * 1024u + tid;
-            np[idx] = half(vals[k] * inv_rms * bf16_to_f32(norm_w[idx]));
+        if (ok0) {
+            uint base = tid * 4u;
+            float4 w = float4(bf16_to_f32(norm_w[base + 0u]), bf16_to_f32(norm_w[base + 1u]),
+                              bf16_to_f32(norm_w[base + 2u]), bf16_to_f32(norm_w[base + 3u]));
+            np4[tid] = half4(v0 * (inv_rms * w));
         }
-    } else if (p.N == 5120u && tg_size == 256u) {
-        float vals[20];
+        if (ok1) {
+            uint base = tid1 * 4u;
+            float4 w = float4(bf16_to_f32(norm_w[base + 0u]), bf16_to_f32(norm_w[base + 1u]),
+                              bf16_to_f32(norm_w[base + 2u]), bf16_to_f32(norm_w[base + 3u]));
+            np4[tid1] = half4(v1 * (inv_rms * w));
+        }
+    } else if ((p.N & 3u) == 0u && n4 <= tg_size * 5u) {
+        const ulong total4 = total >> 2;
+        const ulong row_off4 = row_off >> 2;
+        const device float4* partY4 = (const device float4*)partY;
+        device float4* hp4 = (device float4*)hp;
+        device half4*  np4 = (device half4*)np;
+
+        float4 vals[5] = {float4(0.0f), float4(0.0f), float4(0.0f), float4(0.0f), float4(0.0f)};
         float sq = 0.0f;
         #pragma clang loop unroll(full)
-        for (uint k = 0; k < 20u; k++) {
-            uint idx = k * 256u + tid;
-            float acc = p.add_residual ? hp[idx] : 0.0f;
-            for (uint s = 0; s < p.sk; s++) {
-                acc += partY[(ulong)s * total + row_off + idx];
+        for (uint k = 0u; k < 5u; ++k) {
+            uint idx4 = k * tg_size + tid;
+            if (idx4 < n4) {
+                float4 acc = p.add_residual ? hp4[idx4] : float4(0.0f);
+                for (uint s = 0u; s < p.sk; ++s) acc += partY4[(ulong)s * total4 + row_off4 + idx4];
+                hp4[idx4] = acc;
+                vals[k] = acc;
+                sq = fma(acc.x, acc.x, fma(acc.y, acc.y, fma(acc.z, acc.z, fma(acc.w, acc.w, sq))));
             }
-            hp[idx] = acc;
-            vals[k] = acc;
-            sq = fma(acc, acc, sq);
         }
         sq = simd_sum(sq);
         if (lane == 0u) smem[sg] = sq;
@@ -1528,15 +1669,20 @@ kernel void mma_qmm8_sk_reduce_rmsnorm_f16(
         float inv_rms = smem[0];
 
         #pragma clang loop unroll(full)
-        for (uint k = 0; k < 20u; k++) {
-            uint idx = k * 256u + tid;
-            np[idx] = half(vals[k] * inv_rms * bf16_to_f32(norm_w[idx]));
+        for (uint k = 0u; k < 5u; ++k) {
+            uint idx4 = k * tg_size + tid;
+            if (idx4 < n4) {
+                uint base = idx4 * 4u;
+                float4 w = float4(bf16_to_f32(norm_w[base + 0u]), bf16_to_f32(norm_w[base + 1u]),
+                                  bf16_to_f32(norm_w[base + 2u]), bf16_to_f32(norm_w[base + 3u]));
+                np4[idx4] = half4(vals[k] * (inv_rms * w));
+            }
         }
     } else {
         float sq = 0.0f;
         for (uint idx = tid; idx < p.N; idx += tg_size) {
             float acc = p.add_residual ? hp[idx] : 0.0f;
-            for (uint s = 0; s < p.sk; s++) {
+            for (uint s = 0u; s < p.sk; s++) {
                 acc += partY[(ulong)s * total + row_off + idx];
             }
             hp[idx] = acc;
@@ -1557,8 +1703,7 @@ kernel void mma_qmm8_sk_reduce_rmsnorm_f16(
     }
 }
 
-// Round 29: Fused Layer-63 Split-K Reduce + Residual Add + Dual Final RMSNorm (FP32 for MTP + FP16 for lm_head!)
-// Eliminates final_norm kernel launch, barrier, and buf_hidden_ round-trip on every decode round!
+// Fused Layer-63 Split-K Reduce + Residual Add + Dual Final RMSNorm (FP32 for MTP + FP16 for lm_head, float4!)
 kernel void mma_qmm8_sk_reduce_dual_norm_f16(
     const device float*       partY   [[buffer(0)]],
     device float*             hid     [[buffer(1)]],
@@ -1579,43 +1724,82 @@ kernel void mma_qmm8_sk_reduce_dual_norm_f16(
 
     threadgroup float smem[32];
     const uint sg = tid >> 5, lane = tid & 31u, nsg = tg_size >> 5;
+    const uint n4 = p.N >> 2;
 
-    if (p.N == 5120u && tg_size == 1024u) {
-        float vals[5];
+    if ((p.N & 3u) == 0u && n4 <= tg_size * 2u) {
+        const ulong total4 = total >> 2;
+        const ulong row_off4 = row_off >> 2;
+        const device float4* partY4 = (const device float4*)partY;
+        device float4* hp4  = (device float4*)hp;
+        device float4* y32_4 = (device float4*)y32;
+        device half4*  y16_4 = (device half4*)y16;
+
+        float4 v0 = float4(0.0f), v1 = float4(0.0f);
         float sq = 0.0f;
-        #pragma clang loop unroll(full)
-        for (uint k = 0; k < 5u; k++) {
-            uint idx = k * 1024u + tid;
-            float acc = p.add_residual ? hp[idx] : 0.0f;
-            for (uint s = 0; s < p.sk; s++) {
-                acc += partY[(ulong)s * total + row_off + idx];
+        const bool ok0 = tid < n4;
+        const uint tid1 = tid + tg_size;
+        const bool ok1 = tid1 < n4;
+
+        if (ok0) {
+            float4 acc = p.add_residual ? hp4[tid] : float4(0.0f);
+            if (p.sk == 8u) {
+                #pragma clang loop unroll(full)
+                for (uint s = 0u; s < 8u; ++s) acc += partY4[(ulong)s * total4 + row_off4 + tid];
+            } else if (p.sk == 2u) {
+                acc += partY4[row_off4 + tid] + partY4[total4 + row_off4 + tid];
+            } else {
+                for (uint s = 0u; s < p.sk; ++s) acc += partY4[(ulong)s * total4 + row_off4 + tid];
             }
-            hp[idx] = acc;
-            vals[k] = acc;
-            sq = fma(acc, acc, sq);
+            hp4[tid] = acc;
+            v0 = acc;
+            sq = fma(acc.x, acc.x, fma(acc.y, acc.y, fma(acc.z, acc.z, fma(acc.w, acc.w, sq))));
         }
+        if (ok1) {
+            float4 acc = p.add_residual ? hp4[tid1] : float4(0.0f);
+            if (p.sk == 8u) {
+                #pragma clang loop unroll(full)
+                for (uint s = 0u; s < 8u; ++s) acc += partY4[(ulong)s * total4 + row_off4 + tid1];
+            } else if (p.sk == 2u) {
+                acc += partY4[row_off4 + tid1] + partY4[total4 + row_off4 + tid1];
+            } else {
+                for (uint s = 0u; s < p.sk; ++s) acc += partY4[(ulong)s * total4 + row_off4 + tid1];
+            }
+            hp4[tid1] = acc;
+            v1 = acc;
+            sq = fma(acc.x, acc.x, fma(acc.y, acc.y, fma(acc.z, acc.z, fma(acc.w, acc.w, sq))));
+        }
+
         sq = simd_sum(sq);
         if (lane == 0u) smem[sg] = sq;
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (sg == 0u) {
-            float tot = simd_sum(smem[lane]);
+            float tot = simd_sum((lane < nsg) ? smem[lane] : 0.0f);
             if (lane == 0u) smem[0] = rsqrt(tot / float(p.N) + p.eps);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         float inv_rms = smem[0];
 
-        #pragma clang loop unroll(full)
-        for (uint k = 0; k < 5u; k++) {
-            uint idx = k * 1024u + tid;
-            float v = vals[k] * inv_rms * bf16_to_f32(norm_w[idx]);
-            y32[idx] = v;
-            y16[idx] = half(v);
+        if (ok0) {
+            uint base = tid * 4u;
+            float4 w = float4(bf16_to_f32(norm_w[base + 0u]), bf16_to_f32(norm_w[base + 1u]),
+                              bf16_to_f32(norm_w[base + 2u]), bf16_to_f32(norm_w[base + 3u]));
+            float4 out = v0 * (inv_rms * w);
+            y32_4[tid] = out;
+            y16_4[tid] = half4(out);
+        }
+        if (ok1) {
+            uint base = tid1 * 4u;
+            float4 w = float4(bf16_to_f32(norm_w[base + 0u]), bf16_to_f32(norm_w[base + 1u]),
+                              bf16_to_f32(norm_w[base + 2u]), bf16_to_f32(norm_w[base + 3u]));
+            float4 out = v1 * (inv_rms * w);
+            y32_4[tid1] = out;
+            y16_4[tid1] = half4(out);
         }
     } else {
         float sq = 0.0f;
         for (uint idx = tid; idx < p.N; idx += tg_size) {
             float acc = p.add_residual ? hp[idx] : 0.0f;
-            for (uint s = 0; s < p.sk; s++) {
+            for (uint s = 0u; s < p.sk; s++) {
                 acc += partY[(ulong)s * total + row_off + idx];
             }
             hp[idx] = acc;
@@ -3113,7 +3297,7 @@ kernel void mma_qmm8_lmhead_max_f16x(
     const device half*   X     [[buffer(3)]],
     device float*        Y     [[buffer(4)]],
     device ArgmaxOut*    parts [[buffer(5)]],
-    constant QmmParams&  p     [[buffer(6)]],
+    constant QmmParams&  p     [[buffer(6)]], // p.add_residual != 0 skips writing full Y logits (greedy fast path!)
     uint2 tgid                 [[threadgroup_position_in_grid]],
     uint2 n_tg                 [[threadgroups_per_grid]],
     uint  lane                 [[thread_index_in_simdgroup]],
@@ -3211,7 +3395,7 @@ kernel void mma_qmm8_lmhead_max_f16x(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Epilogue: simdgroup sg = row m (0..7), lane = column (0..31) -> coalesced write + 5-step warp row-max!
+    // Epilogue: simdgroup sg = row m (0..7), lane = column (0..31) -> optional Y write + 5-step warp row-max!
     uint m = sg;
     if (m < p.M) {
         uint t  = lane >> 3;
@@ -3223,7 +3407,9 @@ kernel void mma_qmm8_lmhead_max_f16x(
             float acc = 0.0f;
             #pragma clang loop unroll(full)
             for (uint k = 0; k < KS; k++) acc += red[k][t][r * 8u + m];
-            Y[(ulong)m * N + gn] = acc;
+            if (p.add_residual == 0u) {
+                Y[(ulong)m * N + gn] = acc;
+            }
             best_v = acc;
         }
         for (ushort off = 16; off > 0; off >>= 1) {
@@ -3975,68 +4161,131 @@ kernel void mtp_sample_draft_batch_gpu(
 // ============================================================================
 
 // ============================================================================
-// 8. Single-Copy ANE hf4 (model.hwx) Native BF16-AMX MLP Kernels!
+// 8. Single-Copy ANE 4-bit (model.hwx: hf4 & universal M1-M5 lut4) MLP Kernels!
 //    Reads Apple Neural Engine's compiled 4-bit [K][8] model.hwx pages directly
 //    via zero-copy mmap: 4.0 bpw (11.1% less DRAM than g64!), zero per-group
-//    scales/biases, exact per-row (scale, 136 + offset) applied once at end,
+//    scales/biases, exact per-row (scale, 1032 + offset) applied once at end,
 //    exact sum(x) computed in registers via 2 warp shuffles (0 TG mem, 0 barriers!)
 // ============================================================================
 
 struct AneShareParams {
     uint M;
-    uint hdr_words;       // 6 (24B asym int4) or 4 (16B sym int4)
+    uint HID;             // hidden_size (multiple of 128, e.g. 5120)
+    uint INTER;           // intermediate_size (= n_subblocks * SUB, e.g. 17408)
+    uint SUB;             // sub-block intermediate width (multiple of 256, e.g. 4352)
+    uint DK;              // down_proj K-group width (= SUB / 2, multiple of 128, e.g. 2176)
+    uint n_subblocks;     // number of MLP sub-blocks (1..4, e.g. 4)
     uint lin_base_w[16];  // word offset of chunk[0] for linear_0..15
     uint lin_chunk_w[16]; // chunk_bytes / 4 for linear_0..15
+    uint lin_hdr_w[16];   // per-linear group header in 32-bit words: 6 (24B asym), 4 (16B sym/lut4), 0 (lut4 unfused)
 };
+
+// Optional PSO specialization constants (default/undefined falls back transparently to AneShareParams!)
+constant uint FC_ANE_HID   [[function_constant(0)]];
+constant uint FC_ANE_INTER [[function_constant(1)]];
+constant uint FC_ANE_SUB   [[function_constant(2)]];
+constant uint FC_ANE_DK    [[function_constant(3)]];
+constant uint FC_ANE_NSB   [[function_constant(4)]];
+constant uint FC_ANE_HDR   [[function_constant(5)]];
 
 inline half2 ane_dq4_f16(uint w, uint sh) {
     uint u = (w >> sh) ^ 0x88u;
     return as_type<half2>(ushort2(u & 0xFu, (u >> 4) & 0xFu) | ushort2(0x6400u));
 }
 
-// Fused gate + up + SiLU from single-copy model.hwx -> half Y[M, 17408]
-// Slot-major + lockstep strided-K + KS=8 (256 threads -> 1 KB coalesced DRAM bursts across 64 real .hwx layers!)
-// Grid: (17408 / 16 = 1088, ceil_div(M, 8), 1), TG: (256, 1, 1) (8 simdgroups)
+// Fast decode when weight words were XORed with 0x88888888u once at load time (4x fewer XORs!)
+inline half2 ane_dq4_f16_xored(uint w_xored, uint sh) {
+    uint u = w_xored >> sh;
+    return as_type<half2>(ushort2(u & 0xFu, (u >> 4) & 0xFu) | ushort2(0x6400u));
+}
+
+inline void ane_hf4_mma4_xored(
+    uint2 w_lo, uint2 w_hi, uint sh,
+    const thread simdgroup_half8x8* Af,
+    thread simdgroup_float8x8& C
+) {
+    uint w[4] = {w_lo.x, w_lo.y, w_hi.x, w_hi.y};
+    #pragma clang loop unroll(full)
+    for (uint q = 0u; q < 4u; ++q) {
+        simdgroup_half8x8 B;
+        half2 h = ane_dq4_f16_xored(w[q], sh);
+        B.thread_elements()[0] = h.x;
+        B.thread_elements()[1] = h.y;
+        simdgroup_multiply_accumulate(C, Af[q], B, C);
+    }
+}
+
+// Universal non-uniform 16-entry FP16 LUT decode via 1 KB threadgroup byte-pair table s_lut2[256]!
+// Maps 2 adjacent 4-bit nibbles (1 byte = (w >> sh) & 0xFFu) -> half2(lut[lo], lut[hi]) in ONE 32-bit TG load
+// (zero simd_shuffle stalls, zero extra shifts, 32-bank spread + hardware broadcast on repeated pairs!).
+inline void ane_lut4_mma4_tbl(
+    uint2 w_lo, uint2 w_hi, uint sh,
+    const threadgroup half2* s_lut2,
+    const thread simdgroup_half8x8* Af,
+    thread simdgroup_float8x8& C
+) {
+    uint w[4] = {w_lo.x, w_lo.y, w_hi.x, w_hi.y};
+    #pragma clang loop unroll(full)
+    for (uint q = 0u; q < 4u; ++q) {
+        simdgroup_half8x8 B;
+        half2 h = s_lut2[(w[q] >> sh) & 0xFFu];
+        B.thread_elements()[0] = h.x;
+        B.thread_elements()[1] = h.y;
+        simdgroup_multiply_accumulate(C, Af[q], B, C);
+    }
+}
+
+// Fused gate + up + SiLU from single-copy model.hwx -> half Y[M, INTER]
+// Direct-load zero-spill inner loop + pre-XOR + post-reduction SO epilogue (8x less SO) + [[function_constant]]!
+// Grid: (INTER / 16, ceil_div(M, 8), 1), TG: (256, 1, 1) (8 simdgroups)
 kernel void ane_hf4_swiglu_bf16(
     const device uint*          W  [[buffer(0)]],
-    const device float2*        SO [[buffer(1)]], // [0..17407]=gate, [17408..34815]=up ({scale, 1032+off})
-    const device half*          X  [[buffer(2)]], // [M, 5120] FP16 normed*inv1
-    device half*                Y  [[buffer(3)]], // [M, 17408] FP16 act
+    const device float2*        SO [[buffer(1)]], // [0..INTER-1]=gate, [INTER..2*INTER-1]=up ({scale, 1032+off})
+    const device half*          X  [[buffer(2)]], // [M, HID] FP16 normed*inv1
+    device half*                Y  [[buffer(3)]], // [M, INTER] FP16 act
     constant AneShareParams&    p  [[buffer(4)]],
     uint2 tgid                     [[threadgroup_position_in_grid]],
     uint  lane                     [[thread_index_in_simdgroup]],
     uint  sg                       [[simdgroup_index_in_threadgroup]]
 ) {
-    constexpr uint HID = 5120u;
-    constexpr uint INTER = 17408u;
-    constexpr uint NGS = 544u; // 4352 / 8 = 34 slots * 16 chunks
     constexpr uint KS = 8u;
+    const uint HID   = (is_function_constant_defined(FC_ANE_HID)   && FC_ANE_HID   != 0u) ? FC_ANE_HID   : p.HID;
+    const uint INTER = (is_function_constant_defined(FC_ANE_INTER) && FC_ANE_INTER != 0u) ? FC_ANE_INTER : p.INTER;
+    const uint SUB   = (is_function_constant_defined(FC_ANE_SUB)   && FC_ANE_SUB   != 0u) ? FC_ANE_SUB   : p.SUB;
+    const uint NSB   = (is_function_constant_defined(FC_ANE_NSB)   && FC_ANE_NSB   != 0u) ? FC_ANE_NSB   : p.n_subblocks;
+    const uint NGS   = SUB >> 3;          // SUB / 8 (groups per sub-block)
+    const uint tgs_sb = SUB >> 4;         // SUB / 16
+    const uint total_tgs = NSB * tgs_sb;
 
     const uint m0 = tgid.y * 8u;
-    if (tgid.x >= 1088u || m0 >= p.M) return;
+    if (tgid.x >= total_tgs || m0 >= p.M) return;
 
-    const uint sb    = tgid.x / 272u;           // 0..3
-    const uint rem   = tgid.x - sb * 272u;      // 0..271 (17 slot-pairs * 16 chunks)
-    const uint slot0 = (rem >> 4) * 2u;         // 0, 2, ..., 32 (slot-major -> coalesced Y & balanced DRAM channels!)
-    const uint ch    = rem & 15u;               // 0..15
+    const uint sb    = tgid.x / tgs_sb;
+    const uint rem   = tgid.x - sb * tgs_sb;
+    const uint slot0 = (rem >> 4) * 2u;
+    const uint ch    = rem & 15u;
     const uint G0    = sb * NGS + slot0 * 16u + ch;
-    const uint G1    = G0 + 16u;                // adjacent slot in SAME chunk ch!
-    const uint gw    = p.hdr_words + HID;
-    const bool aligned1 = (p.hdr_words == 6u);
+    const uint G1    = G0 + 16u;
+
+    const uint li_g  = sb * 4u + 0u;
+    const uint li_u  = sb * 4u + 1u;
+    const uint hdr_g = is_function_constant_defined(FC_ANE_HDR) ? FC_ANE_HDR : p.lin_hdr_w[li_g];
+    const uint hdr_u = is_function_constant_defined(FC_ANE_HDR) ? FC_ANE_HDR : p.lin_hdr_w[li_u];
+    const uint gw_g  = hdr_g + HID;
+    const uint gw_u  = hdr_u + HID;
 
     const uint qid = lane >> 2;
     const uint fm  = (qid & 4u) + ((lane >> 1) & 3u);
     const uint fn  = (qid & 2u) * 2u + (lane & 1u) * 2u;
     const uint sh  = 4u * fn;
 
-    const uint li_g = sb * 4u + 0u;
-    const uint li_u = sb * 4u + 1u;
+    // Odd slot (pg1/pu1) is ALWAYS 16B-aligned for all supported hdr in {0, 4, 6} (zero alignment branch!)
     const device uint* pg0 = W + (ulong)p.lin_base_w[li_g] + (ulong)ch * p.lin_chunk_w[li_g]
-                             + 16u + (ulong)slot0 * gw + p.hdr_words + 4u * fm;
-    const device uint* pg1 = pg0 + gw;
+                             + 16u + (ulong)slot0 * gw_g + hdr_g + 4u * fm;
+    const device uint* pg1 = pg0 + gw_g;
     const device uint* pu0 = W + (ulong)p.lin_base_w[li_u] + (ulong)ch * p.lin_chunk_w[li_u]
-                             + 16u + (ulong)slot0 * gw + p.hdr_words + 4u * fm;
-    const device uint* pu1 = pu0 + gw;
+                             + 16u + (ulong)slot0 * gw_u + hdr_u + 4u * fm;
+    const device uint* pu1 = pu0 + gw_u;
 
     const uint gm = m0 + fm;
     const bool mok = gm < p.M;
@@ -4048,7 +4297,7 @@ kernel void ane_hf4_swiglu_bf16(
     simdgroup_float8x8 Cu1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
     float sx = 0.0f;
 
-    // Lockstep strided-K across 8 simdgroups -> 1 KB contiguous DRAM burst per iteration (5120 / 256 = 20 exact!)
+    // Lockstep strided-K across 8 simdgroups -> 1 KB contiguous DRAM burst per iteration (zero spill!)
     for (uint ko = sg * 32u; ko < HID; ko += KS * 32u) {
         half4 x0 = mok ? *(const device half4*)(xr + ko + 4u * fn)      : half4(0.0h);
         half4 x1 = mok ? *(const device half4*)(xr + ko + 4u * fn + 4u) : half4(0.0h);
@@ -4061,55 +4310,18 @@ kernel void ane_hf4_swiglu_bf16(
         Af[2].thread_elements()[0] = x0.z; Af[2].thread_elements()[1] = x1.z;
         Af[3].thread_elements()[0] = x0.w; Af[3].thread_elements()[1] = x1.w;
 
-        uint2 a0 = *(const device uint2*)(pg0 + ko);
-        uint2 b0 = *(const device uint2*)(pg0 + ko + 2u);
-        uint4 w1 = aligned1 ? *(const device uint4*)(pg1 + ko)
-                            : uint4(*(const device uint2*)(pg1 + ko), *(const device uint2*)(pg1 + ko + 2u));
+        uint2 a0 = *(const device uint2*)(pg0 + ko)      ^ uint2(0x88888888u);
+        uint2 b0 = *(const device uint2*)(pg0 + ko + 2u) ^ uint2(0x88888888u);
+        uint4 w1 = *(const device uint4*)(pg1 + ko)      ^ uint4(0x88888888u);
+        ane_hf4_mma4_xored(a0, b0, sh, Af, Cg0);
 
-        {
-            uint w[4] = {a0.x, a0.y, b0.x, b0.y};
-            #pragma clang loop unroll(full)
-            for (uint q = 0u; q < 4u; ++q) {
-                simdgroup_half8x8 B;
-                half2 h = ane_dq4_f16(w[q], sh);
-                B.thread_elements()[0] = h.x; B.thread_elements()[1] = h.y;
-                simdgroup_multiply_accumulate(Cg0, Af[q], B, Cg0);
-            }
-        }
-        uint2 a2 = *(const device uint2*)(pu0 + ko);
-        uint2 b2 = *(const device uint2*)(pu0 + ko + 2u);
-        {
-            uint w[4] = {w1.x, w1.y, w1.z, w1.w};
-            #pragma clang loop unroll(full)
-            for (uint q = 0u; q < 4u; ++q) {
-                simdgroup_half8x8 B;
-                half2 h = ane_dq4_f16(w[q], sh);
-                B.thread_elements()[0] = h.x; B.thread_elements()[1] = h.y;
-                simdgroup_multiply_accumulate(Cg1, Af[q], B, Cg1);
-            }
-        }
-        uint4 w3 = aligned1 ? *(const device uint4*)(pu1 + ko)
-                            : uint4(*(const device uint2*)(pu1 + ko), *(const device uint2*)(pu1 + ko + 2u));
-        {
-            uint w[4] = {a2.x, a2.y, b2.x, b2.y};
-            #pragma clang loop unroll(full)
-            for (uint q = 0u; q < 4u; ++q) {
-                simdgroup_half8x8 B;
-                half2 h = ane_dq4_f16(w[q], sh);
-                B.thread_elements()[0] = h.x; B.thread_elements()[1] = h.y;
-                simdgroup_multiply_accumulate(Cu0, Af[q], B, Cu0);
-            }
-        }
-        {
-            uint w[4] = {w3.x, w3.y, w3.z, w3.w};
-            #pragma clang loop unroll(full)
-            for (uint q = 0u; q < 4u; ++q) {
-                simdgroup_half8x8 B;
-                half2 h = ane_dq4_f16(w[q], sh);
-                B.thread_elements()[0] = h.x; B.thread_elements()[1] = h.y;
-                simdgroup_multiply_accumulate(Cu1, Af[q], B, Cu1);
-            }
-        }
+        uint2 a2 = *(const device uint2*)(pu0 + ko)      ^ uint2(0x88888888u);
+        uint2 b2 = *(const device uint2*)(pu0 + ko + 2u) ^ uint2(0x88888888u);
+        ane_hf4_mma4_xored(w1.xy, w1.zw, sh, Af, Cg1);
+
+        uint4 w3 = *(const device uint4*)(pu1 + ko)      ^ uint4(0x88888888u);
+        ane_hf4_mma4_xored(a2, b2, sh, Af, Cu0);
+        ane_hf4_mma4_xored(w3.xy, w3.zw, sh, Af, Cu1);
     }
 
     sx += simd_shuffle_xor(sx, 1);
@@ -4117,45 +4329,47 @@ kernel void ane_hf4_swiglu_bf16(
 
     threadgroup float red_g[KS][2][64];
     threadgroup float red_u[KS][2][64];
-    uint c0 = G0 * 8u + fn;
-    uint c1 = G1 * 8u + fn;
-    float2 sg0 = SO[c0],           sg1 = SO[c0 + 1u];
-    float2 su0 = SO[INTER + c0],   su1 = SO[INTER + c0 + 1u];
-    float2 sg2 = SO[c1],           sg3 = SO[c1 + 1u];
-    float2 su2 = SO[INTER + c1],   su3 = SO[INTER + c1 + 1u];
+    threadgroup float red_sx[KS][8];
 
-    red_g[sg][0][fm * 8u + fn]      = (Cg0.thread_elements()[0] - sg0.y * sx) * sg0.x;
-    red_g[sg][0][fm * 8u + fn + 1u] = (Cg0.thread_elements()[1] - sg1.y * sx) * sg1.x;
-    red_g[sg][1][fm * 8u + fn]      = (Cg1.thread_elements()[0] - sg2.y * sx) * sg2.x;
-    red_g[sg][1][fm * 8u + fn + 1u] = (Cg1.thread_elements()[1] - sg3.y * sx) * sg3.x;
-    red_u[sg][0][fm * 8u + fn]      = (Cu0.thread_elements()[0] - su0.y * sx) * su0.x;
-    red_u[sg][0][fm * 8u + fn + 1u] = (Cu0.thread_elements()[1] - su1.y * sx) * su1.x;
-    red_u[sg][1][fm * 8u + fn]      = (Cu1.thread_elements()[0] - su2.y * sx) * su2.x;
-    red_u[sg][1][fm * 8u + fn + 1u] = (Cu1.thread_elements()[1] - su3.y * sx) * su3.x;
+    if (fn == 0u) red_sx[sg][fm] = sx;
+    red_g[sg][0][fm * 8u + fn]      = Cg0.thread_elements()[0];
+    red_g[sg][0][fm * 8u + fn + 1u] = Cg0.thread_elements()[1];
+    red_g[sg][1][fm * 8u + fn]      = Cg1.thread_elements()[0];
+    red_g[sg][1][fm * 8u + fn + 1u] = Cg1.thread_elements()[1];
+    red_u[sg][0][fm * 8u + fn]      = Cu0.thread_elements()[0];
+    red_u[sg][0][fm * 8u + fn + 1u] = Cu0.thread_elements()[1];
+    red_u[sg][1][fm * 8u + fn]      = Cu1.thread_elements()[0];
+    red_u[sg][1][fm * 8u + fn + 1u] = Cu1.thread_elements()[1];
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    uint e = sg * 32u + lane; // 0..255; only 0..127 needed
+    // Post-reduction SO epilogue: 8x fewer SO loads & scale/offset multiplies!
+    uint e = sg * 32u + lane;
     if (e < 128u) {
-        uint t = e >> 6;
+        uint t  = e >> 6;
         uint rc = e & 63u;
-        uint m = rc >> 3;
-        uint c = rc & 7u;
+        uint m  = rc >> 3;
+        uint c  = rc & 7u;
         uint gm_out = m0 + m;
         if (gm_out < p.M) {
-            float g = 0.0f, u = 0.0f;
+            float g = 0.0f, u = 0.0f, sx_tot = 0.0f;
             #pragma clang loop unroll(full)
             for (uint k = 0u; k < KS; ++k) {
-                g += red_g[k][t][rc];
-                u += red_u[k][t][rc];
+                g      += red_g[k][t][rc];
+                u      += red_u[k][t][rc];
+                sx_tot += red_sx[k][m];
             }
-            uint G_out = (t == 0u) ? G0 : G1;
-            Y[(ulong)gm_out * INTER + G_out * 8u + c] = half(silu_f32(g) * u);
+            uint oc = ((t == 0u) ? G0 : G1) * 8u + c;
+            float2 so_g = SO[oc];
+            float2 so_u = SO[INTER + oc];
+            float gv = (g - so_g.y * sx_tot) * so_g.x;
+            float uv = (u - so_u.y * sx_tot) * so_u.x;
+            Y[(ulong)gm_out * INTER + oc] = half(silu_f32(gv) * uv);
         }
     }
 }
 
-// Dedicated 453 GB/s M=1 QMV gate+up+SiLU from single-copy model.hwx -> half Y[17408]
-// Grid: (544, 1, 1), TG: (128, 1, 1) (4 simdgroups, 1 slot = 8 channels/sg)
+// Dedicated 453 GB/s M=1 QMV gate+up+SiLU from single-copy model.hwx -> half Y[INTER]
+// Grid: (ceil_div(INTER / 8, 4), 1, 1), TG: (128, 1, 1) (4 simdgroups, 1 slot = 8 channels/sg)
 kernel void ane_hf4_swiglu_m1(
     const device uint*          W  [[buffer(0)]],
     const device float2*        SO [[buffer(1)]],
@@ -4166,25 +4380,32 @@ kernel void ane_hf4_swiglu_m1(
     uint lane                      [[thread_index_in_simdgroup]],
     uint sg                        [[simdgroup_index_in_threadgroup]]
 ) {
-    constexpr uint HID = 5120u;
-    constexpr uint INTER = 17408u;
-    constexpr uint NGS = 544u;
+    const uint HID          = p.HID;
+    const uint INTER        = p.INTER;
+    const uint SUB          = p.SUB;
+    const uint NGS          = SUB >> 3;   // SUB / 8
+    const uint slots_per_ch = SUB >> 7;   // SUB / 128
+    const uint total_g      = p.n_subblocks * NGS;
     const uint gidx = tgid * 4u + sg;
-    if (gidx >= 2176u) return;
+    if (gidx >= total_g) return;
 
-    const uint sb   = gidx / 544u;
-    const uint rem  = gidx - sb * 544u;
-    const uint ch   = rem / 34u;
-    const uint slot = rem - ch * 34u;
-    const uint G0   = sb * NGS + slot * 16u + ch;
-    const uint gw   = p.hdr_words + HID;
+    const uint sb    = gidx / NGS;
+    const uint rem   = gidx - sb * NGS;
+    const uint ch    = rem / slots_per_ch;
+    const uint slot  = rem - ch * slots_per_ch;
+    const uint G0    = sb * NGS + slot * 16u + ch;
 
-    const uint li_g = sb * 4u + 0u;
-    const uint li_u = sb * 4u + 1u;
+    const uint li_g  = sb * 4u + 0u;
+    const uint li_u  = sb * 4u + 1u;
+    const uint hdr_g = p.lin_hdr_w[li_g];
+    const uint hdr_u = p.lin_hdr_w[li_u];
+    const uint gw_g  = hdr_g + HID;
+    const uint gw_u  = hdr_u + HID;
+
     const device uint* pg = W + (ulong)p.lin_base_w[li_g] + (ulong)ch * p.lin_chunk_w[li_g]
-                            + 16u + (ulong)slot * gw + p.hdr_words;
+                            + 16u + (ulong)slot * gw_g + hdr_g;
     const device uint* pu = W + (ulong)p.lin_base_w[li_u] + (ulong)ch * p.lin_chunk_w[li_u]
-                            + 16u + (ulong)slot * gw + p.hdr_words;
+                            + 16u + (ulong)slot * gw_u + hdr_u;
 
     float ag[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
     float au[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
@@ -4229,8 +4450,119 @@ kernel void ane_hf4_swiglu_m1(
     }
 }
 
-// Dedicated 457 GB/s M=1 QMV Split-K=8 down_proj from single-copy model.hwx -> partY[8, 5120]
-// Grid: (160, 1, 8), TG: (128, 1, 1) (4 simdgroups = 4 slots/TG)
+// Dedicated M<=4 register-vectorized gate+up+SiLU from single-copy model.hwx -> half Y[M, INTER]
+// Zero 8-row AMX padding, zero TG memory, zero barriers -> ~440 GB/s at M=2..4!
+// Grid: (ceil_div(INTER / 8, 4), ceil_div(M, 4), 1), TG: (128, 1, 1)
+kernel void ane_hf4_swiglu_m4(
+    const device uint*          W  [[buffer(0)]],
+    const device float2*        SO [[buffer(1)]],
+    const device half*          X  [[buffer(2)]],
+    device half*                Y  [[buffer(3)]],
+    constant AneShareParams&    p  [[buffer(4)]],
+    uint2 tgid                     [[threadgroup_position_in_grid]],
+    uint  lane                     [[thread_index_in_simdgroup]],
+    uint  sg                       [[simdgroup_index_in_threadgroup]]
+) {
+    const uint HID   = (is_function_constant_defined(FC_ANE_HID)   && FC_ANE_HID   != 0u) ? FC_ANE_HID   : p.HID;
+    const uint INTER = (is_function_constant_defined(FC_ANE_INTER) && FC_ANE_INTER != 0u) ? FC_ANE_INTER : p.INTER;
+    const uint SUB   = (is_function_constant_defined(FC_ANE_SUB)   && FC_ANE_SUB   != 0u) ? FC_ANE_SUB   : p.SUB;
+    const uint NSB   = (is_function_constant_defined(FC_ANE_NSB)   && FC_ANE_NSB   != 0u) ? FC_ANE_NSB   : p.n_subblocks;
+    const uint NGS          = SUB >> 3;
+    const uint slots_per_ch = SUB >> 7;
+    const uint total_g      = NSB * NGS;
+    const uint m0   = tgid.y * 4u;
+    const uint gidx = tgid.x * 4u + sg;
+    if (gidx >= total_g || m0 >= p.M) return;
+
+    const uint sb    = gidx / NGS;
+    const uint rem   = gidx - sb * NGS;
+    const uint ch    = rem / slots_per_ch;
+    const uint slot  = rem - ch * slots_per_ch;
+    const uint G0    = sb * NGS + slot * 16u + ch;
+
+    const uint li_g  = sb * 4u + 0u;
+    const uint li_u  = sb * 4u + 1u;
+    const uint hdr_g = is_function_constant_defined(FC_ANE_HDR) ? FC_ANE_HDR : p.lin_hdr_w[li_g];
+    const uint hdr_u = is_function_constant_defined(FC_ANE_HDR) ? FC_ANE_HDR : p.lin_hdr_w[li_u];
+    const uint gw_g  = hdr_g + HID;
+    const uint gw_u  = hdr_u + HID;
+
+    const device uint* pg = W + (ulong)p.lin_base_w[li_g] + (ulong)ch * p.lin_chunk_w[li_g]
+                            + 16u + (ulong)slot * gw_g + hdr_g;
+    const device uint* pu = W + (ulong)p.lin_base_w[li_u] + (ulong)ch * p.lin_chunk_w[li_u]
+                            + 16u + (ulong)slot * gw_u + hdr_u;
+
+    const bool mok0 = (m0 + 0u) < p.M;
+    const bool mok1 = (m0 + 1u) < p.M;
+    const bool mok2 = (m0 + 2u) < p.M;
+    const bool mok3 = (m0 + 3u) < p.M;
+    const device half* xr0 = X + (ulong)(mok0 ? (m0 + 0u) : 0u) * HID;
+    const device half* xr1 = X + (ulong)(mok1 ? (m0 + 1u) : 0u) * HID;
+    const device half* xr2 = X + (ulong)(mok2 ? (m0 + 2u) : 0u) * HID;
+    const device half* xr3 = X + (ulong)(mok3 ? (m0 + 3u) : 0u) * HID;
+
+    float4 ag[8], au[8];
+    #pragma clang loop unroll(full)
+    for (uint c = 0u; c < 8u; ++c) { ag[c] = float4(0.0f); au[c] = float4(0.0f); }
+    float4 sx = float4(0.0f);
+
+    for (uint k = lane * 4u; k < HID; k += 128u) {
+        half4 x0 = mok0 ? *(const device half4*)(xr0 + k) : half4(0.0h);
+        half4 x1 = mok1 ? *(const device half4*)(xr1 + k) : half4(0.0h);
+        half4 x2 = mok2 ? *(const device half4*)(xr2 + k) : half4(0.0h);
+        half4 x3 = mok3 ? *(const device half4*)(xr3 + k) : half4(0.0h);
+
+        uint2 g0 = *(const device uint2*)(pg + k);
+        uint2 g1 = *(const device uint2*)(pg + k + 2u);
+        uint2 u0 = *(const device uint2*)(pu + k);
+        uint2 u1 = *(const device uint2*)(pu + k + 2u);
+        uint gw4[4] = {g0.x ^ 0x88888888u, g0.y ^ 0x88888888u, g1.x ^ 0x88888888u, g1.y ^ 0x88888888u};
+        uint uw4[4] = {u0.x ^ 0x88888888u, u0.y ^ 0x88888888u, u1.x ^ 0x88888888u, u1.y ^ 0x88888888u};
+
+        float4 xk[4];
+        xk[0] = float4(float(x0.x), float(x1.x), float(x2.x), float(x3.x));
+        xk[1] = float4(float(x0.y), float(x1.y), float(x2.y), float(x3.y));
+        xk[2] = float4(float(x0.z), float(x1.z), float(x2.z), float(x3.z));
+        xk[3] = float4(float(x0.w), float(x1.w), float(x2.w), float(x3.w));
+        sx += (xk[0] + xk[1]) + (xk[2] + xk[3]);
+
+        #pragma clang loop unroll(full)
+        for (uint j = 0u; j < 4u; ++j) {
+            uint gv = gw4[j], uv = uw4[j];
+            float4 xv = xk[j];
+            #pragma clang loop unroll(full)
+            for (uint c = 0u; c < 8u; ++c) {
+                ag[c] = fma(float((gv >> (4u * c)) & 0xFu), xv, ag[c]);
+                au[c] = fma(float((uv >> (4u * c)) & 0xFu), xv, au[c]);
+            }
+        }
+    }
+
+    float sx_r[4] = { simd_sum(sx.x), simd_sum(sx.y), simd_sum(sx.z), simd_sum(sx.w) };
+    #pragma clang loop unroll(full)
+    for (uint c = 0u; c < 8u; ++c) {
+        float g_r[4] = { simd_sum(ag[c].x), simd_sum(ag[c].y), simd_sum(ag[c].z), simd_sum(ag[c].w) };
+        float u_r[4] = { simd_sum(au[c].x), simd_sum(au[c].y), simd_sum(au[c].z), simd_sum(au[c].w) };
+        if (lane == 0u) {
+            uint oc = G0 * 8u + c;
+            float2 sg0 = SO[oc];
+            float2 su0 = SO[INTER + oc];
+            float goff = sg0.y - 1024.0f;
+            float uoff = su0.y - 1024.0f;
+            #pragma clang loop unroll(full)
+            for (uint r = 0u; r < 4u; ++r) {
+                if (m0 + r < p.M) {
+                    float gv = (g_r[r] - goff * sx_r[r]) * sg0.x;
+                    float uv = (u_r[r] - uoff * sx_r[r]) * su0.x;
+                    Y[(ulong)(m0 + r) * INTER + oc] = half(silu_f32(gv) * uv);
+                }
+            }
+        }
+    }
+}
+
+// Dedicated 457 GB/s M=1 QMV Split-K down_proj from single-copy model.hwx -> partY[2*n_subblocks, HID]
+// Grid: (16 * ceil_div(HID / 128, 4), 1, 2 * n_subblocks), TG: (128, 1, 1) (4 simdgroups = 4 slots/TG)
 kernel void ane_hf4_down_m1_sk(
     const device uint*          W     [[buffer(0)]],
     const device float2*        SO    [[buffer(1)]],
@@ -4241,19 +4573,26 @@ kernel void ane_hf4_down_m1_sk(
     uint  lane                        [[thread_index_in_simdgroup]],
     uint  sg                          [[simdgroup_index_in_threadgroup]]
 ) {
-    constexpr uint HID = 5120u;
-    constexpr uint DK = 2176u;
-    if (tgid.x >= 160u || tgid.z >= 8u) return;
+    const uint HID          = p.HID;
+    const uint INTER        = p.INTER;
+    const uint DK           = p.DK;
+    const uint n_q          = p.n_subblocks * 2u;
+    const uint slots_per_ch = HID >> 7;                // HID / 128
+    const uint tg_per_ch    = (slots_per_ch + 3u) >> 2; // ceil_div(slots_per_ch, 4)
+    if (tgid.x >= 16u * tg_per_ch || tgid.z >= n_q) return;
 
-    const uint ch   = tgid.x / 10u;
-    const uint slot = (tgid.x - ch * 10u) * 4u + sg;
-    const uint q    = tgid.z;
-    const uint gw   = p.hdr_words + DK;
-    const uint sb   = q >> 1;
-    const uint li   = sb * 4u + 2u + (q & 1u);
+    const uint ch   = tgid.x / tg_per_ch;
+    const uint slot = (tgid.x - ch * tg_per_ch) * 4u + sg;
+    if (slot >= slots_per_ch) return;
+
+    const uint q   = tgid.z;
+    const uint sb  = q >> 1;
+    const uint li  = sb * 4u + 2u + (q & 1u);
+    const uint hdr = p.lin_hdr_w[li];
+    const uint gw  = hdr + DK;
 
     const device uint* pw = W + (ulong)p.lin_base_w[li] + (ulong)ch * p.lin_chunk_w[li]
-                            + 16u + (ulong)slot * gw + p.hdr_words;
+                            + 16u + (ulong)slot * gw + hdr;
     const device half* xr = X + (ulong)q * DK;
 
     float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
@@ -4280,20 +4619,118 @@ kernel void ane_hf4_down_m1_sk(
 
     sx = simd_sum(sx);
     const uint go = slot * 16u + ch;
+    const uint so_down_base = 2u * INTER + q * HID;
     #pragma clang loop unroll(full)
     for (uint c = 0u; c < 8u; ++c) {
         float v = simd_sum(acc[c]);
         if (lane == 0u) {
             uint o = go * 8u + c;
-            float2 sd = SO[34816u + q * HID + o];
+            float2 sd = SO[so_down_base + o];
             partY[(ulong)q * HID + o] = (v - (sd.y - 1024.0f) * sx) * sd.x;
         }
     }
 }
 
+// Dedicated M<=4 register-vectorized Split-K down_proj from single-copy model.hwx -> partY[2*n_subblocks, M, HID]
+// Grid: (16 * ceil_div(HID / 128, 4), ceil_div(M, 4), 2 * n_subblocks), TG: (128, 1, 1)
+kernel void ane_hf4_down_sk_m4(
+    const device uint*          W     [[buffer(0)]],
+    const device float2*        SO    [[buffer(1)]],
+    const device half*          X     [[buffer(2)]],
+    device float*               partY [[buffer(3)]],
+    constant AneShareParams&    p     [[buffer(4)]],
+    uint3 tgid                        [[threadgroup_position_in_grid]],
+    uint  lane                        [[thread_index_in_simdgroup]],
+    uint  sg                          [[simdgroup_index_in_threadgroup]]
+) {
+    const uint HID   = (is_function_constant_defined(FC_ANE_HID)   && FC_ANE_HID   != 0u) ? FC_ANE_HID   : p.HID;
+    const uint INTER = (is_function_constant_defined(FC_ANE_INTER) && FC_ANE_INTER != 0u) ? FC_ANE_INTER : p.INTER;
+    const uint DK    = (is_function_constant_defined(FC_ANE_DK)    && FC_ANE_DK    != 0u) ? FC_ANE_DK    : p.DK;
+    const uint NSB   = (is_function_constant_defined(FC_ANE_NSB)   && FC_ANE_NSB   != 0u) ? FC_ANE_NSB   : p.n_subblocks;
+    const uint n_q          = NSB * 2u;
+    const uint slots_per_ch = HID >> 7;
+    const uint tg_per_ch    = (slots_per_ch + 3u) >> 2;
+    const uint m0 = tgid.y * 4u;
+    if (tgid.x >= 16u * tg_per_ch || m0 >= p.M || tgid.z >= n_q) return;
+
+    const uint ch   = tgid.x / tg_per_ch;
+    const uint slot = (tgid.x - ch * tg_per_ch) * 4u + sg;
+    if (slot >= slots_per_ch) return;
+
+    const uint q   = tgid.z;
+    const uint sb  = q >> 1;
+    const uint li  = sb * 4u + 2u + (q & 1u);
+    const uint hdr = is_function_constant_defined(FC_ANE_HDR) ? FC_ANE_HDR : p.lin_hdr_w[li];
+    const uint gw  = hdr + DK;
+
+    const device uint* pw = W + (ulong)p.lin_base_w[li] + (ulong)ch * p.lin_chunk_w[li]
+                            + 16u + (ulong)slot * gw + hdr;
+
+    const bool mok0 = (m0 + 0u) < p.M;
+    const bool mok1 = (m0 + 1u) < p.M;
+    const bool mok2 = (m0 + 2u) < p.M;
+    const bool mok3 = (m0 + 3u) < p.M;
+    const device half* xr0 = X + (ulong)(mok0 ? (m0 + 0u) : 0u) * INTER + (ulong)q * DK;
+    const device half* xr1 = X + (ulong)(mok1 ? (m0 + 1u) : 0u) * INTER + (ulong)q * DK;
+    const device half* xr2 = X + (ulong)(mok2 ? (m0 + 2u) : 0u) * INTER + (ulong)q * DK;
+    const device half* xr3 = X + (ulong)(mok3 ? (m0 + 3u) : 0u) * INTER + (ulong)q * DK;
+
+    float4 acc[8];
+    #pragma clang loop unroll(full)
+    for (uint c = 0u; c < 8u; ++c) acc[c] = float4(0.0f);
+    float4 sx = float4(0.0f);
+
+    for (uint k = lane * 4u; k < DK; k += 128u) {
+        half4 x0 = mok0 ? *(const device half4*)(xr0 + k) : half4(0.0h);
+        half4 x1 = mok1 ? *(const device half4*)(xr1 + k) : half4(0.0h);
+        half4 x2 = mok2 ? *(const device half4*)(xr2 + k) : half4(0.0h);
+        half4 x3 = mok3 ? *(const device half4*)(xr3 + k) : half4(0.0h);
+
+        uint2 u0 = *(const device uint2*)(pw + k);
+        uint2 u1 = *(const device uint2*)(pw + k + 2u);
+        uint w4[4] = {u0.x ^ 0x88888888u, u0.y ^ 0x88888888u, u1.x ^ 0x88888888u, u1.y ^ 0x88888888u};
+
+        float4 xk[4];
+        xk[0] = float4(float(x0.x), float(x1.x), float(x2.x), float(x3.x));
+        xk[1] = float4(float(x0.y), float(x1.y), float(x2.y), float(x3.y));
+        xk[2] = float4(float(x0.z), float(x1.z), float(x2.z), float(x3.z));
+        xk[3] = float4(float(x0.w), float(x1.w), float(x2.w), float(x3.w));
+        sx += (xk[0] + xk[1]) + (xk[2] + xk[3]);
+
+        #pragma clang loop unroll(full)
+        for (uint j = 0u; j < 4u; ++j) {
+            uint wv = w4[j];
+            float4 xv = xk[j];
+            #pragma clang loop unroll(full)
+            for (uint c = 0u; c < 8u; ++c) {
+                acc[c] = fma(float((wv >> (4u * c)) & 0xFu), xv, acc[c]);
+            }
+        }
+    }
+
+    float sx_r[4] = { simd_sum(sx.x), simd_sum(sx.y), simd_sum(sx.z), simd_sum(sx.w) };
+    const uint go = slot * 16u + ch;
+    const uint so_down_base = 2u * INTER + q * HID;
+    const ulong sk_stride = (ulong)p.M * HID;
+    #pragma clang loop unroll(full)
+    for (uint c = 0u; c < 8u; ++c) {
+        float v_r[4] = { simd_sum(acc[c].x), simd_sum(acc[c].y), simd_sum(acc[c].z), simd_sum(acc[c].w) };
+        if (lane == 0u) {
+            uint o = go * 8u + c;
+            float2 sd = SO[so_down_base + o];
+            float doff = sd.y - 1024.0f;
+            #pragma clang loop unroll(full)
+            for (uint r = 0u; r < 4u; ++r) {
+                if (m0 + r < p.M) {
+                    partY[(ulong)q * sk_stride + (ulong)(m0 + r) * HID + o] = (v_r[r] - doff * sx_r[r]) * sd.x;
+                }
+            }
+        }
+    }
+}
+
 // Zero-Padding 14+ TFLOPs BM=64, BN=64, BK=32 Tiled Prefill gate & up from single-copy model.hwx!
-// Maps 544 slots/sub-block into 68 EXACT 8-slot tiles (ZERO wasted tail slots!).
-// Grid: (272, ceil_div(M, 64), 2) [z=0 -> gate_out, z=1 -> up_out], TG: (128, 1, 1)
+// Grid: (n_subblocks * ceil_div(SUB/8, 8), ceil_div(M, 64), 2) [z=0 -> gate_out, z=1 -> up_out], TG: (128, 1, 1)
 kernel void ane_hf4_tiled_gateup(
     const device uint*          W        [[buffer(0)]],
     const device float2*        SO       [[buffer(1)]],
@@ -4306,16 +4743,22 @@ kernel void ane_hf4_tiled_gateup(
     uint  lane                           [[thread_index_in_simdgroup]],
     uint  sg                             [[simdgroup_index_in_threadgroup]]
 ) {
-    constexpr uint HID = 5120u;
-    constexpr uint INTER = 17408u;
-    constexpr uint NGS = 544u;
+    const uint HID   = (is_function_constant_defined(FC_ANE_HID)   && FC_ANE_HID   != 0u) ? FC_ANE_HID   : p.HID;
+    const uint INTER = (is_function_constant_defined(FC_ANE_INTER) && FC_ANE_INTER != 0u) ? FC_ANE_INTER : p.INTER;
+    const uint SUB   = (is_function_constant_defined(FC_ANE_SUB)   && FC_ANE_SUB   != 0u) ? FC_ANE_SUB   : p.SUB;
+    const uint NSB   = (is_function_constant_defined(FC_ANE_NSB)   && FC_ANE_NSB   != 0u) ? FC_ANE_NSB   : p.n_subblocks;
+    const uint NGS          = SUB >> 3;
+    const uint slots_per_ch = SUB >> 7;
+    const uint tiles_sb     = (NGS + 7u) >> 3;
+    const uint total_tiles  = NSB * tiles_sb;
     const uint m0 = tgid.y * 64u;
-    if (tgid.x >= 272u || m0 >= p.M || tgid.z >= 2u) return;
+    if (tgid.x >= total_tiles || m0 >= p.M || tgid.z >= 2u) return;
 
-    const uint sb   = tgid.x / 68u;        // 0..3
-    const uint tile = tgid.x - sb * 68u;   // 0..67 (68 * 8 = 544 exact!)
-    const uint li   = sb * 4u + tgid.z;    // 0=gate, 1=up
-    const uint gw   = p.hdr_words + HID;
+    const uint sb      = tgid.x / tiles_sb;
+    const uint tile    = tgid.x - sb * tiles_sb;
+    const uint li      = sb * 4u + tgid.z; // 0=gate, 1=up
+    const uint hdr     = is_function_constant_defined(FC_ANE_HDR) ? FC_ANE_HDR : p.lin_hdr_w[li];
+    const uint gw      = hdr + HID;
     const uint so_base = tgid.z * INTER;
 
     threadgroup half sA[64][36];
@@ -4338,20 +4781,21 @@ kernel void ane_hf4_tiled_gateup(
 
     const uint w_slot = tid >> 4;          // 0..7
     const uint w_k    = (tid & 15u) * 2u;  // 0, 2, ..., 30
-    const uint flat   = tile * 8u + w_slot; // 0..543 exact!
-    const uint ch     = flat / 34u;         // 0..15
-    const uint slot   = flat - ch * 34u;    // 0..33
+    const uint flat   = tile * 8u + w_slot;
+    const bool flat_ok = flat < NGS;
+    const uint flat_c = flat_ok ? flat : 0u;
+    const uint ch     = flat_c / slots_per_ch;
+    const uint slot   = flat_c - ch * slots_per_ch;
     const uint G_s    = sb * NGS + slot * 16u + ch;
     const device uint* w_ptr = W + (ulong)p.lin_base_w[li] + (ulong)ch * p.lin_chunk_w[li]
-                               + 16u + (ulong)slot * gw + p.hdr_words + w_k;
+                               + 16u + (ulong)slot * gw + hdr + w_k;
 
-    // Exact FP16 scale & bias after subtracting 1024.0h from ane_dq4_f16 (full 11-bit mantissa precision!)
     half sc8[8], bi8[8];
     #pragma clang loop unroll(full)
     for (uint c = 0u; c < 8u; ++c) {
         float2 so = SO[so_base + G_s * 8u + c];
-        sc8[c] = half(so.x);
-        bi8[c] = half(-(so.y - 1024.0f) * so.x);
+        sc8[c] = flat_ok ? half(so.x) : half(0.0h);
+        bi8[c] = flat_ok ? half(-(so.y - 1024.0f) * so.x) : half(0.0h);
     }
 
     for (uint k0 = 0u; k0 < HID; k0 += 32u) {
@@ -4362,7 +4806,7 @@ kernel void ane_hf4_tiled_gateup(
             da[0] = half4(0.0h); da[1] = half4(0.0h); da[2] = half4(0.0h); da[3] = half4(0.0h);
         }
 
-        uint2 u2 = *(const device uint2*)(w_ptr + k0);
+        uint2 u2 = flat_ok ? *(const device uint2*)(w_ptr + k0) : uint2(0u);
         uint ws[2] = {u2.x, u2.y};
         #pragma clang loop unroll(full)
         for (uint j = 0u; j < 2u; ++j) {
@@ -4400,11 +4844,14 @@ kernel void ane_hf4_tiled_gateup(
     uint fn  = (qid & 2u) * 2u + (lane & 1u) * 2u;
 
     uint G_out[4];
+    bool G_ok[4];
     #pragma clang loop unroll(full)
     for (uint j = 0u; j < 4u; ++j) {
         uint fo = tile * 8u + (sg_n >> 3) + j;
-        uint co = fo / 34u;
-        uint so = fo - co * 34u;
+        G_ok[j] = fo < NGS;
+        uint foc = G_ok[j] ? fo : 0u;
+        uint co = foc / slots_per_ch;
+        uint so = foc - co * slots_per_ch;
         G_out[j] = sb * NGS + so * 16u + co;
     }
 
@@ -4415,36 +4862,40 @@ kernel void ane_hf4_tiled_gateup(
             device float* yr = Y + (ulong)gm * INTER;
             #pragma clang loop unroll(full)
             for (uint j = 0u; j < 4u; ++j) {
-                *(device float2*)(yr + G_out[j] * 8u + fn) =
-                    float2(acc[i][j].thread_elements()[0], acc[i][j].thread_elements()[1]);
+                if (G_ok[j]) {
+                    *(device float2*)(yr + G_out[j] * 8u + fn) =
+                        float2(acc[i][j].thread_elements()[0], acc[i][j].thread_elements()[1]);
+                }
             }
         }
     }
 }
 
 // Zero-Padding 14+ TFLOPs BM=64, BN=64, BK=32 Single-Pass Tiled Prefill down_proj (+ residual add!)
-// Loops across all 8 sub-blocks q=0..7 inside ONE kernel -> ZERO Split-K DRAM, ZERO extra barrier!
-// Grid: (80, ceil_div(M, 64), 1), TG: (128, 1, 1)
+// Grid: (16 * ceil_div(HID/128, 8), ceil_div(M, 64), 1), TG: (128, 1, 1)
 kernel void ane_hf4_tiled_down(
     const device uint*          W  [[buffer(0)]],
     const device float2*        SO [[buffer(1)]],
-    const device half*          X  [[buffer(2)]], // [M, 17408] FP16 act
-    device float*               Y  [[buffer(3)]], // [M, 5120] FP32 hidden (+= residual)
+    const device half*          X  [[buffer(2)]], // [M, INTER] FP16 act
+    device float*               Y  [[buffer(3)]], // [M, HID] FP32 hidden (+= residual)
     constant AneShareParams&    p  [[buffer(4)]],
     uint2 tgid                     [[threadgroup_position_in_grid]],
     uint  tid                      [[thread_index_in_threadgroup]],
     uint  lane                     [[thread_index_in_simdgroup]],
     uint  sg                       [[simdgroup_index_in_threadgroup]]
 ) {
-    constexpr uint HID = 5120u;
-    constexpr uint INTER = 17408u;
-    constexpr uint DK = 2176u; // 68 * 32 exact!
+    const uint HID   = (is_function_constant_defined(FC_ANE_HID)   && FC_ANE_HID   != 0u) ? FC_ANE_HID   : p.HID;
+    const uint INTER = (is_function_constant_defined(FC_ANE_INTER) && FC_ANE_INTER != 0u) ? FC_ANE_INTER : p.INTER;
+    const uint DK    = (is_function_constant_defined(FC_ANE_DK)    && FC_ANE_DK    != 0u) ? FC_ANE_DK    : p.DK;
+    const uint NSB   = (is_function_constant_defined(FC_ANE_NSB)   && FC_ANE_NSB   != 0u) ? FC_ANE_NSB   : p.n_subblocks;
+    const uint n_q          = NSB * 2u;
+    const uint slots_per_ch = HID >> 7;
+    const uint tg_per_ch    = (slots_per_ch + 7u) >> 3;
     const uint m0 = tgid.y * 64u;
-    if (tgid.x >= 80u || m0 >= p.M) return;
+    if (tgid.x >= 16u * tg_per_ch || m0 >= p.M) return;
 
-    const uint ch    = tgid.x / 5u;             // 0..15
-    const uint slot0 = (tgid.x - ch * 5u) * 8u; // 0, 8, 16, 24, 32 (40 exact!)
-    const uint gw    = p.hdr_words + DK;
+    const uint ch    = tgid.x / tg_per_ch;
+    const uint slot0 = (tgid.x - ch * tg_per_ch) * 8u;
 
     threadgroup half sA[64][36];
     threadgroup half sB[32][68];
@@ -4464,24 +4915,29 @@ kernel void ane_hf4_tiled_down(
     const device half* x_row = X + (ulong)(gm_ok ? gm_ld : 0u) * INTER;
     threadgroup half4* da = (threadgroup half4*)(&sA[r_a][c_a]);
 
-    const uint w_slot = tid >> 4;          // 0..7
-    const uint w_k    = (tid & 15u) * 2u;  // 0, 2, ..., 30
-    const uint slot   = slot0 + w_slot;    // 0..39
-    const uint go_s   = slot * 16u + ch;   // group index in 0..639
+    const uint w_slot  = tid >> 4;          // 0..7
+    const uint w_k     = (tid & 15u) * 2u;  // 0, 2, ..., 30
+    const uint slot    = slot0 + w_slot;
+    const bool slot_ok = slot < slots_per_ch;
+    const uint slot_c  = slot_ok ? slot : 0u;
+    const uint go_s    = slot_c * 16u + ch;
 
-    for (uint q = 0u; q < 8u; ++q) {
-        const uint sb = q >> 1;
-        const uint li = sb * 4u + 2u + (q & 1u);
+    for (uint q = 0u; q < n_q; ++q) {
+        const uint sb  = q >> 1;
+        const uint li  = sb * 4u + 2u + (q & 1u);
+        const uint hdr = is_function_constant_defined(FC_ANE_HDR) ? FC_ANE_HDR : p.lin_hdr_w[li];
+        const uint gw  = hdr + DK;
         const device uint* w_ptr = W + (ulong)p.lin_base_w[li] + (ulong)ch * p.lin_chunk_w[li]
-                                   + 16u + (ulong)slot * gw + p.hdr_words + w_k;
+                                   + 16u + (ulong)slot_c * gw + hdr + w_k;
         const device half* x_base = x_row + (ulong)q * DK;
+        const uint so_down_base = 2u * INTER + q * HID;
 
         half sc8[8], bi8[8];
         #pragma clang loop unroll(full)
         for (uint c = 0u; c < 8u; ++c) {
-            float2 sd = SO[34816u + q * HID + go_s * 8u + c];
-            sc8[c] = half(sd.x);
-            bi8[c] = half(-(sd.y - 1024.0f) * sd.x);
+            float2 sd = SO[so_down_base + go_s * 8u + c];
+            sc8[c] = slot_ok ? half(sd.x) : half(0.0h);
+            bi8[c] = slot_ok ? half(-(sd.y - 1024.0f) * sd.x) : half(0.0h);
         }
 
         for (uint k0 = 0u; k0 < DK; k0 += 32u) {
@@ -4492,7 +4948,7 @@ kernel void ane_hf4_tiled_down(
                 da[0] = half4(0.0h); da[1] = half4(0.0h); da[2] = half4(0.0h); da[3] = half4(0.0h);
             }
 
-            uint2 u2 = *(const device uint2*)(w_ptr + k0);
+            uint2 u2 = slot_ok ? *(const device uint2*)(w_ptr + k0) : uint2(0u);
             uint ws[2] = {u2.x, u2.y};
             #pragma clang loop unroll(full)
             for (uint j = 0u; j < 2u; ++j) {
@@ -4536,50 +4992,427 @@ kernel void ane_hf4_tiled_down(
             device float* yr = Y + (ulong)gm * HID;
             #pragma clang loop unroll(full)
             for (uint j = 0u; j < 4u; ++j) {
-                uint go = (slot0 + (sg_n >> 3) + j) * 16u + ch;
-                device float2* yp = (device float2*)(yr + go * 8u + fn);
-                *yp = *yp + float2(acc[i][j].thread_elements()[0], acc[i][j].thread_elements()[1]);
+                uint sl_out = slot0 + (sg_n >> 3) + j;
+                if (sl_out < slots_per_ch) {
+                    uint go = sl_out * 16u + ch;
+                    device float2* yp = (device float2*)(yr + go * 8u + fn);
+                    *yp = *yp + float2(acc[i][j].thread_elements()[0], acc[i][j].thread_elements()[1]);
+                }
             }
         }
     }
 }
 
-// Split-K=8 down_proj from single-copy model.hwx -> partY[8, M, 5120] (plugs straight into sk_reduce_rmsnorm_f16!)
-// Adjacent-slot TN=4 in SAME chunk ch (35KB contiguous!), KS=8, 1-step interleaved load/MMA + uint4 on odd slots!
-// Grid: (5120 / 32 = 160, ceil_div(M, 8), 8), TG: (256, 1, 1) (8 simdgroups)
-kernel void ane_hf4_down_sk_bf16(
+// Co-Exec / Mid-Batch Fused BM=32, BN=32, BK=32 SwiGLU from single-copy model.hwx -> half Y[M, INTER]
+// Double-buffered sA/sBg/sBu (13.5 KB -> 4 TGs/core!), 128B coalesced W bursts, ZERO FP32 gate/up DRAM round-trip!
+// Grid: (n_subblocks * ceil_div(SUB/8, 4), ceil_div(M, 32), 1), TG: (128, 1, 1)
+kernel void ane_hf4_swiglu_tiled32(
+    const device uint*          W  [[buffer(0)]],
+    const device float2*        SO [[buffer(1)]],
+    const device half*          X  [[buffer(2)]],
+    device half*                Y  [[buffer(3)]],
+    constant AneShareParams&    p  [[buffer(4)]],
+    uint2 tgid                     [[threadgroup_position_in_grid]],
+    uint  tid                      [[thread_index_in_threadgroup]],
+    uint  lane                     [[thread_index_in_simdgroup]],
+    uint  sg                       [[simdgroup_index_in_threadgroup]]
+) {
+    const uint HID   = (is_function_constant_defined(FC_ANE_HID)   && FC_ANE_HID   != 0u) ? FC_ANE_HID   : p.HID;
+    const uint INTER = (is_function_constant_defined(FC_ANE_INTER) && FC_ANE_INTER != 0u) ? FC_ANE_INTER : p.INTER;
+    const uint SUB   = (is_function_constant_defined(FC_ANE_SUB)   && FC_ANE_SUB   != 0u) ? FC_ANE_SUB   : p.SUB;
+    const uint NSB   = (is_function_constant_defined(FC_ANE_NSB)   && FC_ANE_NSB   != 0u) ? FC_ANE_NSB   : p.n_subblocks;
+    const uint NGS          = SUB >> 3;
+    const uint slots_per_ch = SUB >> 7;
+    const uint tiles_sb     = (NGS + 3u) >> 2;
+    const uint total_tiles  = NSB * tiles_sb;
+    const uint m0 = tgid.y * 32u;
+    if (tgid.x >= total_tiles || m0 >= p.M || HID == 0u) return;
+
+    const uint sb    = tgid.x / tiles_sb;
+    const uint tile  = tgid.x - sb * tiles_sb;
+    const uint li_g  = sb * 4u + 0u;
+    const uint li_u  = sb * 4u + 1u;
+    const uint hdr_g = is_function_constant_defined(FC_ANE_HDR) ? FC_ANE_HDR : p.lin_hdr_w[li_g];
+    const uint hdr_u = is_function_constant_defined(FC_ANE_HDR) ? FC_ANE_HDR : p.lin_hdr_w[li_u];
+    const uint gw_g  = hdr_g + HID;
+    const uint gw_u  = hdr_u + HID;
+
+    threadgroup half sA[2][32][36];
+    threadgroup half sBg[2][32][36];
+    threadgroup half sBu[2][32][36];
+
+    simdgroup_float8x8 acc_g[2][2], acc_u[2][2];
+    #pragma clang loop unroll(full)
+    for (uint i = 0u; i < 2u; ++i)
+    #pragma clang loop unroll(full)
+    for (uint j = 0u; j < 2u; ++j) {
+        acc_g[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        acc_u[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    }
+
+    const uint sg_m  = (sg >> 1) * 16u;
+    const uint sg_n  = (sg & 1u) * 16u;
+    const uint r_a   = tid >> 2;         // 0..31
+    const uint c_a   = (tid & 3u) * 8u;  // 0, 8, 16, 24
+    const uint gm_ld = m0 + r_a;
+    const bool gm_ok = gm_ld < p.M;
+    const device half* x_base = X + (ulong)(gm_ok ? gm_ld : 0u) * HID;
+
+    const uint w_slot  = tid >> 5;       // 0..3 (1 full SG per slot -> 128B coalesced read!)
+    const uint w_k     = tid & 31u;      // 0..31
+    const uint flat    = tile * 4u + w_slot;
+    const bool flat_ok = flat < NGS;
+    const uint flat_c  = flat_ok ? flat : 0u;
+    const uint ch      = flat_c / slots_per_ch;
+    const uint slot    = flat_c - ch * slots_per_ch;
+    const uint G_s     = sb * NGS + slot * 16u + ch;
+
+    const device uint* wg_ptr = W + (ulong)p.lin_base_w[li_g] + (ulong)ch * p.lin_chunk_w[li_g]
+                                + 16u + (ulong)slot * gw_g + hdr_g + w_k;
+    const device uint* wu_ptr = W + (ulong)p.lin_base_w[li_u] + (ulong)ch * p.lin_chunk_w[li_u]
+                                + 16u + (ulong)slot * gw_u + hdr_u + w_k;
+
+    half2 sc_g[4], bi_g[4], sc_u[4], bi_u[4];
+    #pragma clang loop unroll(full)
+    for (uint c = 0u; c < 4u; ++c) {
+        float2 sog0 = SO[G_s * 8u + 2u * c + 0u];
+        float2 sog1 = SO[G_s * 8u + 2u * c + 1u];
+        float2 sou0 = SO[INTER + G_s * 8u + 2u * c + 0u];
+        float2 sou1 = SO[INTER + G_s * 8u + 2u * c + 1u];
+        sc_g[c] = flat_ok ? half2(half(sog0.x), half(sog1.x)) : half2(0.0h);
+        bi_g[c] = flat_ok ? half2(half(-(sog0.y - 1024.0f) * sog0.x), half(-(sog1.y - 1024.0f) * sog1.x)) : half2(0.0h);
+        sc_u[c] = flat_ok ? half2(half(sou0.x), half(sou1.x)) : half2(0.0h);
+        bi_u[c] = flat_ok ? half2(half(-(sou0.y - 1024.0f) * sou0.x), half(-(sou1.y - 1024.0f) * sou1.x)) : half2(0.0h);
+    }
+
+    // Prologue: load k0=0 into buf 0
+    {
+        threadgroup half4* da = (threadgroup half4*)(&sA[0][r_a][c_a]);
+        if (gm_ok) {
+            const device half4* xp = (const device half4*)(x_base + c_a);
+            da[0] = xp[0]; da[1] = xp[1];
+        } else {
+            da[0] = half4(0.0h); da[1] = half4(0.0h);
+        }
+        uint wg = (flat_ok ? wg_ptr[0] : 0u) ^ 0x88888888u;
+        uint wu = (flat_ok ? wu_ptr[0] : 0u) ^ 0x88888888u;
+        threadgroup half2* dg = (threadgroup half2*)(&sBg[0][w_k][w_slot * 8u]);
+        dg[0] = fma(ane_dq4_f16_xored(wg,  0u) - half2(1024.0h), sc_g[0], bi_g[0]);
+        dg[1] = fma(ane_dq4_f16_xored(wg,  8u) - half2(1024.0h), sc_g[1], bi_g[1]);
+        dg[2] = fma(ane_dq4_f16_xored(wg, 16u) - half2(1024.0h), sc_g[2], bi_g[2]);
+        dg[3] = fma(ane_dq4_f16_xored(wg, 24u) - half2(1024.0h), sc_g[3], bi_g[3]);
+
+        threadgroup half2* du = (threadgroup half2*)(&sBu[0][w_k][w_slot * 8u]);
+        du[0] = fma(ane_dq4_f16_xored(wu,  0u) - half2(1024.0h), sc_u[0], bi_u[0]);
+        du[1] = fma(ane_dq4_f16_xored(wu,  8u) - half2(1024.0h), sc_u[1], bi_u[1]);
+        du[2] = fma(ane_dq4_f16_xored(wu, 16u) - half2(1024.0h), sc_u[2], bi_u[2]);
+        du[3] = fma(ane_dq4_f16_xored(wu, 24u) - half2(1024.0h), sc_u[3], bi_u[3]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint k0 = 0u; k0 < HID; k0 += 32u) {
+        const uint cur = (k0 >> 5) & 1u;
+        const uint nxt = cur ^ 1u;
+        const uint k_nxt = k0 + 32u;
+        const bool has_nxt = k_nxt < HID;
+
+        half4 nx0 = half4(0.0h), nx1 = half4(0.0h);
+        uint nwg = 0u, nwu = 0u;
+        if (has_nxt) {
+            if (gm_ok) {
+                const device half4* xp = (const device half4*)(x_base + k_nxt + c_a);
+                nx0 = xp[0]; nx1 = xp[1];
+            }
+            if (flat_ok) {
+                nwg = wg_ptr[k_nxt];
+                nwu = wu_ptr[k_nxt];
+            }
+        }
+
+        #pragma clang loop unroll(full)
+        for (uint kk = 0u; kk < 32u; kk += 8u) {
+            simdgroup_half8x8 a[2], bg[2], bu[2];
+            simdgroup_load(a[0],  &sA[cur][sg_m][kk], 36);
+            simdgroup_load(a[1],  &sA[cur][sg_m + 8u][kk], 36);
+            simdgroup_load(bg[0], &sBg[cur][kk][sg_n], 36);
+            simdgroup_load(bg[1], &sBg[cur][kk][sg_n + 8u], 36);
+            simdgroup_load(bu[0], &sBu[cur][kk][sg_n], 36);
+            simdgroup_load(bu[1], &sBu[cur][kk][sg_n + 8u], 36);
+            #pragma clang loop unroll(full)
+            for (uint i = 0u; i < 2u; ++i)
+            #pragma clang loop unroll(full)
+            for (uint j = 0u; j < 2u; ++j) {
+                simdgroup_multiply_accumulate(acc_g[i][j], a[i], bg[j], acc_g[i][j]);
+                simdgroup_multiply_accumulate(acc_u[i][j], a[i], bu[j], acc_u[i][j]);
+            }
+        }
+
+        if (has_nxt) {
+            threadgroup half4* da = (threadgroup half4*)(&sA[nxt][r_a][c_a]);
+            da[0] = nx0; da[1] = nx1;
+
+            uint wg_x = nwg ^ 0x88888888u;
+            uint wu_x = nwu ^ 0x88888888u;
+            threadgroup half2* dg = (threadgroup half2*)(&sBg[nxt][w_k][w_slot * 8u]);
+            dg[0] = fma(ane_dq4_f16_xored(wg_x,  0u) - half2(1024.0h), sc_g[0], bi_g[0]);
+            dg[1] = fma(ane_dq4_f16_xored(wg_x,  8u) - half2(1024.0h), sc_g[1], bi_g[1]);
+            dg[2] = fma(ane_dq4_f16_xored(wg_x, 16u) - half2(1024.0h), sc_g[2], bi_g[2]);
+            dg[3] = fma(ane_dq4_f16_xored(wg_x, 24u) - half2(1024.0h), sc_g[3], bi_g[3]);
+
+            threadgroup half2* du = (threadgroup half2*)(&sBu[nxt][w_k][w_slot * 8u]);
+            du[0] = fma(ane_dq4_f16_xored(wu_x,  0u) - half2(1024.0h), sc_u[0], bi_u[0]);
+            du[1] = fma(ane_dq4_f16_xored(wu_x,  8u) - half2(1024.0h), sc_u[1], bi_u[1]);
+            du[2] = fma(ane_dq4_f16_xored(wu_x, 16u) - half2(1024.0h), sc_u[2], bi_u[2]);
+            du[3] = fma(ane_dq4_f16_xored(wu_x, 24u) - half2(1024.0h), sc_u[3], bi_u[3]);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    uint qid = lane >> 2;
+    uint fm  = (qid & 4u) + ((lane >> 1) & 3u);
+    uint fn  = (qid & 2u) * 2u + (lane & 1u) * 2u;
+
+    uint G_out[2];
+    bool G_ok[2];
+    #pragma clang loop unroll(full)
+    for (uint j = 0u; j < 2u; ++j) {
+        uint fo = tile * 4u + (sg_n >> 3) + j;
+        G_ok[j] = fo < NGS;
+        uint foc = G_ok[j] ? fo : 0u;
+        uint co = foc / slots_per_ch;
+        uint so = foc - co * slots_per_ch;
+        G_out[j] = sb * NGS + so * 16u + co;
+    }
+
+    #pragma clang loop unroll(full)
+    for (uint i = 0u; i < 2u; ++i) {
+        uint gm = m0 + sg_m + 8u * i + fm;
+        if (gm < p.M) {
+            device half* yr = Y + (ulong)gm * INTER;
+            #pragma clang loop unroll(full)
+            for (uint j = 0u; j < 2u; ++j) {
+                if (G_ok[j]) {
+                    float g0 = acc_g[i][j].thread_elements()[0], g1 = acc_g[i][j].thread_elements()[1];
+                    float u0 = acc_u[i][j].thread_elements()[0], u1 = acc_u[i][j].thread_elements()[1];
+                    *(device half2*)(yr + G_out[j] * 8u + fn) = half2(half(silu_f32(g0) * u0), half(silu_f32(g1) * u1));
+                }
+            }
+        }
+    }
+}
+
+// Co-Exec / Mid-Batch Split-K BM=32, BN=32, BK=32 down_proj -> partY[sk, M, HID] (sk = n_tg.z in {1,2,4,8}!)
+// Double-buffered sA/sB (9 KB -> 4+ TGs/core!), plugs straight into mma_qmm8_sk_reduce!
+// Grid: (16 * ceil_div(HID/128, 4), ceil_div(M, 32), sk), TG: (128, 1, 1)
+kernel void ane_hf4_down_tiled32_sk(
     const device uint*          W     [[buffer(0)]],
-    const device float2*        SO    [[buffer(1)]], // [34816 + q*5120 .. +5119]
-    const device half*          X     [[buffer(2)]], // [M, 17408] FP16 act
-    device float*               partY [[buffer(3)]], // [8, M, 5120] FP32
+    const device float2*        SO    [[buffer(1)]],
+    const device half*          X     [[buffer(2)]],
+    device float*               partY [[buffer(3)]],
     constant AneShareParams&    p     [[buffer(4)]],
     uint3 tgid                        [[threadgroup_position_in_grid]],
+    uint3 n_tg                        [[threadgroups_per_grid]],
+    uint  tid                         [[thread_index_in_threadgroup]],
     uint  lane                        [[thread_index_in_simdgroup]],
     uint  sg                          [[simdgroup_index_in_threadgroup]]
 ) {
-    constexpr uint HID = 5120u;
-    constexpr uint INTER = 17408u;
-    constexpr uint DK = 2176u; // 68 * 32
+    const uint HID   = (is_function_constant_defined(FC_ANE_HID)   && FC_ANE_HID   != 0u) ? FC_ANE_HID   : p.HID;
+    const uint INTER = (is_function_constant_defined(FC_ANE_INTER) && FC_ANE_INTER != 0u) ? FC_ANE_INTER : p.INTER;
+    const uint DK    = (is_function_constant_defined(FC_ANE_DK)    && FC_ANE_DK    != 0u) ? FC_ANE_DK    : p.DK;
+    const uint NSB   = (is_function_constant_defined(FC_ANE_NSB)   && FC_ANE_NSB   != 0u) ? FC_ANE_NSB   : p.n_subblocks;
+    const uint n_q          = NSB * 2u;
+    const uint slots_per_ch = HID >> 7;
+    const uint tg_per_ch    = (slots_per_ch + 3u) >> 2;
+    const uint m0 = tgid.y * 32u;
+    if (tgid.x >= 16u * tg_per_ch || m0 >= p.M || DK == 0u) return;
+
+    const uint ch    = tgid.x / tg_per_ch;
+    const uint slot0 = (tgid.x - ch * tg_per_ch) * 4u;
+    const uint sk    = max(1u, n_tg.z);
+    const uint q_per_sk = (n_q + sk - 1u) / sk;
+    const uint q_start  = tgid.z * q_per_sk;
+    const uint q_end    = min(n_q, q_start + q_per_sk);
+
+    threadgroup half sA[2][32][36];
+    threadgroup half sB[2][32][36];
+
+    simdgroup_float8x8 acc[2][2];
+    #pragma clang loop unroll(full)
+    for (uint i = 0u; i < 2u; ++i)
+    #pragma clang loop unroll(full)
+    for (uint j = 0u; j < 2u; ++j) acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    const uint sg_m  = (sg >> 1) * 16u;
+    const uint sg_n  = (sg & 1u) * 16u;
+    const uint r_a   = tid >> 2;
+    const uint c_a   = (tid & 3u) * 8u;
+    const uint gm_ld = m0 + r_a;
+    const bool gm_ok = gm_ld < p.M;
+    const device half* x_row = X + (ulong)(gm_ok ? gm_ld : 0u) * INTER;
+
+    const uint w_slot  = tid >> 5;       // 0..3
+    const uint w_k     = tid & 31u;      // 0..31
+    const uint slot    = slot0 + w_slot;
+    const bool slot_ok = slot < slots_per_ch;
+    const uint slot_c  = slot_ok ? slot : 0u;
+    const uint go_s    = slot_c * 16u + ch;
+
+    for (uint q = q_start; q < q_end; ++q) {
+        const uint sb  = q >> 1;
+        const uint li  = sb * 4u + 2u + (q & 1u);
+        const uint hdr = is_function_constant_defined(FC_ANE_HDR) ? FC_ANE_HDR : p.lin_hdr_w[li];
+        const uint gw  = hdr + DK;
+        const device uint* w_ptr = W + (ulong)p.lin_base_w[li] + (ulong)ch * p.lin_chunk_w[li]
+                                   + 16u + (ulong)slot_c * gw + hdr + w_k;
+        const device half* x_base = x_row + (ulong)q * DK;
+        const uint so_down_base = 2u * INTER + q * HID;
+
+        half2 sc8[4], bi8[4];
+        #pragma clang loop unroll(full)
+        for (uint c = 0u; c < 4u; ++c) {
+            float2 sd0 = SO[so_down_base + go_s * 8u + 2u * c + 0u];
+            float2 sd1 = SO[so_down_base + go_s * 8u + 2u * c + 1u];
+            sc8[c] = slot_ok ? half2(half(sd0.x), half(sd1.x)) : half2(0.0h);
+            bi8[c] = slot_ok ? half2(half(-(sd0.y - 1024.0f) * sd0.x), half(-(sd1.y - 1024.0f) * sd1.x)) : half2(0.0h);
+        }
+
+        // Prologue for this q: load k0=0 into buf 0
+        {
+            threadgroup half4* da = (threadgroup half4*)(&sA[0][r_a][c_a]);
+            if (gm_ok) {
+                const device half4* xp = (const device half4*)(x_base + c_a);
+                da[0] = xp[0]; da[1] = xp[1];
+            } else {
+                da[0] = half4(0.0h); da[1] = half4(0.0h);
+            }
+            uint w = (slot_ok ? w_ptr[0] : 0u) ^ 0x88888888u;
+            threadgroup half2* dst = (threadgroup half2*)(&sB[0][w_k][w_slot * 8u]);
+            dst[0] = fma(ane_dq4_f16_xored(w,  0u) - half2(1024.0h), sc8[0], bi8[0]);
+            dst[1] = fma(ane_dq4_f16_xored(w,  8u) - half2(1024.0h), sc8[1], bi8[1]);
+            dst[2] = fma(ane_dq4_f16_xored(w, 16u) - half2(1024.0h), sc8[2], bi8[2]);
+            dst[3] = fma(ane_dq4_f16_xored(w, 24u) - half2(1024.0h), sc8[3], bi8[3]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint k0 = 0u; k0 < DK; k0 += 32u) {
+            const uint cur = (k0 >> 5) & 1u;
+            const uint nxt = cur ^ 1u;
+            const uint k_nxt = k0 + 32u;
+            const bool has_nxt = k_nxt < DK;
+
+            half4 nx0 = half4(0.0h), nx1 = half4(0.0h);
+            uint nw = 0u;
+            if (has_nxt) {
+                if (gm_ok) {
+                    const device half4* xp = (const device half4*)(x_base + k_nxt + c_a);
+                    nx0 = xp[0]; nx1 = xp[1];
+                }
+                if (slot_ok) nw = w_ptr[k_nxt];
+            }
+
+            #pragma clang loop unroll(full)
+            for (uint kk = 0u; kk < 32u; kk += 8u) {
+                simdgroup_half8x8 a[2], b[2];
+                simdgroup_load(a[0], &sA[cur][sg_m][kk], 36);
+                simdgroup_load(a[1], &sA[cur][sg_m + 8u][kk], 36);
+                simdgroup_load(b[0], &sB[cur][kk][sg_n], 36);
+                simdgroup_load(b[1], &sB[cur][kk][sg_n + 8u], 36);
+                #pragma clang loop unroll(full)
+                for (uint i = 0u; i < 2u; ++i)
+                #pragma clang loop unroll(full)
+                for (uint j = 0u; j < 2u; ++j) simdgroup_multiply_accumulate(acc[i][j], a[i], b[j], acc[i][j]);
+            }
+
+            if (has_nxt) {
+                threadgroup half4* da = (threadgroup half4*)(&sA[nxt][r_a][c_a]);
+                da[0] = nx0; da[1] = nx1;
+                uint w_x = nw ^ 0x88888888u;
+                threadgroup half2* dst = (threadgroup half2*)(&sB[nxt][w_k][w_slot * 8u]);
+                dst[0] = fma(ane_dq4_f16_xored(w_x,  0u) - half2(1024.0h), sc8[0], bi8[0]);
+                dst[1] = fma(ane_dq4_f16_xored(w_x,  8u) - half2(1024.0h), sc8[1], bi8[1]);
+                dst[2] = fma(ane_dq4_f16_xored(w_x, 16u) - half2(1024.0h), sc8[2], bi8[2]);
+                dst[3] = fma(ane_dq4_f16_xored(w_x, 24u) - half2(1024.0h), sc8[3], bi8[3]);
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+        }
+        if (q + 1u < q_end) threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    uint qid = lane >> 2;
+    uint fm  = (qid & 4u) + ((lane >> 1) & 3u);
+    uint fn  = (qid & 2u) * 2u + (lane & 1u) * 2u;
+    const ulong sk_off = (ulong)tgid.z * ((ulong)p.M * HID);
+
+    #pragma clang loop unroll(full)
+    for (uint i = 0u; i < 2u; ++i) {
+        uint gm = m0 + sg_m + 8u * i + fm;
+        if (gm < p.M) {
+            device float* yr = partY + sk_off + (ulong)gm * HID;
+            #pragma clang loop unroll(full)
+            for (uint j = 0u; j < 2u; ++j) {
+                uint sl_out = slot0 + (sg_n >> 3) + j;
+                if (sl_out < slots_per_ch) {
+                    uint go = sl_out * 16u + ch;
+                    *(device float2*)(yr + go * 8u + fn) =
+                        float2(acc[i][j].thread_elements()[0], acc[i][j].thread_elements()[1]);
+                }
+            }
+        }
+    }
+}
+
+// Split-K down_proj impl templated by KS (8 for existing 256-thr ABI; 4 for 128-thr 0% SG tail waste!)
+// Direct-load zero-spill inner loop + pre-XOR + post-reduction SO epilogue + [[function_constant]]!
+template<uint KS>
+inline void ane_hf4_down_sk_impl(
+    const device uint*          W,
+    const device float2*        SO,
+    const device half*          X,
+    device float*               partY,
+    constant AneShareParams&    p,
+    threadgroup float*          red,
+    threadgroup float*          red_sx,
+    uint3 tgid,
+    uint  lane,
+    uint  sg
+) {
     constexpr uint TN = 4u;
-    constexpr uint KS = 8u;
+    const uint HID   = (is_function_constant_defined(FC_ANE_HID)   && FC_ANE_HID   != 0u) ? FC_ANE_HID   : p.HID;
+    const uint INTER = (is_function_constant_defined(FC_ANE_INTER) && FC_ANE_INTER != 0u) ? FC_ANE_INTER : p.INTER;
+    const uint DK    = (is_function_constant_defined(FC_ANE_DK)    && FC_ANE_DK    != 0u) ? FC_ANE_DK    : p.DK;
+    const uint NSB   = (is_function_constant_defined(FC_ANE_NSB)   && FC_ANE_NSB   != 0u) ? FC_ANE_NSB   : p.n_subblocks;
+    const uint n_q          = NSB * 2u;
+    const uint slots_per_ch = HID >> 7;
+    const uint total_tgx    = ((slots_per_ch + 3u) >> 2) * 16u;
 
     const uint m0 = tgid.y * 8u;
     const uint q  = tgid.z;
-    if (tgid.x >= 160u || m0 >= p.M || q >= 8u) return;
+    if (tgid.x >= total_tgx || m0 >= p.M || q >= n_q) return;
 
-    const uint slot0 = (tgid.x >> 4) * TN; // 0, 4, ..., 36 (40 slots total!)
-    const uint ch    = tgid.x & 15u;       // 0..15
-    const uint gw    = p.hdr_words + DK;
+    const uint slot0 = (tgid.x >> 4) * TN;
+    const uint ch    = tgid.x & 15u;
     const uint sb    = q >> 1;
     const uint li    = sb * 4u + 2u + (q & 1u);
+    const uint hdr   = is_function_constant_defined(FC_ANE_HDR) ? FC_ANE_HDR : p.lin_hdr_w[li];
+    const uint gw    = hdr + DK;
 
     const uint qid = lane >> 2;
     const uint fm  = (qid & 4u) + ((lane >> 1) & 3u);
     const uint fn  = (qid & 2u) * 2u + (lane & 1u) * 2u;
     const uint sh  = 4u * fn;
 
-    const device uint* pw0 = W + (ulong)p.lin_base_w[li] + (ulong)ch * p.lin_chunk_w[li]
-                             + 16u + (ulong)slot0 * gw + p.hdr_words + 4u * fm;
+    const device uint* pw_base = W + (ulong)p.lin_base_w[li] + (ulong)ch * p.lin_chunk_w[li]
+                                 + 16u + hdr + 4u * fm;
+    const uint s0 = min(slot0 + 0u, slots_per_ch - 1u);
+    const uint s1 = min(slot0 + 1u, slots_per_ch - 1u);
+    const uint s2 = min(slot0 + 2u, slots_per_ch - 1u);
+    const uint s3 = min(slot0 + 3u, slots_per_ch - 1u);
+    const device uint* pw0 = pw_base + (ulong)s0 * gw;
+    const device uint* pw1 = pw_base + (ulong)s1 * gw;
+    const device uint* pw2 = pw_base + (ulong)s2 * gw;
+    const device uint* pw3 = pw_base + (ulong)s3 * gw;
+    const bool ok_u4_1 = ((s1 & 1u) == 1u) || ((hdr & 2u) == 0u);
+    const bool ok_u4_3 = ((s3 & 1u) == 1u) || ((hdr & 2u) == 0u);
 
     const uint gm = m0 + fm;
     const bool mok = gm < p.M;
@@ -4590,7 +5423,7 @@ kernel void ane_hf4_down_sk_bf16(
     for (uint t = 0u; t < TN; ++t) C[t] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
     float sx = 0.0f;
 
-    // Strided-K across 8 simdgroups -> 1 KB lockstep DRAM burst!
+    // Strided-K across KS simdgroups -> 1 KB (KS=8) or 512B (KS=4) lockstep DRAM burst (zero spill!)
     for (uint ko = sg * 32u; ko < DK; ko += KS * 32u) {
         half4 x0 = mok ? *(const device half4*)(xr + ko + 4u * fn)      : half4(0.0h);
         half4 x1 = mok ? *(const device half4*)(xr + ko + 4u * fn + 4u) : half4(0.0h);
@@ -4604,87 +5437,1242 @@ kernel void ane_hf4_down_sk_bf16(
         Af[3].thread_elements()[0] = x0.w; Af[3].thread_elements()[1] = x1.w;
 
         const device uint* p0 = pw0 + ko;
-        const device uint* p1 = p0 + gw;
-        const device uint* p2 = p1 + gw;
-        const device uint* p3 = p2 + gw;
+        const device uint* p1 = pw1 + ko;
+        const device uint* p2 = pw2 + ko;
+        const device uint* p3 = pw3 + ko;
 
-        uint2 a0 = *(const device uint2*)(p0);
-        uint2 b0 = *(const device uint2*)(p0 + 2u);
-        uint4 w1 = (p.hdr_words == 6u) ? *(const device uint4*)(p1)
-                                       : uint4(*(const device uint2*)(p1), *(const device uint2*)(p1 + 2u));
-        {
-            uint w[4] = {a0.x, a0.y, b0.x, b0.y};
-            #pragma clang loop unroll(full)
-            for (uint qq = 0u; qq < 4u; ++qq) {
-                simdgroup_half8x8 B;
-                half2 h = ane_dq4_f16(w[qq], sh);
-                B.thread_elements()[0] = h.x; B.thread_elements()[1] = h.y;
-                simdgroup_multiply_accumulate(C[0], Af[qq], B, C[0]);
-            }
-        }
-        uint2 a2 = *(const device uint2*)(p2);
-        uint2 b2 = *(const device uint2*)(p2 + 2u);
-        {
-            uint w[4] = {w1.x, w1.y, w1.z, w1.w};
-            #pragma clang loop unroll(full)
-            for (uint qq = 0u; qq < 4u; ++qq) {
-                simdgroup_half8x8 B;
-                half2 h = ane_dq4_f16(w[qq], sh);
-                B.thread_elements()[0] = h.x; B.thread_elements()[1] = h.y;
-                simdgroup_multiply_accumulate(C[1], Af[qq], B, C[1]);
-            }
-        }
-        uint4 w3 = (p.hdr_words == 6u) ? *(const device uint4*)(p3)
-                                       : uint4(*(const device uint2*)(p3), *(const device uint2*)(p3 + 2u));
-        {
-            uint w[4] = {a2.x, a2.y, b2.x, b2.y};
-            #pragma clang loop unroll(full)
-            for (uint qq = 0u; qq < 4u; ++qq) {
-                simdgroup_half8x8 B;
-                half2 h = ane_dq4_f16(w[qq], sh);
-                B.thread_elements()[0] = h.x; B.thread_elements()[1] = h.y;
-                simdgroup_multiply_accumulate(C[2], Af[qq], B, C[2]);
-            }
-        }
-        {
-            uint w[4] = {w3.x, w3.y, w3.z, w3.w};
-            #pragma clang loop unroll(full)
-            for (uint qq = 0u; qq < 4u; ++qq) {
-                simdgroup_half8x8 B;
-                half2 h = ane_dq4_f16(w[qq], sh);
-                B.thread_elements()[0] = h.x; B.thread_elements()[1] = h.y;
-                simdgroup_multiply_accumulate(C[3], Af[qq], B, C[3]);
-            }
-        }
+        uint2 a0 = *(const device uint2*)(p0)      ^ uint2(0x88888888u);
+        uint2 b0 = *(const device uint2*)(p0 + 2u) ^ uint2(0x88888888u);
+        uint4 w1 = (ok_u4_1 ? *(const device uint4*)(p1)
+                            : uint4(*(const device uint2*)(p1), *(const device uint2*)(p1 + 2u))) ^ uint4(0x88888888u);
+        ane_hf4_mma4_xored(a0, b0, sh, Af, C[0]);
+
+        uint2 a2 = *(const device uint2*)(p2)      ^ uint2(0x88888888u);
+        uint2 b2 = *(const device uint2*)(p2 + 2u) ^ uint2(0x88888888u);
+        ane_hf4_mma4_xored(w1.xy, w1.zw, sh, Af, C[1]);
+
+        uint4 w3 = (ok_u4_3 ? *(const device uint4*)(p3)
+                            : uint4(*(const device uint2*)(p3), *(const device uint2*)(p3 + 2u))) ^ uint4(0x88888888u);
+        ane_hf4_mma4_xored(a2, b2, sh, Af, C[2]);
+        ane_hf4_mma4_xored(w3.xy, w3.zw, sh, Af, C[3]);
     }
 
     sx += simd_shuffle_xor(sx, 1);
     sx += simd_shuffle_xor(sx, 8);
 
-    threadgroup float red[KS][TN][64];
+    const uint so_down_base = 2u * INTER + q * HID;
+    if (fn == 0u) red_sx[sg * 8u + fm] = sx;
     #pragma clang loop unroll(full)
     for (uint t = 0u; t < TN; ++t) {
-        uint o = ((slot0 + t) * 16u + ch) * 8u + fn;
-        float2 sd0 = SO[34816u + q * HID + o];
-        float2 sd1 = SO[34816u + q * HID + o + 1u];
-        red[sg][t][fm * 8u + fn]      = (C[t].thread_elements()[0] - sd0.y * sx) * sd0.x;
-        red[sg][t][fm * 8u + fn + 1u] = (C[t].thread_elements()[1] - sd1.y * sx) * sd1.x;
+        red[(sg * TN + t) * 64u + fm * 8u + fn]      = C[t].thread_elements()[0];
+        red[(sg * TN + t) * 64u + fm * 8u + fn + 1u] = C[t].thread_elements()[1];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    uint e  = sg * 32u + lane; // 0..255 exact 1-to-1!
-    uint t  = e >> 6;          // 0..3
-    uint rc = e & 63u;
-    uint m  = rc >> 3;
-    uint c  = rc & 7u;
-    uint gm_out = m0 + m;
+    const uint e0 = sg * 32u + lane;
+    const uint t0 = e0 >> 6;
+    const uint rc = e0 & 63u;
+    const uint m  = rc >> 3;
+    const uint c  = rc & 7u;
+    const uint gm_out = m0 + m;
     if (gm_out < p.M) {
-        float acc = 0.0f;
+        float sx_tot = 0.0f;
         #pragma clang loop unroll(full)
-        for (uint k = 0u; k < KS; ++k) acc += red[k][t][rc];
-        uint go_out = (slot0 + t) * 16u + ch;
-        ulong sk_stride = (ulong)p.M * HID;
-        partY[(ulong)q * sk_stride + (ulong)gm_out * HID + go_out * 8u + c] = acc;
+        for (uint k = 0u; k < KS; ++k) sx_tot += red_sx[k * 8u + m];
+        const ulong sk_stride = (ulong)p.M * HID;
+        constexpr uint PASSES = 8u / KS;
+        constexpr uint T_STEP = 4u / PASSES;
+        #pragma clang loop unroll(full)
+        for (uint pass = 0u; pass < PASSES; ++pass) {
+            uint t = t0 + pass * T_STEP;
+            if ((slot0 + t) < slots_per_ch) {
+                float acc = 0.0f;
+                #pragma clang loop unroll(full)
+                for (uint k = 0u; k < KS; ++k) acc += red[(k * TN + t) * 64u + rc];
+                uint go_out = (slot0 + t) * 16u + ch;
+                uint o = go_out * 8u + c;
+                float2 sd = SO[so_down_base + o];
+                partY[(ulong)q * sk_stride + (ulong)gm_out * HID + o] = (acc - sd.y * sx_tot) * sd.x;
+            }
+        }
+    }
+}
+
+// Grid: (16 * ceil_div(HID/128, 4), ceil_div(M, 8), 2 * n_subblocks), TG: (256, 1, 1) (8 simdgroups)
+kernel void ane_hf4_down_sk_bf16(
+    const device uint*          W     [[buffer(0)]],
+    const device float2*        SO    [[buffer(1)]],
+    const device half*          X     [[buffer(2)]],
+    device float*               partY [[buffer(3)]],
+    constant AneShareParams&    p     [[buffer(4)]],
+    uint3 tgid                        [[threadgroup_position_in_grid]],
+    uint  lane                        [[thread_index_in_simdgroup]],
+    uint  sg                          [[simdgroup_index_in_threadgroup]]
+) {
+    threadgroup float red[8u * 4u * 64u];
+    threadgroup float red_sx[8u * 8u];
+    ane_hf4_down_sk_impl<8u>(W, SO, X, partY, p, red, red_sx, tgid, lane, sg);
+}
+
+// KS=4 (128 thr, 4 KB TG SRAM -> 2x occupancy + 0% SG tail waste on DK=2176!)
+// Grid: (16 * ceil_div(HID/128, 4), ceil_div(M, 8), 2 * n_subblocks), TG: (128, 1, 1) (4 simdgroups)
+kernel void ane_hf4_down_sk4_bf16(
+    const device uint*          W     [[buffer(0)]],
+    const device float2*        SO    [[buffer(1)]],
+    const device half*          X     [[buffer(2)]],
+    device float*               partY [[buffer(3)]],
+    constant AneShareParams&    p     [[buffer(4)]],
+    uint3 tgid                        [[threadgroup_position_in_grid]],
+    uint  lane                        [[thread_index_in_simdgroup]],
+    uint  sg                          [[simdgroup_index_in_threadgroup]]
+) {
+    threadgroup float red[4u * 4u * 64u];
+    threadgroup float red_sx[4u * 8u];
+    ane_hf4_down_sk_impl<4u>(W, SO, X, partY, p, red, red_sx, tgid, lane, sg);
+}
+
+// ============================================================================
+// 8b. Universal Single-Copy Non-Uniform LUT4 (NF4 / arbitrary 16-entry FP16 LUT)
+//     Reads the verified half[16] LUT directly from hwx_buf chunk header bytes [0..31]
+//     (ZERO extra buffer bindings -> exact drop-in ABI with ane_hf4_*!),
+//     expanding once per TG into a 1 KB threadgroup half2 s_lut2[256] byte-pair table
+//     for single-load 2-nibble dequant (zero simd_shuffle stalls, zero extra SRAM on M=8!).
+// ============================================================================
+
+// Grid: (INTER / 16, ceil_div(M, 8), 1), TG: (256, 1, 1)
+kernel void ane_lut4_swiglu_bf16(
+    const device uint*          W  [[buffer(0)]],
+    const device float2*        SO [[buffer(1)]], // .x = per-channel scale
+    const device half*          X  [[buffer(2)]],
+    device half*                Y  [[buffer(3)]],
+    constant AneShareParams&    p  [[buffer(4)]],
+    uint2 tgid                     [[threadgroup_position_in_grid]],
+    uint  lane                     [[thread_index_in_simdgroup]],
+    uint  sg                       [[simdgroup_index_in_threadgroup]]
+) {
+    constexpr uint KS = 8u;
+    const uint HID   = (is_function_constant_defined(FC_ANE_HID)   && FC_ANE_HID   != 0u) ? FC_ANE_HID   : p.HID;
+    const uint INTER = (is_function_constant_defined(FC_ANE_INTER) && FC_ANE_INTER != 0u) ? FC_ANE_INTER : p.INTER;
+    const uint SUB   = (is_function_constant_defined(FC_ANE_SUB)   && FC_ANE_SUB   != 0u) ? FC_ANE_SUB   : p.SUB;
+    const uint NSB   = (is_function_constant_defined(FC_ANE_NSB)   && FC_ANE_NSB   != 0u) ? FC_ANE_NSB   : p.n_subblocks;
+    const uint NGS   = SUB >> 3;
+    const uint tgs_sb = SUB >> 4;
+    const uint total_tgs = NSB * tgs_sb;
+
+    const uint m0 = tgid.y * 8u;
+    if (tgid.x >= total_tgs || m0 >= p.M) return;
+
+    const uint sb    = tgid.x / tgs_sb;
+    const uint rem   = tgid.x - sb * tgs_sb;
+    const uint slot0 = (rem >> 4) * 2u;
+    const uint ch    = rem & 15u;
+    const uint G0    = sb * NGS + slot0 * 16u + ch;
+    const uint G1    = G0 + 16u;
+
+    const uint li_g  = sb * 4u + 0u;
+    const uint li_u  = sb * 4u + 1u;
+    const uint hdr_g = is_function_constant_defined(FC_ANE_HDR) ? FC_ANE_HDR : p.lin_hdr_w[li_g];
+    const uint hdr_u = is_function_constant_defined(FC_ANE_HDR) ? FC_ANE_HDR : p.lin_hdr_w[li_u];
+    const uint gw_g  = hdr_g + HID;
+    const uint gw_u  = hdr_u + HID;
+
+    const device uint* ch_g = W + (ulong)p.lin_base_w[li_g] + (ulong)ch * p.lin_chunk_w[li_g];
+    const device uint* ch_u = W + (ulong)p.lin_base_w[li_u] + (ulong)ch * p.lin_chunk_w[li_u];
+
+    // Alias 2x1 KB byte-pair LUT tables into red_g (0 B extra SRAM -> keeps full 4 TGs/core!)
+    threadgroup float red_g[KS][2][64];
+    threadgroup float red_u[KS][2][64];
+    threadgroup half2* s_lut2_g = (threadgroup half2*)(&red_g[0][0][0]);
+    threadgroup half2* s_lut2_u = s_lut2_g + 256u;
+    {
+        const uint tid = sg * 32u + lane;
+        const device half* lg = (const device half*)ch_g;
+        const device half* lu = (const device half*)ch_u;
+        s_lut2_g[tid] = half2(lg[tid & 15u], lg[tid >> 4]);
+        s_lut2_u[tid] = half2(lu[tid & 15u], lu[tid >> 4]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint qid = lane >> 2;
+    const uint fm  = (qid & 4u) + ((lane >> 1) & 3u);
+    const uint fn  = (qid & 2u) * 2u + (lane & 1u) * 2u;
+    const uint sh  = 4u * fn;
+
+    const device uint* pg0 = ch_g + 16u + (ulong)slot0 * gw_g + hdr_g + 4u * fm;
+    const device uint* pg1 = pg0 + gw_g;
+    const device uint* pu0 = ch_u + 16u + (ulong)slot0 * gw_u + hdr_u + 4u * fm;
+    const device uint* pu1 = pu0 + gw_u;
+    const bool even_u4_g = (hdr_g & 2u) == 0u;
+    const bool even_u4_u = (hdr_u & 2u) == 0u;
+
+    const uint gm = m0 + fm;
+    const bool mok = gm < p.M;
+    const device half* xr = X + (ulong)(mok ? gm : 0u) * HID;
+
+    simdgroup_float8x8 Cg0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 Cg1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 Cu0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 Cu1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    for (uint ko = sg * 32u; ko < HID; ko += KS * 32u) {
+        half4 x0 = mok ? *(const device half4*)(xr + ko + 4u * fn)      : half4(0.0h);
+        half4 x1 = mok ? *(const device half4*)(xr + ko + 4u * fn + 4u) : half4(0.0h);
+        simdgroup_half8x8 Af[4];
+        Af[0].thread_elements()[0] = x0.x; Af[0].thread_elements()[1] = x1.x;
+        Af[1].thread_elements()[0] = x0.y; Af[1].thread_elements()[1] = x1.y;
+        Af[2].thread_elements()[0] = x0.z; Af[2].thread_elements()[1] = x1.z;
+        Af[3].thread_elements()[0] = x0.w; Af[3].thread_elements()[1] = x1.w;
+
+        uint4 w0 = even_u4_g ? *(const device uint4*)(pg0 + ko)
+                             : uint4(*(const device uint2*)(pg0 + ko), *(const device uint2*)(pg0 + ko + 2u));
+        uint4 w1 = *(const device uint4*)(pg1 + ko);
+        ane_lut4_mma4_tbl(w0.xy, w0.zw, sh, s_lut2_g, Af, Cg0);
+
+        uint4 w2 = even_u4_u ? *(const device uint4*)(pu0 + ko)
+                             : uint4(*(const device uint2*)(pu0 + ko), *(const device uint2*)(pu0 + ko + 2u));
+        ane_lut4_mma4_tbl(w1.xy, w1.zw, sh, s_lut2_g, Af, Cg1);
+
+        uint4 w3 = *(const device uint4*)(pu1 + ko);
+        ane_lut4_mma4_tbl(w2.xy, w2.zw, sh, s_lut2_u, Af, Cu0);
+        ane_lut4_mma4_tbl(w3.xy, w3.zw, sh, s_lut2_u, Af, Cu1);
+    }
+
+    // Fence s_lut2_g/u reads before reusing red_g for reduction!
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    red_g[sg][0][fm * 8u + fn]      = Cg0.thread_elements()[0];
+    red_g[sg][0][fm * 8u + fn + 1u] = Cg0.thread_elements()[1];
+    red_g[sg][1][fm * 8u + fn]      = Cg1.thread_elements()[0];
+    red_g[sg][1][fm * 8u + fn + 1u] = Cg1.thread_elements()[1];
+    red_u[sg][0][fm * 8u + fn]      = Cu0.thread_elements()[0];
+    red_u[sg][0][fm * 8u + fn + 1u] = Cu0.thread_elements()[1];
+    red_u[sg][1][fm * 8u + fn]      = Cu1.thread_elements()[0];
+    red_u[sg][1][fm * 8u + fn + 1u] = Cu1.thread_elements()[1];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint e = sg * 32u + lane;
+    if (e < 128u) {
+        uint t  = e >> 6;
+        uint rc = e & 63u;
+        uint m  = rc >> 3;
+        uint c  = rc & 7u;
+        uint gm_out = m0 + m;
+        if (gm_out < p.M) {
+            float g = 0.0f, u = 0.0f;
+            #pragma clang loop unroll(full)
+            for (uint k = 0u; k < KS; ++k) {
+                g += red_g[k][t][rc];
+                u += red_u[k][t][rc];
+            }
+            uint oc = ((t == 0u) ? G0 : G1) * 8u + c;
+            float gv = g * SO[oc].x;
+            float uv = u * SO[INTER + oc].x;
+            Y[(ulong)gm_out * INTER + oc] = half(silu_f32(gv) * uv);
+        }
+    }
+}
+
+// Grid: (16 * ceil_div(HID/128, 4), ceil_div(M, 8), 2 * n_subblocks), TG: (128, 1, 1) (KS=4, 0% SG tail waste!)
+kernel void ane_lut4_down_sk4_bf16(
+    const device uint*          W     [[buffer(0)]],
+    const device float2*        SO    [[buffer(1)]],
+    const device half*          X     [[buffer(2)]],
+    device float*               partY [[buffer(3)]],
+    constant AneShareParams&    p     [[buffer(4)]],
+    uint3 tgid                        [[threadgroup_position_in_grid]],
+    uint  lane                        [[thread_index_in_simdgroup]],
+    uint  sg                          [[simdgroup_index_in_threadgroup]]
+) {
+    constexpr uint TN = 4u;
+    constexpr uint KS = 4u;
+    const uint HID   = (is_function_constant_defined(FC_ANE_HID)   && FC_ANE_HID   != 0u) ? FC_ANE_HID   : p.HID;
+    const uint INTER = (is_function_constant_defined(FC_ANE_INTER) && FC_ANE_INTER != 0u) ? FC_ANE_INTER : p.INTER;
+    const uint DK    = (is_function_constant_defined(FC_ANE_DK)    && FC_ANE_DK    != 0u) ? FC_ANE_DK    : p.DK;
+    const uint NSB   = (is_function_constant_defined(FC_ANE_NSB)   && FC_ANE_NSB   != 0u) ? FC_ANE_NSB   : p.n_subblocks;
+    const uint n_q          = NSB * 2u;
+    const uint slots_per_ch = HID >> 7;
+    const uint total_tgx    = ((slots_per_ch + 3u) >> 2) * 16u;
+
+    const uint m0 = tgid.y * 8u;
+    const uint q  = tgid.z;
+    if (tgid.x >= total_tgx || m0 >= p.M || q >= n_q) return;
+
+    const uint slot0 = (tgid.x >> 4) * TN;
+    const uint ch    = tgid.x & 15u;
+    const uint sb    = q >> 1;
+    const uint li    = sb * 4u + 2u + (q & 1u);
+    const uint hdr   = is_function_constant_defined(FC_ANE_HDR) ? FC_ANE_HDR : p.lin_hdr_w[li];
+    const uint gw    = hdr + DK;
+
+    const device uint* chunk_base = W + (ulong)p.lin_base_w[li] + (ulong)ch * p.lin_chunk_w[li];
+
+    // Alias 1 KB byte-pair LUT table into red (0 B extra SRAM -> keeps full 8 TGs/core!)
+    threadgroup float red[KS][TN][64];
+    threadgroup half2* s_lut2 = (threadgroup half2*)(&red[0][0][0]);
+    {
+        const uint tid = sg * 32u + lane;
+        const device half* lv = (const device half*)chunk_base;
+        s_lut2[tid]        = half2(lv[tid & 15u], lv[tid >> 4]);
+        s_lut2[tid + 128u] = half2(lv[(tid + 128u) & 15u], lv[(tid + 128u) >> 4]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint qid = lane >> 2;
+    const uint fm  = (qid & 4u) + ((lane >> 1) & 3u);
+    const uint fn  = (qid & 2u) * 2u + (lane & 1u) * 2u;
+    const uint sh  = 4u * fn;
+
+    const device uint* pw_base = chunk_base + 16u + hdr + 4u * fm;
+    const uint s0 = min(slot0 + 0u, slots_per_ch - 1u);
+    const uint s1 = min(slot0 + 1u, slots_per_ch - 1u);
+    const uint s2 = min(slot0 + 2u, slots_per_ch - 1u);
+    const uint s3 = min(slot0 + 3u, slots_per_ch - 1u);
+    const device uint* pw0 = pw_base + (ulong)s0 * gw;
+    const device uint* pw1 = pw_base + (ulong)s1 * gw;
+    const device uint* pw2 = pw_base + (ulong)s2 * gw;
+    const device uint* pw3 = pw_base + (ulong)s3 * gw;
+    const bool even_u4 = (hdr & 2u) == 0u;
+    const bool ok_u4_1 = even_u4 || ((s1 & 1u) == 1u);
+    const bool ok_u4_3 = even_u4 || ((s3 & 1u) == 1u);
+
+    const uint gm = m0 + fm;
+    const bool mok = gm < p.M;
+    const device half* xr = X + (ulong)(mok ? gm : 0u) * INTER + (ulong)q * DK;
+
+    simdgroup_float8x8 C[TN];
+    #pragma clang loop unroll(full)
+    for (uint t = 0u; t < TN; ++t) C[t] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    for (uint ko = sg * 32u; ko < DK; ko += KS * 32u) {
+        half4 x0 = mok ? *(const device half4*)(xr + ko + 4u * fn)      : half4(0.0h);
+        half4 x1 = mok ? *(const device half4*)(xr + ko + 4u * fn + 4u) : half4(0.0h);
+        simdgroup_half8x8 Af[4];
+        Af[0].thread_elements()[0] = x0.x; Af[0].thread_elements()[1] = x1.x;
+        Af[1].thread_elements()[0] = x0.y; Af[1].thread_elements()[1] = x1.y;
+        Af[2].thread_elements()[0] = x0.z; Af[2].thread_elements()[1] = x1.z;
+        Af[3].thread_elements()[0] = x0.w; Af[3].thread_elements()[1] = x1.w;
+
+        const device uint* p0 = pw0 + ko;
+        const device uint* p1 = pw1 + ko;
+        const device uint* p2 = pw2 + ko;
+        const device uint* p3 = pw3 + ko;
+
+        uint4 w0 = even_u4 ? *(const device uint4*)(p0)
+                           : uint4(*(const device uint2*)(p0), *(const device uint2*)(p0 + 2u));
+        uint4 w1 = ok_u4_1 ? *(const device uint4*)(p1)
+                           : uint4(*(const device uint2*)(p1), *(const device uint2*)(p1 + 2u));
+        ane_lut4_mma4_tbl(w0.xy, w0.zw, sh, s_lut2, Af, C[0]);
+
+        uint4 w2 = even_u4 ? *(const device uint4*)(p2)
+                           : uint4(*(const device uint2*)(p2), *(const device uint2*)(p2 + 2u));
+        ane_lut4_mma4_tbl(w1.xy, w1.zw, sh, s_lut2, Af, C[1]);
+
+        uint4 w3 = ok_u4_3 ? *(const device uint4*)(p3)
+                           : uint4(*(const device uint2*)(p3), *(const device uint2*)(p3 + 2u));
+        ane_lut4_mma4_tbl(w2.xy, w2.zw, sh, s_lut2, Af, C[2]);
+        ane_lut4_mma4_tbl(w3.xy, w3.zw, sh, s_lut2, Af, C[3]);
+    }
+
+    // Fence s_lut2 reads before reusing red for reduction!
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint so_down_base = 2u * INTER + q * HID;
+    #pragma clang loop unroll(full)
+    for (uint t = 0u; t < TN; ++t) {
+        red[sg][t][fm * 8u + fn]      = C[t].thread_elements()[0];
+        red[sg][t][fm * 8u + fn + 1u] = C[t].thread_elements()[1];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint e0 = sg * 32u + lane;
+    const uint t0 = e0 >> 6;
+    const uint rc = e0 & 63u;
+    const uint m  = rc >> 3;
+    const uint c  = rc & 7u;
+    const uint gm_out = m0 + m;
+    if (gm_out < p.M) {
+        const ulong sk_stride = (ulong)p.M * HID;
+        #pragma clang loop unroll(full)
+        for (uint pass = 0u; pass < 2u; ++pass) {
+            uint t = t0 + pass * 2u;
+            if ((slot0 + t) < slots_per_ch) {
+                float acc = 0.0f;
+                #pragma clang loop unroll(full)
+                for (uint k = 0u; k < KS; ++k) acc += red[k][t][rc];
+                uint go_out = (slot0 + t) * 16u + ch;
+                uint o = go_out * 8u + c;
+                partY[(ulong)q * sk_stride + (ulong)gm_out * HID + o] = acc * SO[so_down_base + o].x;
+            }
+        }
+    }
+}
+
+// Universal LUT4 M<=4 (handles M=1..4) gate+up+SiLU -> half Y[M, INTER]
+// Grid: (ceil_div(INTER / 8, 4), ceil_div(M, 4), 1), TG: (128, 1, 1)
+kernel void ane_lut4_swiglu_m4(
+    const device uint*          W  [[buffer(0)]],
+    const device float2*        SO [[buffer(1)]],
+    const device half*          X  [[buffer(2)]],
+    device half*                Y  [[buffer(3)]],
+    constant AneShareParams&    p  [[buffer(4)]],
+    uint2 tgid                     [[threadgroup_position_in_grid]],
+    uint  lane                     [[thread_index_in_simdgroup]],
+    uint  sg                       [[simdgroup_index_in_threadgroup]]
+) {
+    const uint HID   = (is_function_constant_defined(FC_ANE_HID)   && FC_ANE_HID   != 0u) ? FC_ANE_HID   : p.HID;
+    const uint INTER = (is_function_constant_defined(FC_ANE_INTER) && FC_ANE_INTER != 0u) ? FC_ANE_INTER : p.INTER;
+    const uint SUB   = (is_function_constant_defined(FC_ANE_SUB)   && FC_ANE_SUB   != 0u) ? FC_ANE_SUB   : p.SUB;
+    const uint NSB   = (is_function_constant_defined(FC_ANE_NSB)   && FC_ANE_NSB   != 0u) ? FC_ANE_NSB   : p.n_subblocks;
+    const uint NGS          = SUB >> 3;
+    const uint slots_per_ch = SUB >> 7;
+    const uint total_g      = NSB * NGS;
+    const uint m0   = tgid.y * 4u;
+    if (tgid.x * 4u >= total_g || m0 >= p.M) return;
+
+    // SUB % 256 == 0 => NGS % 32 == 0 => all 4 simdgroups in this TG share identical sb!
+    const uint sb_tg = (tgid.x * 4u) / NGS;
+    const uint li_g  = sb_tg * 4u + 0u;
+    const uint li_u  = sb_tg * 4u + 1u;
+
+    threadgroup half2 s_lut2_g[256];
+    threadgroup half2 s_lut2_u[256];
+    {
+        const uint tid = sg * 32u + lane;
+        const device half* lg = (const device half*)(W + (ulong)p.lin_base_w[li_g]);
+        const device half* lu = (const device half*)(W + (ulong)p.lin_base_w[li_u]);
+        s_lut2_g[tid]        = half2(lg[tid & 15u], lg[tid >> 4]);
+        s_lut2_g[tid + 128u] = half2(lg[(tid + 128u) & 15u], lg[(tid + 128u) >> 4]);
+        s_lut2_u[tid]        = half2(lu[tid & 15u], lu[tid >> 4]);
+        s_lut2_u[tid + 128u] = half2(lu[(tid + 128u) & 15u], lu[(tid + 128u) >> 4]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint gidx = tgid.x * 4u + sg;
+    if (gidx >= total_g) return;
+
+    const uint rem   = gidx - sb_tg * NGS;
+    const uint ch    = rem / slots_per_ch;
+    const uint slot  = rem - ch * slots_per_ch;
+    const uint G0    = sb_tg * NGS + slot * 16u + ch;
+
+    const uint hdr_g = is_function_constant_defined(FC_ANE_HDR) ? FC_ANE_HDR : p.lin_hdr_w[li_g];
+    const uint hdr_u = is_function_constant_defined(FC_ANE_HDR) ? FC_ANE_HDR : p.lin_hdr_w[li_u];
+    const uint gw_g  = hdr_g + HID;
+    const uint gw_u  = hdr_u + HID;
+
+    const device uint* ch_g = W + (ulong)p.lin_base_w[li_g] + (ulong)ch * p.lin_chunk_w[li_g];
+    const device uint* ch_u = W + (ulong)p.lin_base_w[li_u] + (ulong)ch * p.lin_chunk_w[li_u];
+    const device uint* pg = ch_g + 16u + (ulong)slot * gw_g + hdr_g;
+    const device uint* pu = ch_u + 16u + (ulong)slot * gw_u + hdr_u;
+
+    const bool mok0 = (m0 + 0u) < p.M;
+    const bool mok1 = (m0 + 1u) < p.M;
+    const bool mok2 = (m0 + 2u) < p.M;
+    const bool mok3 = (m0 + 3u) < p.M;
+    const device half* xr0 = X + (ulong)(mok0 ? (m0 + 0u) : 0u) * HID;
+    const device half* xr1 = X + (ulong)(mok1 ? (m0 + 1u) : 0u) * HID;
+    const device half* xr2 = X + (ulong)(mok2 ? (m0 + 2u) : 0u) * HID;
+    const device half* xr3 = X + (ulong)(mok3 ? (m0 + 3u) : 0u) * HID;
+
+    float4 ag[8], au[8];
+    #pragma clang loop unroll(full)
+    for (uint c = 0u; c < 8u; ++c) { ag[c] = float4(0.0f); au[c] = float4(0.0f); }
+
+    for (uint k = lane * 4u; k < HID; k += 128u) {
+        half4 x0 = mok0 ? *(const device half4*)(xr0 + k) : half4(0.0h);
+        half4 x1 = mok1 ? *(const device half4*)(xr1 + k) : half4(0.0h);
+        half4 x2 = mok2 ? *(const device half4*)(xr2 + k) : half4(0.0h);
+        half4 x3 = mok3 ? *(const device half4*)(xr3 + k) : half4(0.0h);
+
+        uint2 g0 = *(const device uint2*)(pg + k);
+        uint2 g1 = *(const device uint2*)(pg + k + 2u);
+        uint2 u0 = *(const device uint2*)(pu + k);
+        uint2 u1 = *(const device uint2*)(pu + k + 2u);
+        uint gw4[4] = {g0.x, g0.y, g1.x, g1.y};
+        uint uw4[4] = {u0.x, u0.y, u1.x, u1.y};
+
+        float4 xk[4];
+        xk[0] = float4(float(x0.x), float(x1.x), float(x2.x), float(x3.x));
+        xk[1] = float4(float(x0.y), float(x1.y), float(x2.y), float(x3.y));
+        xk[2] = float4(float(x0.z), float(x1.z), float(x2.z), float(x3.z));
+        xk[3] = float4(float(x0.w), float(x1.w), float(x2.w), float(x3.w));
+
+        #pragma clang loop unroll(full)
+        for (uint j = 0u; j < 4u; ++j) {
+            uint gv = gw4[j], uv = uw4[j];
+            float4 xv = xk[j];
+            #pragma clang loop unroll(full)
+            for (uint cp = 0u; cp < 4u; ++cp) {
+                half2 wg2 = s_lut2_g[(gv >> (8u * cp)) & 0xFFu];
+                half2 wu2 = s_lut2_u[(uv >> (8u * cp)) & 0xFFu];
+                ag[2u * cp + 0u] = fma(float(wg2.x), xv, ag[2u * cp + 0u]);
+                ag[2u * cp + 1u] = fma(float(wg2.y), xv, ag[2u * cp + 1u]);
+                au[2u * cp + 0u] = fma(float(wu2.x), xv, au[2u * cp + 0u]);
+                au[2u * cp + 1u] = fma(float(wu2.y), xv, au[2u * cp + 1u]);
+            }
+        }
+    }
+
+    #pragma clang loop unroll(full)
+    for (uint c = 0u; c < 8u; ++c) {
+        float g_r[4] = { simd_sum(ag[c].x), simd_sum(ag[c].y), simd_sum(ag[c].z), simd_sum(ag[c].w) };
+        float u_r[4] = { simd_sum(au[c].x), simd_sum(au[c].y), simd_sum(au[c].z), simd_sum(au[c].w) };
+        if (lane == 0u) {
+            uint oc = G0 * 8u + c;
+            float sc_g = SO[oc].x;
+            float sc_u = SO[INTER + oc].x;
+            #pragma clang loop unroll(full)
+            for (uint r = 0u; r < 4u; ++r) {
+                if (m0 + r < p.M) {
+                    Y[(ulong)(m0 + r) * INTER + oc] = half(silu_f32(g_r[r] * sc_g) * (u_r[r] * sc_u));
+                }
+            }
+        }
+    }
+}
+
+// Universal LUT4 M<=4 (handles M=1..4) Split-K down_proj -> partY[2*n_subblocks, M, HID]
+// Grid: (16 * ceil_div(HID / 128, 4), ceil_div(M, 4), 2 * n_subblocks), TG: (128, 1, 1)
+kernel void ane_lut4_down_sk_m4(
+    const device uint*          W     [[buffer(0)]],
+    const device float2*        SO    [[buffer(1)]],
+    const device half*          X     [[buffer(2)]],
+    device float*               partY [[buffer(3)]],
+    constant AneShareParams&    p     [[buffer(4)]],
+    uint3 tgid                        [[threadgroup_position_in_grid]],
+    uint  lane                        [[thread_index_in_simdgroup]],
+    uint  sg                          [[simdgroup_index_in_threadgroup]]
+) {
+    const uint HID   = (is_function_constant_defined(FC_ANE_HID)   && FC_ANE_HID   != 0u) ? FC_ANE_HID   : p.HID;
+    const uint INTER = (is_function_constant_defined(FC_ANE_INTER) && FC_ANE_INTER != 0u) ? FC_ANE_INTER : p.INTER;
+    const uint DK    = (is_function_constant_defined(FC_ANE_DK)    && FC_ANE_DK    != 0u) ? FC_ANE_DK    : p.DK;
+    const uint NSB   = (is_function_constant_defined(FC_ANE_NSB)   && FC_ANE_NSB   != 0u) ? FC_ANE_NSB   : p.n_subblocks;
+    const uint n_q          = NSB * 2u;
+    const uint slots_per_ch = HID >> 7;
+    const uint tg_per_ch    = (slots_per_ch + 3u) >> 2;
+    const uint m0 = tgid.y * 4u;
+    if (tgid.x >= 16u * tg_per_ch || m0 >= p.M || tgid.z >= n_q) return;
+
+    const uint ch  = tgid.x / tg_per_ch;
+    const uint q   = tgid.z;
+    const uint sb  = q >> 1;
+    const uint li  = sb * 4u + 2u + (q & 1u);
+    const device uint* chunk_base = W + (ulong)p.lin_base_w[li] + (ulong)ch * p.lin_chunk_w[li];
+
+    // Load 1 KB byte-pair LUT BEFORE non-uniform slot early-return (barrier-safe!)
+    threadgroup half2 s_lut2[256];
+    {
+        const uint tid = sg * 32u + lane;
+        const device half* lv = (const device half*)chunk_base;
+        s_lut2[tid]        = half2(lv[tid & 15u], lv[tid >> 4]);
+        s_lut2[tid + 128u] = half2(lv[(tid + 128u) & 15u], lv[(tid + 128u) >> 4]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint slot = (tgid.x - ch * tg_per_ch) * 4u + sg;
+    if (slot >= slots_per_ch) return;
+
+    const uint hdr = is_function_constant_defined(FC_ANE_HDR) ? FC_ANE_HDR : p.lin_hdr_w[li];
+    const uint gw  = hdr + DK;
+    const device uint* pw = chunk_base + 16u + (ulong)slot * gw + hdr;
+
+    const bool mok0 = (m0 + 0u) < p.M;
+    const bool mok1 = (m0 + 1u) < p.M;
+    const bool mok2 = (m0 + 2u) < p.M;
+    const bool mok3 = (m0 + 3u) < p.M;
+    const device half* xr0 = X + (ulong)(mok0 ? (m0 + 0u) : 0u) * INTER + (ulong)q * DK;
+    const device half* xr1 = X + (ulong)(mok1 ? (m0 + 1u) : 0u) * INTER + (ulong)q * DK;
+    const device half* xr2 = X + (ulong)(mok2 ? (m0 + 2u) : 0u) * INTER + (ulong)q * DK;
+    const device half* xr3 = X + (ulong)(mok3 ? (m0 + 3u) : 0u) * INTER + (ulong)q * DK;
+
+    float4 acc[8];
+    #pragma clang loop unroll(full)
+    for (uint c = 0u; c < 8u; ++c) acc[c] = float4(0.0f);
+
+    for (uint k = lane * 4u; k < DK; k += 128u) {
+        half4 x0 = mok0 ? *(const device half4*)(xr0 + k) : half4(0.0h);
+        half4 x1 = mok1 ? *(const device half4*)(xr1 + k) : half4(0.0h);
+        half4 x2 = mok2 ? *(const device half4*)(xr2 + k) : half4(0.0h);
+        half4 x3 = mok3 ? *(const device half4*)(xr3 + k) : half4(0.0h);
+
+        uint2 u0 = *(const device uint2*)(pw + k);
+        uint2 u1 = *(const device uint2*)(pw + k + 2u);
+        uint w4[4] = {u0.x, u0.y, u1.x, u1.y};
+
+        float4 xk[4];
+        xk[0] = float4(float(x0.x), float(x1.x), float(x2.x), float(x3.x));
+        xk[1] = float4(float(x0.y), float(x1.y), float(x2.y), float(x3.y));
+        xk[2] = float4(float(x0.z), float(x1.z), float(x2.z), float(x3.z));
+        xk[3] = float4(float(x0.w), float(x1.w), float(x2.w), float(x3.w));
+
+        #pragma clang loop unroll(full)
+        for (uint j = 0u; j < 4u; ++j) {
+            uint wv = w4[j];
+            float4 xv = xk[j];
+            #pragma clang loop unroll(full)
+            for (uint cp = 0u; cp < 4u; ++cp) {
+                half2 ww2 = s_lut2[(wv >> (8u * cp)) & 0xFFu];
+                acc[2u * cp + 0u] = fma(float(ww2.x), xv, acc[2u * cp + 0u]);
+                acc[2u * cp + 1u] = fma(float(ww2.y), xv, acc[2u * cp + 1u]);
+            }
+        }
+    }
+
+    const uint go = slot * 16u + ch;
+    const uint so_down_base = 2u * INTER + q * HID;
+    const ulong sk_stride = (ulong)p.M * HID;
+    #pragma clang loop unroll(full)
+    for (uint c = 0u; c < 8u; ++c) {
+        float v_r[4] = { simd_sum(acc[c].x), simd_sum(acc[c].y), simd_sum(acc[c].z), simd_sum(acc[c].w) };
+        if (lane == 0u) {
+            uint o = go * 8u + c;
+            float sc_d = SO[so_down_base + o].x;
+            #pragma clang loop unroll(full)
+            for (uint r = 0u; r < 4u; ++r) {
+                if (m0 + r < p.M) {
+                    partY[(ulong)q * sk_stride + (ulong)(m0 + r) * HID + o] = v_r[r] * sc_d;
+                }
+            }
+        }
+    }
+}
+
+// Universal LUT4 BM=64, BN=64, BK=32 Tiled Prefill gate & up
+// Grid: (n_subblocks * ceil_div(SUB/8, 8), ceil_div(M, 64), 2), TG: (128, 1, 1)
+kernel void ane_lut4_tiled_gateup(
+    const device uint*          W        [[buffer(0)]],
+    const device float2*        SO       [[buffer(1)]],
+    const device half*          X        [[buffer(2)]],
+    device float*               gate_out [[buffer(3)]],
+    device float*               up_out   [[buffer(4)]],
+    constant AneShareParams&    p        [[buffer(5)]],
+    uint3 tgid                           [[threadgroup_position_in_grid]],
+    uint  tid                            [[thread_index_in_threadgroup]],
+    uint  lane                           [[thread_index_in_simdgroup]],
+    uint  sg                             [[simdgroup_index_in_threadgroup]]
+) {
+    const uint HID   = (is_function_constant_defined(FC_ANE_HID)   && FC_ANE_HID   != 0u) ? FC_ANE_HID   : p.HID;
+    const uint INTER = (is_function_constant_defined(FC_ANE_INTER) && FC_ANE_INTER != 0u) ? FC_ANE_INTER : p.INTER;
+    const uint SUB   = (is_function_constant_defined(FC_ANE_SUB)   && FC_ANE_SUB   != 0u) ? FC_ANE_SUB   : p.SUB;
+    const uint NSB   = (is_function_constant_defined(FC_ANE_NSB)   && FC_ANE_NSB   != 0u) ? FC_ANE_NSB   : p.n_subblocks;
+    const uint NGS          = SUB >> 3;
+    const uint slots_per_ch = SUB >> 7;
+    const uint tiles_sb     = (NGS + 7u) >> 3;
+    const uint total_tiles  = NSB * tiles_sb;
+    const uint m0 = tgid.y * 64u;
+    if (tgid.x >= total_tiles || m0 >= p.M || tgid.z >= 2u) return;
+
+    const uint sb      = tgid.x / tiles_sb;
+    const uint tile    = tgid.x - sb * tiles_sb;
+    const uint li      = sb * 4u + tgid.z;
+    const uint hdr     = is_function_constant_defined(FC_ANE_HDR) ? FC_ANE_HDR : p.lin_hdr_w[li];
+    const uint gw      = hdr + HID;
+    const uint so_base = tgid.z * INTER;
+
+    threadgroup half  sA[64][36];
+    threadgroup half  sB[32][68];
+    threadgroup half2 s_lut2[256]; // 1 KB -> 9.75 KB total (3 TGs/core unchanged!)
+    {
+        const device half* lv = (const device half*)(W + (ulong)p.lin_base_w[li]);
+        s_lut2[tid]        = half2(lv[tid & 15u], lv[tid >> 4]);
+        s_lut2[tid + 128u] = half2(lv[(tid + 128u) & 15u], lv[(tid + 128u) >> 4]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    simdgroup_float8x8 acc[4][4];
+    #pragma clang loop unroll(full)
+    for (uint i = 0u; i < 4u; ++i)
+    #pragma clang loop unroll(full)
+    for (uint j = 0u; j < 4u; ++j) acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    const uint sg_m = (sg >> 1) * 32u;
+    const uint sg_n = (sg & 1u) * 32u;
+    const uint r_a  = tid >> 1;
+    const uint c_a  = (tid & 1u) * 16u;
+    const uint gm_ld = m0 + r_a;
+    const bool gm_ok = gm_ld < p.M;
+    const device half* x_base = X + (ulong)(gm_ok ? gm_ld : 0u) * HID;
+    threadgroup half4* da = (threadgroup half4*)(&sA[r_a][c_a]);
+
+    const uint w_slot = tid >> 4;
+    const uint w_k    = (tid & 15u) * 2u;
+    const uint flat   = tile * 8u + w_slot;
+    const bool flat_ok = flat < NGS;
+    const uint flat_c = flat_ok ? flat : 0u;
+    const uint ch     = flat_c / slots_per_ch;
+    const uint slot   = flat_c - ch * slots_per_ch;
+    const uint G_s    = sb * NGS + slot * 16u + ch;
+    const device uint* w_ptr = W + (ulong)p.lin_base_w[li] + (ulong)ch * p.lin_chunk_w[li]
+                               + 16u + (ulong)slot * gw + hdr + w_k;
+
+    half2 sc2[4];
+    #pragma clang loop unroll(full)
+    for (uint c = 0u; c < 4u; ++c) {
+        sc2[c] = flat_ok ? half2(half(SO[so_base + G_s * 8u + 2u * c + 0u].x),
+                                 half(SO[so_base + G_s * 8u + 2u * c + 1u].x)) : half2(0.0h);
+    }
+
+    for (uint k0 = 0u; k0 < HID; k0 += 32u) {
+        if (gm_ok) {
+            const device half4* xp = (const device half4*)(x_base + k0 + c_a);
+            da[0] = xp[0]; da[1] = xp[1]; da[2] = xp[2]; da[3] = xp[3];
+        } else {
+            da[0] = half4(0.0h); da[1] = half4(0.0h); da[2] = half4(0.0h); da[3] = half4(0.0h);
+        }
+
+        uint2 u2 = flat_ok ? *(const device uint2*)(w_ptr + k0) : uint2(0u);
+        uint ws[2] = {u2.x, u2.y};
+        #pragma clang loop unroll(full)
+        for (uint j = 0u; j < 2u; ++j) {
+            uint w = ws[j];
+            threadgroup half2* dst = (threadgroup half2*)(&sB[w_k + j][w_slot * 8u]);
+            dst[0] = s_lut2[(w >>  0u) & 0xFFu] * sc2[0];
+            dst[1] = s_lut2[(w >>  8u) & 0xFFu] * sc2[1];
+            dst[2] = s_lut2[(w >> 16u) & 0xFFu] * sc2[2];
+            dst[3] = s_lut2[(w >> 24u) & 0xFFu] * sc2[3];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        #pragma clang loop unroll(full)
+        for (uint kk = 0u; kk < 32u; kk += 8u) {
+            simdgroup_half8x8 a[4], b[4];
+            #pragma clang loop unroll(full)
+            for (uint i = 0u; i < 4u; ++i) simdgroup_load(a[i], &sA[sg_m + 8u * i][kk], 36);
+            #pragma clang loop unroll(full)
+            for (uint j = 0u; j < 4u; ++j) simdgroup_load(b[j], &sB[kk][sg_n + 8u * j], 68);
+            #pragma clang loop unroll(full)
+            for (uint i = 0u; i < 4u; ++i)
+            #pragma clang loop unroll(full)
+            for (uint j = 0u; j < 4u; ++j) simdgroup_multiply_accumulate(acc[i][j], a[i], b[j], acc[i][j]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    device float* Y = (tgid.z == 0u) ? gate_out : up_out;
+    uint qid = lane >> 2;
+    uint fm  = (qid & 4u) + ((lane >> 1) & 3u);
+    uint fn  = (qid & 2u) * 2u + (lane & 1u) * 2u;
+
+    uint G_out[4];
+    bool G_ok[4];
+    #pragma clang loop unroll(full)
+    for (uint j = 0u; j < 4u; ++j) {
+        uint fo = tile * 8u + (sg_n >> 3) + j;
+        G_ok[j] = fo < NGS;
+        uint foc = G_ok[j] ? fo : 0u;
+        uint co = foc / slots_per_ch;
+        uint so = foc - co * slots_per_ch;
+        G_out[j] = sb * NGS + so * 16u + co;
+    }
+
+    #pragma clang loop unroll(full)
+    for (uint i = 0u; i < 4u; ++i) {
+        uint gm = m0 + sg_m + 8u * i + fm;
+        if (gm < p.M) {
+            device float* yr = Y + (ulong)gm * INTER;
+            #pragma clang loop unroll(full)
+            for (uint j = 0u; j < 4u; ++j) {
+                if (G_ok[j]) {
+                    *(device float2*)(yr + G_out[j] * 8u + fn) =
+                        float2(acc[i][j].thread_elements()[0], acc[i][j].thread_elements()[1]);
+                }
+            }
+        }
+    }
+}
+
+// Universal LUT4 BM=64, BN=64, BK=32 Single-Pass Tiled Prefill down_proj (+ residual add!)
+// Grid: (16 * ceil_div(HID/128, 8), ceil_div(M, 64), 1), TG: (128, 1, 1)
+kernel void ane_lut4_tiled_down(
+    const device uint*          W  [[buffer(0)]],
+    const device float2*        SO [[buffer(1)]],
+    const device half*          X  [[buffer(2)]],
+    device float*               Y  [[buffer(3)]],
+    constant AneShareParams&    p  [[buffer(4)]],
+    uint2 tgid                     [[threadgroup_position_in_grid]],
+    uint  tid                      [[thread_index_in_threadgroup]],
+    uint  lane                     [[thread_index_in_simdgroup]],
+    uint  sg                       [[simdgroup_index_in_threadgroup]]
+) {
+    const uint HID   = (is_function_constant_defined(FC_ANE_HID)   && FC_ANE_HID   != 0u) ? FC_ANE_HID   : p.HID;
+    const uint INTER = (is_function_constant_defined(FC_ANE_INTER) && FC_ANE_INTER != 0u) ? FC_ANE_INTER : p.INTER;
+    const uint DK    = (is_function_constant_defined(FC_ANE_DK)    && FC_ANE_DK    != 0u) ? FC_ANE_DK    : p.DK;
+    const uint NSB   = (is_function_constant_defined(FC_ANE_NSB)   && FC_ANE_NSB   != 0u) ? FC_ANE_NSB   : p.n_subblocks;
+    const uint n_q          = NSB * 2u;
+    const uint slots_per_ch = HID >> 7;
+    const uint tg_per_ch    = (slots_per_ch + 7u) >> 3;
+    const uint m0 = tgid.y * 64u;
+    if (tgid.x >= 16u * tg_per_ch || m0 >= p.M) return;
+
+    const uint ch    = tgid.x / tg_per_ch;
+    const uint slot0 = (tgid.x - ch * tg_per_ch) * 8u;
+
+    threadgroup half  sA[64][36];
+    threadgroup half  sB[32][68];
+    threadgroup half2 s_lut2[256]; // 1 KB -> 9.75 KB total (3 TGs/core unchanged!)
+
+    simdgroup_float8x8 acc[4][4];
+    #pragma clang loop unroll(full)
+    for (uint i = 0u; i < 4u; ++i)
+    #pragma clang loop unroll(full)
+    for (uint j = 0u; j < 4u; ++j) acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    const uint sg_m  = (sg >> 1) * 32u;
+    const uint sg_n  = (sg & 1u) * 32u;
+    const uint r_a   = tid >> 1;
+    const uint c_a   = (tid & 1u) * 16u;
+    const uint gm_ld = m0 + r_a;
+    const bool gm_ok = gm_ld < p.M;
+    const device half* x_row = X + (ulong)(gm_ok ? gm_ld : 0u) * INTER;
+    threadgroup half4* da = (threadgroup half4*)(&sA[r_a][c_a]);
+
+    const uint w_slot  = tid >> 4;
+    const uint w_k     = (tid & 15u) * 2u;
+    const uint slot    = slot0 + w_slot;
+    const bool slot_ok = slot < slots_per_ch;
+    const uint slot_c  = slot_ok ? slot : 0u;
+    const uint go_s    = slot_c * 16u + ch;
+
+    for (uint q = 0u; q < n_q; ++q) {
+        const uint sb  = q >> 1;
+        const uint li  = sb * 4u + 2u + (q & 1u);
+        const uint hdr = is_function_constant_defined(FC_ANE_HDR) ? FC_ANE_HDR : p.lin_hdr_w[li];
+        const uint gw  = hdr + DK;
+        const device uint* chunk_base = W + (ulong)p.lin_base_w[li] + (ulong)ch * p.lin_chunk_w[li];
+        {
+            const device half* lv = (const device half*)chunk_base;
+            s_lut2[tid]        = half2(lv[tid & 15u], lv[tid >> 4]);
+            s_lut2[tid + 128u] = half2(lv[(tid + 128u) & 15u], lv[(tid + 128u) >> 4]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const device uint* w_ptr = chunk_base + 16u + (ulong)slot_c * gw + hdr + w_k;
+        const device half* x_base = x_row + (ulong)q * DK;
+        const uint so_down_base = 2u * INTER + q * HID;
+
+        half2 sc2[4];
+        #pragma clang loop unroll(full)
+        for (uint c = 0u; c < 4u; ++c) {
+            sc2[c] = slot_ok ? half2(half(SO[so_down_base + go_s * 8u + 2u * c + 0u].x),
+                                     half(SO[so_down_base + go_s * 8u + 2u * c + 1u].x)) : half2(0.0h);
+        }
+
+        for (uint k0 = 0u; k0 < DK; k0 += 32u) {
+            if (gm_ok) {
+                const device half4* xp = (const device half4*)(x_base + k0 + c_a);
+                da[0] = xp[0]; da[1] = xp[1]; da[2] = xp[2]; da[3] = xp[3];
+            } else {
+                da[0] = half4(0.0h); da[1] = half4(0.0h); da[2] = half4(0.0h); da[3] = half4(0.0h);
+            }
+
+            uint2 u2 = slot_ok ? *(const device uint2*)(w_ptr + k0) : uint2(0u);
+            uint ws[2] = {u2.x, u2.y};
+            #pragma clang loop unroll(full)
+            for (uint j = 0u; j < 2u; ++j) {
+                uint w = ws[j];
+                threadgroup half2* dst = (threadgroup half2*)(&sB[w_k + j][w_slot * 8u]);
+                dst[0] = s_lut2[(w >>  0u) & 0xFFu] * sc2[0];
+                dst[1] = s_lut2[(w >>  8u) & 0xFFu] * sc2[1];
+                dst[2] = s_lut2[(w >> 16u) & 0xFFu] * sc2[2];
+                dst[3] = s_lut2[(w >> 24u) & 0xFFu] * sc2[3];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            #pragma clang loop unroll(full)
+            for (uint kk = 0u; kk < 32u; kk += 8u) {
+                simdgroup_half8x8 a[4], b[4];
+                #pragma clang loop unroll(full)
+                for (uint i = 0u; i < 4u; ++i) simdgroup_load(a[i], &sA[sg_m + 8u * i][kk], 36);
+                #pragma clang loop unroll(full)
+                for (uint j = 0u; j < 4u; ++j) simdgroup_load(b[j], &sB[kk][sg_n + 8u * j], 68);
+                #pragma clang loop unroll(full)
+                for (uint i = 0u; i < 4u; ++i)
+                #pragma clang loop unroll(full)
+                for (uint j = 0u; j < 4u; ++j) simdgroup_multiply_accumulate(acc[i][j], a[i], b[j], acc[i][j]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    uint qid = lane >> 2;
+    uint fm  = (qid & 4u) + ((lane >> 1) & 3u);
+    uint fn  = (qid & 2u) * 2u + (lane & 1u) * 2u;
+
+    #pragma clang loop unroll(full)
+    for (uint i = 0u; i < 4u; ++i) {
+        uint gm = m0 + sg_m + 8u * i + fm;
+        if (gm < p.M) {
+            device float* yr = Y + (ulong)gm * HID;
+            #pragma clang loop unroll(full)
+            for (uint j = 0u; j < 4u; ++j) {
+                uint sl_out = slot0 + (sg_n >> 3) + j;
+                if (sl_out < slots_per_ch) {
+                    uint go = sl_out * 16u + ch;
+                    device float2* yp = (device float2*)(yr + go * 8u + fn);
+                    *yp = *yp + float2(acc[i][j].thread_elements()[0], acc[i][j].thread_elements()[1]);
+                }
+            }
+        }
+    }
+}
+
+// Universal LUT4 Co-Exec Fused BM=32, BN=32, BK=32 SwiGLU -> half Y[M, INTER]
+// Grid: (n_subblocks * ceil_div(SUB/8, 4), ceil_div(M, 32), 1), TG: (128, 1, 1)
+kernel void ane_lut4_swiglu_tiled32(
+    const device uint*          W  [[buffer(0)]],
+    const device float2*        SO [[buffer(1)]],
+    const device half*          X  [[buffer(2)]],
+    device half*                Y  [[buffer(3)]],
+    constant AneShareParams&    p  [[buffer(4)]],
+    uint2 tgid                     [[threadgroup_position_in_grid]],
+    uint  tid                      [[thread_index_in_threadgroup]],
+    uint  lane                     [[thread_index_in_simdgroup]],
+    uint  sg                       [[simdgroup_index_in_threadgroup]]
+) {
+    const uint HID   = (is_function_constant_defined(FC_ANE_HID)   && FC_ANE_HID   != 0u) ? FC_ANE_HID   : p.HID;
+    const uint INTER = (is_function_constant_defined(FC_ANE_INTER) && FC_ANE_INTER != 0u) ? FC_ANE_INTER : p.INTER;
+    const uint SUB   = (is_function_constant_defined(FC_ANE_SUB)   && FC_ANE_SUB   != 0u) ? FC_ANE_SUB   : p.SUB;
+    const uint NSB   = (is_function_constant_defined(FC_ANE_NSB)   && FC_ANE_NSB   != 0u) ? FC_ANE_NSB   : p.n_subblocks;
+    const uint NGS          = SUB >> 3;
+    const uint slots_per_ch = SUB >> 7;
+    const uint tiles_sb     = (NGS + 3u) >> 2;
+    const uint total_tiles  = NSB * tiles_sb;
+    const uint m0 = tgid.y * 32u;
+    if (tgid.x >= total_tiles || m0 >= p.M || HID == 0u) return;
+
+    const uint sb    = tgid.x / tiles_sb;
+    const uint tile  = tgid.x - sb * tiles_sb;
+    const uint li_g  = sb * 4u + 0u;
+    const uint li_u  = sb * 4u + 1u;
+    const uint hdr_g = is_function_constant_defined(FC_ANE_HDR) ? FC_ANE_HDR : p.lin_hdr_w[li_g];
+    const uint hdr_u = is_function_constant_defined(FC_ANE_HDR) ? FC_ANE_HDR : p.lin_hdr_w[li_u];
+    const uint gw_g  = hdr_g + HID;
+    const uint gw_u  = hdr_u + HID;
+
+    threadgroup half  sA[2][32][36];
+    threadgroup half  sBg[2][32][36];
+    threadgroup half  sBu[2][32][36];
+    threadgroup half2 s_lut2_g[256]; // +2 KB -> 15.5 KB <= 16 KB (keeps 2 TGs/core!)
+    threadgroup half2 s_lut2_u[256];
+    {
+        const device half* lg = (const device half*)(W + (ulong)p.lin_base_w[li_g]);
+        const device half* lu = (const device half*)(W + (ulong)p.lin_base_w[li_u]);
+        s_lut2_g[tid]        = half2(lg[tid & 15u], lg[tid >> 4]);
+        s_lut2_g[tid + 128u] = half2(lg[(tid + 128u) & 15u], lg[(tid + 128u) >> 4]);
+        s_lut2_u[tid]        = half2(lu[tid & 15u], lu[tid >> 4]);
+        s_lut2_u[tid + 128u] = half2(lu[(tid + 128u) & 15u], lu[(tid + 128u) >> 4]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    simdgroup_float8x8 acc_g[2][2], acc_u[2][2];
+    #pragma clang loop unroll(full)
+    for (uint i = 0u; i < 2u; ++i)
+    #pragma clang loop unroll(full)
+    for (uint j = 0u; j < 2u; ++j) {
+        acc_g[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        acc_u[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    }
+
+    const uint sg_m  = (sg >> 1) * 16u;
+    const uint sg_n  = (sg & 1u) * 16u;
+    const uint r_a   = tid >> 2;
+    const uint c_a   = (tid & 3u) * 8u;
+    const uint gm_ld = m0 + r_a;
+    const bool gm_ok = gm_ld < p.M;
+    const device half* x_base = X + (ulong)(gm_ok ? gm_ld : 0u) * HID;
+
+    const uint w_slot  = tid >> 5;
+    const uint w_k     = tid & 31u;
+    const uint flat    = tile * 4u + w_slot;
+    const bool flat_ok = flat < NGS;
+    const uint flat_c  = flat_ok ? flat : 0u;
+    const uint ch      = flat_c / slots_per_ch;
+    const uint slot    = flat_c - ch * slots_per_ch;
+    const uint G_s     = sb * NGS + slot * 16u + ch;
+
+    const device uint* wg_ptr = W + (ulong)p.lin_base_w[li_g] + (ulong)ch * p.lin_chunk_w[li_g]
+                                + 16u + (ulong)slot * gw_g + hdr_g + w_k;
+    const device uint* wu_ptr = W + (ulong)p.lin_base_w[li_u] + (ulong)ch * p.lin_chunk_w[li_u]
+                                + 16u + (ulong)slot * gw_u + hdr_u + w_k;
+
+    half2 sc_g[4], sc_u[4];
+    #pragma clang loop unroll(full)
+    for (uint c = 0u; c < 4u; ++c) {
+        sc_g[c] = flat_ok ? half2(half(SO[G_s * 8u + 2u * c + 0u].x), half(SO[G_s * 8u + 2u * c + 1u].x)) : half2(0.0h);
+        sc_u[c] = flat_ok ? half2(half(SO[INTER + G_s * 8u + 2u * c + 0u].x), half(SO[INTER + G_s * 8u + 2u * c + 1u].x)) : half2(0.0h);
+    }
+
+    {
+        threadgroup half4* da = (threadgroup half4*)(&sA[0][r_a][c_a]);
+        if (gm_ok) {
+            const device half4* xp = (const device half4*)(x_base + c_a);
+            da[0] = xp[0]; da[1] = xp[1];
+        } else {
+            da[0] = half4(0.0h); da[1] = half4(0.0h);
+        }
+        uint wg = flat_ok ? wg_ptr[0] : 0u;
+        uint wu = flat_ok ? wu_ptr[0] : 0u;
+        threadgroup half2* dg = (threadgroup half2*)(&sBg[0][w_k][w_slot * 8u]);
+        dg[0] = s_lut2_g[(wg >>  0u) & 0xFFu] * sc_g[0];
+        dg[1] = s_lut2_g[(wg >>  8u) & 0xFFu] * sc_g[1];
+        dg[2] = s_lut2_g[(wg >> 16u) & 0xFFu] * sc_g[2];
+        dg[3] = s_lut2_g[(wg >> 24u) & 0xFFu] * sc_g[3];
+
+        threadgroup half2* du = (threadgroup half2*)(&sBu[0][w_k][w_slot * 8u]);
+        du[0] = s_lut2_u[(wu >>  0u) & 0xFFu] * sc_u[0];
+        du[1] = s_lut2_u[(wu >>  8u) & 0xFFu] * sc_u[1];
+        du[2] = s_lut2_u[(wu >> 16u) & 0xFFu] * sc_u[2];
+        du[3] = s_lut2_u[(wu >> 24u) & 0xFFu] * sc_u[3];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint k0 = 0u; k0 < HID; k0 += 32u) {
+        const uint cur = (k0 >> 5) & 1u;
+        const uint nxt = cur ^ 1u;
+        const uint k_nxt = k0 + 32u;
+        const bool has_nxt = k_nxt < HID;
+
+        half4 nx0 = half4(0.0h), nx1 = half4(0.0h);
+        uint nwg = 0u, nwu = 0u;
+        if (has_nxt) {
+            if (gm_ok) {
+                const device half4* xp = (const device half4*)(x_base + k_nxt + c_a);
+                nx0 = xp[0]; nx1 = xp[1];
+            }
+            if (flat_ok) {
+                nwg = wg_ptr[k_nxt];
+                nwu = wu_ptr[k_nxt];
+            }
+        }
+
+        #pragma clang loop unroll(full)
+        for (uint kk = 0u; kk < 32u; kk += 8u) {
+            simdgroup_half8x8 a[2], bg[2], bu[2];
+            simdgroup_load(a[0],  &sA[cur][sg_m][kk], 36);
+            simdgroup_load(a[1],  &sA[cur][sg_m + 8u][kk], 36);
+            simdgroup_load(bg[0], &sBg[cur][kk][sg_n], 36);
+            simdgroup_load(bg[1], &sBg[cur][kk][sg_n + 8u], 36);
+            simdgroup_load(bu[0], &sBu[cur][kk][sg_n], 36);
+            simdgroup_load(bu[1], &sBu[cur][kk][sg_n + 8u], 36);
+            #pragma clang loop unroll(full)
+            for (uint i = 0u; i < 2u; ++i)
+            #pragma clang loop unroll(full)
+            for (uint j = 0u; j < 2u; ++j) {
+                simdgroup_multiply_accumulate(acc_g[i][j], a[i], bg[j], acc_g[i][j]);
+                simdgroup_multiply_accumulate(acc_u[i][j], a[i], bu[j], acc_u[i][j]);
+            }
+        }
+
+        if (has_nxt) {
+            threadgroup half4* da = (threadgroup half4*)(&sA[nxt][r_a][c_a]);
+            da[0] = nx0; da[1] = nx1;
+
+            threadgroup half2* dg = (threadgroup half2*)(&sBg[nxt][w_k][w_slot * 8u]);
+            dg[0] = s_lut2_g[(nwg >>  0u) & 0xFFu] * sc_g[0];
+            dg[1] = s_lut2_g[(nwg >>  8u) & 0xFFu] * sc_g[1];
+            dg[2] = s_lut2_g[(nwg >> 16u) & 0xFFu] * sc_g[2];
+            dg[3] = s_lut2_g[(nwg >> 24u) & 0xFFu] * sc_g[3];
+
+            threadgroup half2* du = (threadgroup half2*)(&sBu[nxt][w_k][w_slot * 8u]);
+            du[0] = s_lut2_u[(nwu >>  0u) & 0xFFu] * sc_u[0];
+            du[1] = s_lut2_u[(nwu >>  8u) & 0xFFu] * sc_u[1];
+            du[2] = s_lut2_u[(nwu >> 16u) & 0xFFu] * sc_u[2];
+            du[3] = s_lut2_u[(nwu >> 24u) & 0xFFu] * sc_u[3];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    uint qid = lane >> 2;
+    uint fm  = (qid & 4u) + ((lane >> 1) & 3u);
+    uint fn  = (qid & 2u) * 2u + (lane & 1u) * 2u;
+
+    uint G_out[2];
+    bool G_ok[2];
+    #pragma clang loop unroll(full)
+    for (uint j = 0u; j < 2u; ++j) {
+        uint fo = tile * 4u + (sg_n >> 3) + j;
+        G_ok[j] = fo < NGS;
+        uint foc = G_ok[j] ? fo : 0u;
+        uint co = foc / slots_per_ch;
+        uint so = foc - co * slots_per_ch;
+        G_out[j] = sb * NGS + so * 16u + co;
+    }
+
+    #pragma clang loop unroll(full)
+    for (uint i = 0u; i < 2u; ++i) {
+        uint gm = m0 + sg_m + 8u * i + fm;
+        if (gm < p.M) {
+            device half* yr = Y + (ulong)gm * INTER;
+            #pragma clang loop unroll(full)
+            for (uint j = 0u; j < 2u; ++j) {
+                if (G_ok[j]) {
+                    float g0 = acc_g[i][j].thread_elements()[0], g1 = acc_g[i][j].thread_elements()[1];
+                    float u0 = acc_u[i][j].thread_elements()[0], u1 = acc_u[i][j].thread_elements()[1];
+                    *(device half2*)(yr + G_out[j] * 8u + fn) = half2(half(silu_f32(g0) * u0), half(silu_f32(g1) * u1));
+                }
+            }
+        }
+    }
+}
+
+// Universal LUT4 Co-Exec Split-K BM=32, BN=32, BK=32 down_proj -> partY[sk, M, HID] (sk = n_tg.z)
+// Grid: (16 * ceil_div(HID/128, 4), ceil_div(M, 32), sk), TG: (128, 1, 1)
+kernel void ane_lut4_down_tiled32_sk(
+    const device uint*          W     [[buffer(0)]],
+    const device float2*        SO    [[buffer(1)]],
+    const device half*          X     [[buffer(2)]],
+    device float*               partY [[buffer(3)]],
+    constant AneShareParams&    p     [[buffer(4)]],
+    uint3 tgid                        [[threadgroup_position_in_grid]],
+    uint3 n_tg                        [[threadgroups_per_grid]],
+    uint  tid                         [[thread_index_in_threadgroup]],
+    uint  lane                        [[thread_index_in_simdgroup]],
+    uint  sg                          [[simdgroup_index_in_threadgroup]]
+) {
+    const uint HID   = (is_function_constant_defined(FC_ANE_HID)   && FC_ANE_HID   != 0u) ? FC_ANE_HID   : p.HID;
+    const uint INTER = (is_function_constant_defined(FC_ANE_INTER) && FC_ANE_INTER != 0u) ? FC_ANE_INTER : p.INTER;
+    const uint DK    = (is_function_constant_defined(FC_ANE_DK)    && FC_ANE_DK    != 0u) ? FC_ANE_DK    : p.DK;
+    const uint NSB   = (is_function_constant_defined(FC_ANE_NSB)   && FC_ANE_NSB   != 0u) ? FC_ANE_NSB   : p.n_subblocks;
+    const uint n_q          = NSB * 2u;
+    const uint slots_per_ch = HID >> 7;
+    const uint tg_per_ch    = (slots_per_ch + 3u) >> 2;
+    const uint m0 = tgid.y * 32u;
+    if (tgid.x >= 16u * tg_per_ch || m0 >= p.M || DK == 0u) return;
+
+    const uint ch    = tgid.x / tg_per_ch;
+    const uint slot0 = (tgid.x - ch * tg_per_ch) * 4u;
+    const uint sk    = max(1u, n_tg.z);
+    const uint q_per_sk = (n_q + sk - 1u) / sk;
+    const uint q_start  = tgid.z * q_per_sk;
+    const uint q_end    = min(n_q, q_start + q_per_sk);
+
+    threadgroup half  sA[2][32][36];
+    threadgroup half  sB[2][32][36];
+    threadgroup half2 s_lut2[256]; // +1 KB -> 10.0 KB <= 10.67 KB (keeps 3 TGs/core!)
+
+    simdgroup_float8x8 acc[2][2];
+    #pragma clang loop unroll(full)
+    for (uint i = 0u; i < 2u; ++i)
+    #pragma clang loop unroll(full)
+    for (uint j = 0u; j < 2u; ++j) acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    const uint sg_m  = (sg >> 1) * 16u;
+    const uint sg_n  = (sg & 1u) * 16u;
+    const uint r_a   = tid >> 2;
+    const uint c_a   = (tid & 3u) * 8u;
+    const uint gm_ld = m0 + r_a;
+    const bool gm_ok = gm_ld < p.M;
+    const device half* x_row = X + (ulong)(gm_ok ? gm_ld : 0u) * INTER;
+
+    const uint w_slot  = tid >> 5;
+    const uint w_k     = tid & 31u;
+    const uint slot    = slot0 + w_slot;
+    const bool slot_ok = slot < slots_per_ch;
+    const uint slot_c  = slot_ok ? slot : 0u;
+    const uint go_s    = slot_c * 16u + ch;
+
+    for (uint q = q_start; q < q_end; ++q) {
+        const uint sb  = q >> 1;
+        const uint li  = sb * 4u + 2u + (q & 1u);
+        const uint hdr = is_function_constant_defined(FC_ANE_HDR) ? FC_ANE_HDR : p.lin_hdr_w[li];
+        const uint gw  = hdr + DK;
+        const device uint* chunk_base = W + (ulong)p.lin_base_w[li] + (ulong)ch * p.lin_chunk_w[li];
+        {
+            const device half* lv = (const device half*)chunk_base;
+            s_lut2[tid]        = half2(lv[tid & 15u], lv[tid >> 4]);
+            s_lut2[tid + 128u] = half2(lv[(tid + 128u) & 15u], lv[(tid + 128u) >> 4]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const device uint* w_ptr = chunk_base + 16u + (ulong)slot_c * gw + hdr + w_k;
+        const device half* x_base = x_row + (ulong)q * DK;
+        const uint so_down_base = 2u * INTER + q * HID;
+
+        half2 sc8[4];
+        #pragma clang loop unroll(full)
+        for (uint c = 0u; c < 4u; ++c) {
+            sc8[c] = slot_ok ? half2(half(SO[so_down_base + go_s * 8u + 2u * c + 0u].x),
+                                     half(SO[so_down_base + go_s * 8u + 2u * c + 1u].x)) : half2(0.0h);
+        }
+
+        {
+            threadgroup half4* da = (threadgroup half4*)(&sA[0][r_a][c_a]);
+            if (gm_ok) {
+                const device half4* xp = (const device half4*)(x_base + c_a);
+                da[0] = xp[0]; da[1] = xp[1];
+            } else {
+                da[0] = half4(0.0h); da[1] = half4(0.0h);
+            }
+            uint w = slot_ok ? w_ptr[0] : 0u;
+            threadgroup half2* dst = (threadgroup half2*)(&sB[0][w_k][w_slot * 8u]);
+            dst[0] = s_lut2[(w >>  0u) & 0xFFu] * sc8[0];
+            dst[1] = s_lut2[(w >>  8u) & 0xFFu] * sc8[1];
+            dst[2] = s_lut2[(w >> 16u) & 0xFFu] * sc8[2];
+            dst[3] = s_lut2[(w >> 24u) & 0xFFu] * sc8[3];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint k0 = 0u; k0 < DK; k0 += 32u) {
+            const uint cur = (k0 >> 5) & 1u;
+            const uint nxt = cur ^ 1u;
+            const uint k_nxt = k0 + 32u;
+            const bool has_nxt = k_nxt < DK;
+
+            half4 nx0 = half4(0.0h), nx1 = half4(0.0h);
+            uint nw = 0u;
+            if (has_nxt) {
+                if (gm_ok) {
+                    const device half4* xp = (const device half4*)(x_base + k_nxt + c_a);
+                    nx0 = xp[0]; nx1 = xp[1];
+                }
+                if (slot_ok) nw = w_ptr[k_nxt];
+            }
+
+            #pragma clang loop unroll(full)
+            for (uint kk = 0u; kk < 32u; kk += 8u) {
+                simdgroup_half8x8 a[2], b[2];
+                simdgroup_load(a[0], &sA[cur][sg_m][kk], 36);
+                simdgroup_load(a[1], &sA[cur][sg_m + 8u][kk], 36);
+                simdgroup_load(b[0], &sB[cur][kk][sg_n], 36);
+                simdgroup_load(b[1], &sB[cur][kk][sg_n + 8u], 36);
+                #pragma clang loop unroll(full)
+                for (uint i = 0u; i < 2u; ++i)
+                #pragma clang loop unroll(full)
+                for (uint j = 0u; j < 2u; ++j) simdgroup_multiply_accumulate(acc[i][j], a[i], b[j], acc[i][j]);
+            }
+
+            if (has_nxt) {
+                threadgroup half4* da = (threadgroup half4*)(&sA[nxt][r_a][c_a]);
+                da[0] = nx0; da[1] = nx1;
+                threadgroup half2* dst = (threadgroup half2*)(&sB[nxt][w_k][w_slot * 8u]);
+                dst[0] = s_lut2[(nw >>  0u) & 0xFFu] * sc8[0];
+                dst[1] = s_lut2[(nw >>  8u) & 0xFFu] * sc8[1];
+                dst[2] = s_lut2[(nw >> 16u) & 0xFFu] * sc8[2];
+                dst[3] = s_lut2[(nw >> 24u) & 0xFFu] * sc8[3];
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+        }
+        if (q + 1u < q_end) threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    uint qid = lane >> 2;
+    uint fm  = (qid & 4u) + ((lane >> 1) & 3u);
+    uint fn  = (qid & 2u) * 2u + (lane & 1u) * 2u;
+    const ulong sk_off = (ulong)tgid.z * ((ulong)p.M * HID);
+
+    #pragma clang loop unroll(full)
+    for (uint i = 0u; i < 2u; ++i) {
+        uint gm = m0 + sg_m + 8u * i + fm;
+        if (gm < p.M) {
+            device float* yr = partY + sk_off + (ulong)gm * HID;
+            #pragma clang loop unroll(full)
+            for (uint j = 0u; j < 2u; ++j) {
+                uint sl_out = slot0 + (sg_n >> 3) + j;
+                if (sl_out < slots_per_ch) {
+                    uint go = sl_out * 16u + ch;
+                    *(device float2*)(yr + go * 8u + fn) =
+                        float2(acc[i][j].thread_elements()[0], acc[i][j].thread_elements()[1]);
+                }
+            }
+        }
     }
 }
 
@@ -4701,14 +6689,16 @@ struct BitScreenParams {
     uint R; // V / 2048 (rows per strided-interleaved simdgroup bucket)
 };
 
-// Build 1-bit sign(W) [V, 160] + float2 W_meta [V] in STRIDE-2048 interleaved order once at startup (~2.5 ms).
+// Optional hidden-dim specialization constant for BitScreen (default/undefined -> 5120u, supports D <= 8192!)
+constant uint FC_BS_D [[function_constant(10)]];
+
+// Build 1-bit sign(W) [V, KW] + float2 W_meta [V] in STRIDE-2048 interleaved order once at startup (~2.5 ms).
 // Simdgroup s (0..2047) owns orig_row = r * 2048 + s (r = 0..R-1), stored contiguously at slot = s * R + r!
-// Interleaving eliminates BPE low-ID clustering so register-only top-2 per simdgroup has <0.05% recall loss.
 kernel void lmh_build_bitscreen(
-    const device uint*   W      [[buffer(0)]], // Q4_g64 [V, 640]
-    const device ushort* S      [[buffer(1)]], // bf16 [V, 80]
-    const device ushort* B      [[buffer(2)]], // bf16 [V, 80]
-    device uint*         W_bits [[buffer(3)]], // [V, 160]
+    const device uint*   W      [[buffer(0)]], // Q4_g64 [V, D/8]
+    const device ushort* S      [[buffer(1)]], // bf16 [V, D/64]
+    const device ushort* B      [[buffer(2)]], // bf16 [V, D/64]
+    device uint*         W_bits [[buffer(3)]], // [V, D/32]
     device float2*       W_meta [[buffer(4)]], // [V]
     constant uint&       V      [[buffer(5)]],
     uint tgid                   [[threadgroup_position_in_grid]],
@@ -4717,6 +6707,13 @@ kernel void lmh_build_bitscreen(
 ) {
     uint slot = tgid * 4u + sg;
     if (slot >= V) return;
+    constexpr uint BS_MAX_NSG = 8u;
+    const uint bs_d   = (is_function_constant_defined(FC_BS_D) && FC_BS_D != 0u) ? FC_BS_D : 5120u;
+    const uint bs_kw  = bs_d >> 5;
+    const uint bs_nsg = min((bs_kw + 31u) >> 5, BS_MAX_NSG);
+    const uint q4_w   = bs_d >> 3;
+    const uint q4_g   = bs_d >> 6;
+
     uint R = V >> 11; // V / 2048
     uint s = slot / R;
     uint r = slot - s * R;
@@ -4724,36 +6721,38 @@ kernel void lmh_build_bitscreen(
 
     float abs_sum = 0.0f;
     uint  pos_cnt = 0u;
-    for (uint k = 0u; k < 5u; ++k) {
-        uint kw = k * 32u + lane; // 0..159 (each word = 32 weights)
-        uint g  = kw >> 1;        // 0..79 (Q4 group-64)
-        uint4 uq = *((const device uint4*)(W + (ulong)row * 640u + kw * 4u));
-        float sc = bf16_to_f32(S[(ulong)row * 80u + g]);
-        float bi = bf16_to_f32(B[(ulong)row * 80u + g]);
-        uint ws[4] = {uq.x, uq.y, uq.z, uq.w};
-        uint mask = 0u;
-        #pragma clang loop unroll(full)
-        for (uint j = 0u; j < 4u; ++j) {
-            uint wv = ws[j];
+    for (uint k = 0u; k < bs_nsg; ++k) {
+        uint kw = k * 32u + lane;
+        if (kw < bs_kw) {
+            uint g  = kw >> 1; // Q4 group-64
+            uint4 uq = *((const device uint4*)(W + (ulong)row * q4_w + kw * 4u));
+            float sc = bf16_to_f32(S[(ulong)row * q4_g + g]);
+            float bi = bf16_to_f32(B[(ulong)row * q4_g + g]);
+            uint ws[4] = {uq.x, uq.y, uq.z, uq.w};
+            uint mask = 0u;
             #pragma clang loop unroll(full)
-            for (uint tt = 0u; tt < 8u; ++tt) {
-                float val = fma(sc, float((wv >> (4u * tt)) & 0xFu), bi);
-                if (val >= 0.0f) mask |= (1u << (j * 8u + tt));
-                abs_sum += fabs(val);
+            for (uint j = 0u; j < 4u; ++j) {
+                uint wv = ws[j];
+                #pragma clang loop unroll(full)
+                for (uint tt = 0u; tt < 8u; ++tt) {
+                    float val = fma(sc, float((wv >> (4u * tt)) & 0xFu), bi);
+                    if (val >= 0.0f) mask |= (1u << (j * 8u + tt));
+                    abs_sum += fabs(val);
+                }
             }
+            W_bits[(ulong)slot * bs_kw + kw] = mask;
+            pos_cnt += popcount(mask);
         }
-        W_bits[(ulong)slot * 160u + kw] = mask;
-        pos_cnt += popcount(mask);
     }
-    float mean_abs = simd_sum(abs_sum) * (1.0f / 5120.0f);
-    int   sum_sign = 2 * int(simd_sum(pos_cnt)) - 5120;
+    float mean_abs = simd_sum(abs_sum) * (1.0f / float(bs_d));
+    int   sum_sign = 2 * int(simd_sum(pos_cnt)) - int(bs_d);
     if (lane == 0u) {
         W_meta[slot] = float2(mean_abs, -3.5f * float(sum_sign));
     }
 }
 
-// Quantize X [B, 5120] FP16 -> 3 bitplanes X_bp [B, 3, 160] + weighted popcount X_pc [B] (<5 us!)
-// Grid: (B, 1, 1), TG: (160, 1, 1) (5 simdgroups, 1 thread per 32-element word)
+// Quantize X [B, D] FP16 -> 3 bitplanes X_bp [B, 3, KW] + weighted popcount X_pc [B] (<5 us!)
+// Grid: (B, 1, 1), TG: (KW, 1, 1) (1 thread per 32-element word; safe for any D % 64 == 0, D <= 8192!)
 kernel void bitscreen_quant_x(
     const device half* X    [[buffer(0)]],
     device uint*       X_bp [[buffer(1)]],
@@ -4764,55 +6763,69 @@ kernel void bitscreen_quant_x(
     uint lane               [[thread_index_in_simdgroup]],
     uint sg                 [[simdgroup_index_in_threadgroup]]
 ) {
-    if (m >= B || tid >= 160u) return;
-    const device half4* xp = (const device half4*)(X + (ulong)m * 5120u + tid * 32u);
-    half4 xv[8];
+    if (m >= B) return;
+    constexpr uint BS_MAX_NSG = 8u;
+    const uint bs_d   = (is_function_constant_defined(FC_BS_D) && FC_BS_D != 0u) ? FC_BS_D : 5120u;
+    const uint bs_kw  = bs_d >> 5;
+    const uint bs_nsg = min((bs_kw + 31u) >> 5, BS_MAX_NSG);
+
+    half4 xv[8] = {half4(0.0h), half4(0.0h), half4(0.0h), half4(0.0h),
+                   half4(0.0h), half4(0.0h), half4(0.0h), half4(0.0h)};
     float sq = 0.0f;
-    #pragma clang loop unroll(full)
-    for (uint j = 0u; j < 8u; ++j) {
-        half4 v = xp[j];
-        xv[j] = v;
-        float4 f = float4(v);
-        sq = fma(f.x, f.x, fma(f.y, f.y, fma(f.z, f.z, fma(f.w, f.w, sq))));
+    if (tid < bs_kw) {
+        const device half4* xp = (const device half4*)(X + (ulong)m * bs_d + tid * 32u);
+        #pragma clang loop unroll(full)
+        for (uint j = 0u; j < 8u; ++j) {
+            half4 v = xp[j];
+            xv[j] = v;
+            float4 f = float4(v);
+            sq = fma(f.x, f.x, fma(f.y, f.y, fma(f.z, f.z, fma(f.w, f.w, sq))));
+        }
     }
-    threadgroup float smem[5];
+    threadgroup float smem[32];
     float sg_sq = simd_sum(sq);
-    if (lane == 0u) smem[sg] = sg_sq;
+    if (lane == 0u && sg < bs_nsg) smem[sg] = sg_sq;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    float tot_sq = smem[0] + smem[1] + smem[2] + smem[3] + smem[4];
-    float rms = sqrt(tot_sq * (1.0f / 5120.0f)) + 1e-6f;
+
+    float tot_sq = 0.0f;
+    for (uint s = 0u; s < bs_nsg; ++s) tot_sq += smem[s];
+    float rms = sqrt(tot_sq * (1.0f / float(bs_d))) + 1e-6f;
     float inv_clip = 1.0f / (3.5f * rms);
 
-    uint bp0 = 0u, bp1 = 0u, bp2 = 0u;
-    #pragma clang loop unroll(full)
-    for (uint j = 0u; j < 8u; ++j) {
-        float4 f = float4(xv[j]);
-        uint u0 = uint(clamp(rint((f.x * inv_clip + 1.0f) * 3.5f), 0.0f, 7.0f));
-        uint u1 = uint(clamp(rint((f.y * inv_clip + 1.0f) * 3.5f), 0.0f, 7.0f));
-        uint u2 = uint(clamp(rint((f.z * inv_clip + 1.0f) * 3.5f), 0.0f, 7.0f));
-        uint u3 = uint(clamp(rint((f.w * inv_clip + 1.0f) * 3.5f), 0.0f, 7.0f));
-        uint sh = j * 4u;
-        bp0 |= ((u0 & 1u) << (sh + 0u)) | ((u1 & 1u) << (sh + 1u)) | ((u2 & 1u) << (sh + 2u)) | ((u3 & 1u) << (sh + 3u));
-        bp1 |= (((u0 >> 1) & 1u) << (sh + 0u)) | (((u1 >> 1) & 1u) << (sh + 1u)) | (((u2 >> 1) & 1u) << (sh + 2u)) | (((u3 >> 1) & 1u) << (sh + 3u));
-        bp2 |= (((u0 >> 2) & 1u) << (sh + 0u)) | (((u1 >> 2) & 1u) << (sh + 1u)) | (((u2 >> 2) & 1u) << (sh + 2u)) | (((u3 >> 2) & 1u) << (sh + 3u));
+    uint pc = 0u;
+    if (tid < bs_kw) {
+        uint bp0 = 0u, bp1 = 0u, bp2 = 0u;
+        #pragma clang loop unroll(full)
+        for (uint j = 0u; j < 8u; ++j) {
+            float4 f = float4(xv[j]);
+            uint u0 = uint(clamp(rint((f.x * inv_clip + 1.0f) * 3.5f), 0.0f, 7.0f));
+            uint u1 = uint(clamp(rint((f.y * inv_clip + 1.0f) * 3.5f), 0.0f, 7.0f));
+            uint u2 = uint(clamp(rint((f.z * inv_clip + 1.0f) * 3.5f), 0.0f, 7.0f));
+            uint u3 = uint(clamp(rint((f.w * inv_clip + 1.0f) * 3.5f), 0.0f, 7.0f));
+            uint sh = j * 4u;
+            bp0 |= ((u0 & 1u) << (sh + 0u)) | ((u1 & 1u) << (sh + 1u)) | ((u2 & 1u) << (sh + 2u)) | ((u3 & 1u) << (sh + 3u));
+            bp1 |= (((u0 >> 1) & 1u) << (sh + 0u)) | (((u1 >> 1) & 1u) << (sh + 1u)) | (((u2 >> 1) & 1u) << (sh + 2u)) | (((u3 >> 1) & 1u) << (sh + 3u));
+            bp2 |= (((u0 >> 2) & 1u) << (sh + 0u)) | (((u1 >> 2) & 1u) << (sh + 1u)) | (((u2 >> 2) & 1u) << (sh + 2u)) | (((u3 >> 2) & 1u) << (sh + 3u));
+        }
+        ulong base = (ulong)m * (3u * bs_kw);
+        X_bp[base + 0u * bs_kw + tid] = bp0;
+        X_bp[base + 1u * bs_kw + tid] = bp1;
+        X_bp[base + 2u * bs_kw + tid] = bp2;
+        pc = popcount(bp0) + (popcount(bp1) << 1) + (popcount(bp2) << 2);
     }
-    ulong base = (ulong)m * 480u;
-    X_bp[base + 0u   + tid] = bp0;
-    X_bp[base + 160u + tid] = bp1;
-    X_bp[base + 320u + tid] = bp2;
 
-    uint pc = popcount(bp0) + (popcount(bp1) << 1) + (popcount(bp2) << 2);
     float sg_pc = float(simd_sum(pc));
-    if (lane == 0u) smem[sg] = sg_pc;
+    if (lane == 0u && sg < bs_nsg) smem[sg] = sg_pc;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid == 0u) {
-        X_pc[m] = smem[0] + smem[1] + smem[2] + smem[3] + smem[4];
+        float tot_pc = 0.0f;
+        for (uint s = 0u; s < bs_nsg; ++s) tot_pc += smem[s];
+        X_pc[m] = tot_pc;
     }
 }
 
 // Register-resident X_bp BitScreen scoring + FUSED per-simdgroup Register Top-2 (NB = 1, 2, 3)!
-// Grid: (512, 1, 1), TG: (32, 4, 1) -> 2,048 simdgroups, each scans R contiguous strided rows -> writes ONLY 32 KB top2!
-// ZERO score buffer DRAM writes, ZERO threadgroup barriers!
+// Grid: (512, 1, 1), TG: (32, 4, 1) -> 2,048 simdgroups, parameterized by FC_BS_D (default 5120)!
 template<uint NB>
 inline void bitscreen_score_impl(
     const device uint*       W_bits,
@@ -4828,18 +6841,23 @@ inline void bitscreen_score_impl(
     const uint s = tgid * 4u + sg; // 0..2047
     if (s >= 2048u) return;
 
-    uint x0[NB][5], x1[NB][5], x2[NB][5];
+    constexpr uint BS_MAX_NSG = 8u;
+    const uint bs_d   = (is_function_constant_defined(FC_BS_D) && FC_BS_D != 0u) ? FC_BS_D : 5120u;
+    const uint bs_kw  = bs_d >> 5;
+    const uint bs_nsg = min((bs_kw + 31u) >> 5, BS_MAX_NSG);
+
+    uint x0[NB][BS_MAX_NSG], x1[NB][BS_MAX_NSG], x2[NB][BS_MAX_NSG];
     float xpc[NB];
     #pragma clang loop unroll(full)
     for (uint b = 0u; b < NB; ++b) {
-        const device uint* xb = X_bp + (ulong)b * 480u;
+        const device uint* xb = X_bp + (ulong)b * (3u * bs_kw);
         xpc[b] = X_pc[b];
-        #pragma clang loop unroll(full)
-        for (uint k = 0u; k < 5u; ++k) {
+        for (uint k = 0u; k < bs_nsg; ++k) {
             uint idx = k * 32u + lane;
-            x0[b][k] = xb[0u   + idx];
-            x1[b][k] = xb[160u + idx];
-            x2[b][k] = xb[320u + idx];
+            bool ok = idx < bs_kw;
+            x0[b][k] = ok ? xb[0u * bs_kw + idx] : 0u;
+            x1[b][k] = ok ? xb[1u * bs_kw + idx] : 0u;
+            x2[b][k] = ok ? xb[2u * bs_kw + idx] : 0u;
         }
     }
 
@@ -4851,23 +6869,23 @@ inline void bitscreen_score_impl(
     const uint slot0 = s * p.R;
     for (uint r = 0u; r < p.R; ++r) {
         uint slot = slot0 + r;
-        const device uint* wp = W_bits + (ulong)slot * 160u;
-        uint w0 = wp[0u   + lane];
-        uint w1 = wp[32u  + lane];
-        uint w2 = wp[64u  + lane];
-        uint w3 = wp[96u  + lane];
-        uint w4 = wp[128u + lane];
+        const device uint* wp = W_bits + (ulong)slot * bs_kw;
+        uint w[BS_MAX_NSG];
+        for (uint k = 0u; k < bs_nsg; ++k) {
+            uint idx = k * 32u + lane;
+            w[k] = (idx < bs_kw) ? wp[idx] : 0u;
+        }
         float2 meta = (lane == 0u) ? W_meta[slot] : float2(0.0f);
         uint orig_row = r * 2048u + s;
 
         #pragma clang loop unroll(full)
         for (uint b = 0u; b < NB; ++b) {
-            uint c0 = popcount(w0 & x0[b][0]) + popcount(w1 & x0[b][1])
-                    + popcount(w2 & x0[b][2]) + popcount(w3 & x0[b][3]) + popcount(w4 & x0[b][4]);
-            uint c1 = popcount(w0 & x1[b][0]) + popcount(w1 & x1[b][1])
-                    + popcount(w2 & x1[b][2]) + popcount(w3 & x1[b][3]) + popcount(w4 & x1[b][4]);
-            uint c2 = popcount(w0 & x2[b][0]) + popcount(w1 & x2[b][1])
-                    + popcount(w2 & x2[b][2]) + popcount(w3 & x2[b][3]) + popcount(w4 & x2[b][4]);
+            uint c0 = 0u, c1 = 0u, c2 = 0u;
+            for (uint k = 0u; k < bs_nsg; ++k) {
+                c0 += popcount(w[k] & x0[b][k]);
+                c1 += popcount(w[k] & x1[b][k]);
+                c2 += popcount(w[k] & x2[b][k]);
+            }
             float tot = float(simd_sum(c0 + (c1 << 1) + (c2 << 2)));
             if (lane == 0u) {
                 float sc = (2.0f * tot - xpc[b] + meta.y) * meta.x;
@@ -4914,7 +6932,7 @@ kernel void bitscreen_score_b3(
     uint tgid [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]
 ) { bitscreen_score_impl<3>(W_bits, W_meta, X_bp, X_pc, top2, p, tgid, lane, sg); }
 
-// Single-pass REGISTER-ONLY 64-bin selector over 4,096 L2-resident top2 items -> ~160..192 + <=64 extra (<8 us!)
+// Single-pass REGISTER-ONLY 64-bin selector over 4,096 L2-resident top2 items -> <=256 cands (supports <=128 extra!)
 // Grid: (B, 1, 1), TG: (256, 1, 1) (each thread holds 16 items in registers -> ZERO repeat DRAM passes!)
 kernel void bitscreen_select_cands(
     const device ArgmaxOut*  top2      [[buffer(0)]], // [B, 4096]
@@ -4975,7 +6993,7 @@ kernel void bitscreen_select_cands(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    const uint max_bs = 256u - min(p.n_extra, 64u);
+    const uint max_bs = 256u - min(p.n_extra, 128u);
     const uint target_bs = min(192u, max_bs);
     if (tid == 0u) {
         uint cum = 0u;

@@ -1,5 +1,6 @@
 #import <Foundation/Foundation.h>
 
+#include "ane_builder.hpp"
 #include "inkling2.hpp"
 #include "json.hpp"
 #include "metal_ctx.hpp"
@@ -29,11 +30,12 @@ static void print_usage() {
     std::fprintf(stderr,
         "mometal - Zero-overhead C++20/Metal/ANE inference engine for Apple Silicon\n\n"
         "Usage:\n"
-        "  mometal run    --model <dir> --prompt <text> [options]\n"
-        "  mometal chat   --model <dir> [options]\n"
-        "  mometal bench  --model <dir> [--prompt-tokens N] [--gen-tokens N] [options]\n"
-        "  mometal verify --model <dir> --tokens 1,2,3 [--top 10]\n"
-        "  mometal serve  --model <dir> [--host 127.0.0.1] [--port 8089] [options]\n\n"
+        "  mometal run       --model <dir> --prompt <text> [options]\n"
+        "  mometal chat      --model <dir> [options]\n"
+        "  mometal bench     --model <dir> [--prompt-tokens N] [--gen-tokens N] [options]\n"
+        "  mometal verify    --model <dir> --tokens 1,2,3 [--top 10]\n"
+        "  mometal serve     --model <dir> [--host 127.0.0.1] [--port 8089] [options]\n"
+        "  mometal build-ane --model <dir> [--out <dir>] [--format auto|hf4|lut4|nf4] [--layers all|0-63] [--workers N]\n\n"
         "Options:\n"
         "  --max-tokens N       Max tokens to generate (default: 256)\n"
         "  --max-seq N          KV cache capacity for full-attention layers (default: 8192)\n"
@@ -49,10 +51,9 @@ static void print_usage() {
         "  --mtp MODE           MTP speculative decoding: auto|off|<path> (default: auto)\n"
         "  --mtp-depth N        Number of speculative draft tokens per round (default: auto [5 Qwen, 3 Inkling])\n"
         "  --no-pld             Disable 4-gram prompt-lookup copy drafting\n"
-        "  --ane-models DIR     Native CoreML/IOSurface ANE MLP directory: auto|off|<dir> (default: auto)\n"
-        "  --ane-tag TAG        ANE model tag (e.g. hf4, hp8, hp4; default: auto)\n"
-        "  --ane-share          Share single-copy ANE hf4 model.hwx MLP weights with GPU (saves ~8.9 GiB wired RAM)\n"
-        "  --ane-share-layers N Share N middle ANE hf4 MLP layers with GPU (e.g. 48 or 64)\n"
+        "  --ane-models DIR     Single-copy ANE-Share MLP directory: auto|off|<dir> (default: auto; falls back to GPU-only)\n"
+        "  --ane-tag TAG        ANE model tag (e.g. hf4, lut4, nf4; default: auto per chip gen)\n"
+        "  --ane-share          Enable single-copy ANE-Share (auto-builds .mlmodelc natively in C++ if missing!)\n"
         "  --cache-dir DIR      Enable disk-backed prefix/state cache in DIR\n"
         "  --no-nvfp4-act       Inkling: skip NVFP4 activation rounding (faster, slight diff)\n"
     );
@@ -93,47 +94,53 @@ static std::vector<int> parse_csv_ints(const std::string& s) {
 }
 
 int main(int argc, char** argv) {
-    @autoreleasepool {
-        if (argc < 2) {
-            print_usage();
-            return 1;
-        }
-        std::string cmd = argv[1];
-        if (cmd == "-h" || cmd == "--help") {
-            print_usage();
-            return 0;
-        }
+    if (argc < 2) {
+        print_usage();
+        return 1;
+    }
+    std::string cmd = argv[1];
+    if (cmd == "-h" || cmd == "--help") {
+        print_usage();
+        return 0;
+    }
 
-        std::string model_dir;
-        std::string prompt;
-        std::string system_prompt;
-        std::string effort = "none";
-        std::string host = "127.0.0.1";
-        std::string tokens_csv;
-        std::string tokens_file;
-        std::string save_ref_path;
-        std::string eval_ref_path;
-        std::string mtp_dir = "auto";
-        std::string ane_models_dir = "auto";
-        std::string ane_tag = "auto";
-        std::string cache_dir;
-        std::vector<std::string> suffix_dirs;
-        int mtp_depth = 0; // 0 = auto per arch (5 Qwen, 3 Inkling)
-        int port = 8089;
-        int max_tokens = 256;
-        int max_seq = 8192;
-        int kv_bits = 16;
-        int ane_share_layers = 0;
-        int sparse_kv_budget = 0;
-        int prompt_tokens_bench = 128;
-        int gen_tokens_bench = 64;
-        int top_verify = 10;
-        int eval_prefix_len = 256;
-        bool raw_prompt = false;
-        bool exact_nvfp4_act = true;
-        bool enable_pld = true;
-        SamplerConfig sc;
+    std::string model_dir;
+    std::string prompt;
+    std::string system_prompt;
+    std::string effort = "none";
+    std::string host = "127.0.0.1";
+    std::string tokens_csv;
+    std::string tokens_file;
+    std::string save_ref_path;
+    std::string eval_ref_path;
+    std::string mtp_dir = "auto";
+    std::string ane_models_dir = "auto";
+    std::string ane_tag = "auto";
+    std::string ane_out_dir;
+    std::string ane_format = "auto";
+    std::string ane_layers_spec = "all";
+    float ane_alpha = 0.85f;
+    int ane_workers = 0; // 0 = auto min(12, hardware_concurrency)
+    bool ane_mse_clip = true;
+    std::string cache_dir;
+    std::vector<std::string> suffix_dirs;
+    int mtp_depth = 0; // 0 = auto per arch (5 Qwen, 3 Inkling)
+    int port = 8089;
+    int max_tokens = 256;
+    int max_seq = 8192;
+    int kv_bits = 16;
+    int ane_share_layers = 0;
+    int sparse_kv_budget = 0;
+    int prompt_tokens_bench = 128;
+    int gen_tokens_bench = 64;
+    int top_verify = 10;
+    int eval_prefix_len = 256;
+    bool raw_prompt = false;
+    bool exact_nvfp4_act = true;
+    bool enable_pld = true;
+    SamplerConfig sc;
 
+    try {
         for (int i = 2; i < argc; ++i) {
             std::string a = argv[i];
             auto next = [&]() -> std::string {
@@ -167,8 +174,17 @@ int main(int argc, char** argv) {
             else if (a == "--no-pld") enable_pld = false;
             else if (a == "--ane-models") ane_models_dir = next();
             else if (a == "--ane-tag") ane_tag = next();
+            else if (a == "--out") ane_out_dir = next();
+            else if (a == "--format") ane_format = next();
+            else if (a == "--layers") ane_layers_spec = next();
+            else if (a == "--workers") ane_workers = std::stoi(next());
+            else if (a == "--alpha") ane_alpha = std::stof(next());
+            else if (a == "--no-mse-clip") ane_mse_clip = false;
             else if (a == "--ane-share") ane_share_layers = 64;
-            else if (a == "--ane-share-layers") ane_share_layers = std::stoi(next());
+            else if (a == "--ane-share-layers") {
+                (void)next();
+                std::fprintf(stderr, "[mometal] Note: --ane-share-layers is deprecated; ANE uses strict all-layer single-copy sharing (else GPU-only fallback).\n");
+            }
             else if (a == "--sparse-kv-budget") sparse_kv_budget = std::stoi(next());
             else if (a == "--cache-dir") cache_dir = next();
             else if (a == "--suffix-dir") suffix_dirs.push_back(next());
@@ -179,30 +195,64 @@ int main(int argc, char** argv) {
                 return 1;
             }
         }
+    } catch (const std::exception& ex) {
+        std::fprintf(stderr, "Argument error: %s\n", ex.what());
+        return 1;
+    }
 
-        if (model_dir.empty()) {
-            std::fprintf(stderr, "Error: --model <dir> is required.\n");
-            return 1;
+    if (model_dir.empty()) {
+        std::fprintf(stderr, "Error: --model <dir> is required.\n");
+        return 1;
+    }
+
+    if (cmd == "build-ane") {
+        @autoreleasepool {
+            AneBuildOptions bopt;
+            bopt.model_dir = model_dir;
+            bopt.out_dir = ane_out_dir;
+            bopt.format = ane_format;
+            bopt.tag = ane_tag;
+            bopt.layers_spec = ane_layers_spec;
+            bopt.alpha = ane_alpha;
+            bopt.mse_clip = ane_mse_clip;
+            bopt.workers = ane_workers;
+            AneBuildResult r = build_ane_mlps_native(bopt);
+            if (!r.ok) {
+                std::fprintf(stderr, "Error: %s\n", r.error.c_str());
+                return 1;
+            }
+            return 0;
         }
+    }
 
-        try {
-            MetalContext ctx;
-            auto model = load_model(ctx, model_dir, max_seq, exact_nvfp4_act, mtp_dir, mtp_depth, enable_pld,
-                                    ane_models_dir, ane_tag, kv_bits, ane_share_layers, sparse_kv_budget);
-            const ModelInfo& info = model->info();
+    try {
+        // Bounded @autoreleasepool for model initialization so all transient shader/load Obj-C objects drain before serving!
+        std::unique_ptr<MetalContext> ctx_ptr;
+        std::unique_ptr<Model> model;
+        @autoreleasepool {
+            ctx_ptr = std::make_unique<MetalContext>();
+            model = load_model(*ctx_ptr, model_dir, max_seq, exact_nvfp4_act, mtp_dir, mtp_depth, enable_pld,
+                               ane_models_dir, ane_tag, kv_bits, ane_share_layers, sparse_kv_budget);
+        }
+        MetalContext& ctx = *ctx_ptr;
+        const ModelInfo& info = model->info();
 
-            std::fprintf(stderr,
-                "[mometal] GPU: %s (max working set %.1f GB)\n"
-                "[mometal] Model: %s | %s | layers=%d visits=%d | weights=%.2f GB (mmap) | cache=%.2f GB | load=%.1f ms\n",
-                ctx.device_name().c_str(),
-                ctx.recommended_max_working_set_size() / (1024.0 * 1024.0 * 1024.0),
-                info.arch.c_str(), info.quant_desc.c_str(),
-                info.num_layers, info.num_visits,
-                info.mapped_weight_bytes / (1024.0 * 1024.0 * 1024.0),
-                info.kv_cache_bytes / (1024.0 * 1024.0 * 1024.0),
-                info.load_time_ms);
+        std::fprintf(stderr,
+            "[mometal] GPU: %s (Apple%d | ~%d cores | ~%.0f GB/s | max working set %.1f GB)\n"
+            "[mometal] Model: %s | %s | layers=%d visits=%d | weights=%.2f GB (mmap) | cache=%.2f GB | load=%.1f ms\n",
+            ctx.device_name().c_str(),
+            static_cast<int>(ctx.gpu_tier()),
+            ctx.estimated_gpu_cores(),
+            ctx.estimated_bandwidth_gbs(),
+            ctx.recommended_max_working_set_size() / (1024.0 * 1024.0 * 1024.0),
+            info.arch.c_str(), info.quant_desc.c_str(),
+            info.num_layers, info.num_visits,
+            info.mapped_weight_bytes / (1024.0 * 1024.0 * 1024.0),
+            info.kv_cache_bytes / (1024.0 * 1024.0 * 1024.0),
+            info.load_time_ms);
 
-            if (cmd == "verify") {
+        if (cmd == "verify") {
+            @autoreleasepool {
                 std::vector<int> ids = parse_csv_ints(tokens_csv);
                 if (ids.empty()) {
                     std::fprintf(stderr, "Error: --tokens 1,2,3 required for verify\n");
@@ -229,8 +279,10 @@ int main(int argc, char** argv) {
                 std::printf("]}\n");
                 return 0;
             }
+        }
 
-            if (cmd == "eval-ppl") {
+        if (cmd == "eval-ppl") {
+            @autoreleasepool {
                 if (tokens_file.empty()) {
                     std::fprintf(stderr, "Error: --tokens-file <path> required for eval-ppl\n");
                     return 1;
@@ -309,7 +361,6 @@ int main(int argc, char** argv) {
                         for (int i = 0; i < 5; ++i) {
                             if (argmax_id == r.top5[i]) { ++argmax_in_ref5; break; }
                         }
-                        // Check if ref top-1 is in our top-5
                         int better = 0;
                         float r0_l = logits[r.top5[0]];
                         for (int v = 0; v < V; ++v) if (logits[v] > r0_l) { if (++better >= 5) break; }
@@ -334,17 +385,19 @@ int main(int argc, char** argv) {
 
                 auto t0 = std::chrono::steady_clock::now();
                 for (size_t pi = 0; pi < passages.size(); ++pi) {
-                    const auto& ids = passages[pi];
-                    model->reset();
-                    const float* lg = model->forward(ids.data(), eval_prefix_len);
-                    score_logits(lg, ids[eval_prefix_len]);
-                    for (size_t pos = static_cast<size_t>(eval_prefix_len); pos + 1 < ids.size(); ++pos) {
-                        int cur = ids[pos];
-                        lg = model->forward(&cur, 1);
-                        score_logits(lg, ids[pos + 1]);
+                    @autoreleasepool {
+                        const auto& ids = passages[pi];
+                        model->reset();
+                        const float* lg = model->forward(ids.data(), eval_prefix_len);
+                        score_logits(lg, ids[eval_prefix_len]);
+                        for (size_t pos = static_cast<size_t>(eval_prefix_len); pos + 1 < ids.size(); ++pos) {
+                            int cur = ids[pos];
+                            lg = model->forward(&cur, 1);
+                            score_logits(lg, ids[pos + 1]);
+                        }
+                        std::fprintf(stderr, "[eval-ppl] passage %zu/%zu done | running ppl=%.4f\n",
+                                     pi + 1, passages.size(), std::exp(total_nll / std::max<int64_t>(1, total_scored)));
                     }
-                    std::fprintf(stderr, "[eval-ppl] passage %zu/%zu done | running ppl=%.4f\n",
-                                 pi + 1, passages.size(), std::exp(total_nll / std::max<int64_t>(1, total_scored)));
                 }
                 auto t1 = std::chrono::steady_clock::now();
                 double dt = std::chrono::duration<double>(t1 - t0).count();
@@ -370,15 +423,18 @@ int main(int argc, char** argv) {
                 std::printf("}\n");
                 return 0;
             }
+        }
 
-            if (cmd == "profile") {
+        if (cmd == "profile") {
+            @autoreleasepool {
                 model->profile_ops();
                 return 0;
             }
+        }
 
-            if (cmd == "bench") {
+        if (cmd == "bench") {
+            @autoreleasepool {
                 std::vector<int> fake_prompt(static_cast<size_t>(prompt_tokens_bench), 100);
-                // Warmup 1 token to fault in mmap pages & warm GPU clocks
                 model->forward_greedy(100);
                 model->reset();
 
@@ -465,16 +521,17 @@ int main(int argc, char** argv) {
                 }
                 return 0;
             }
+        }
 
-            // Commands requiring tokenizer
+        // Commands requiring tokenizer
+        Tokenizer tok;
+        @autoreleasepool {
             auto tok_t0 = std::chrono::steady_clock::now();
-            Tokenizer tok;
             tok.load(model_dir, info.arch);
             auto tok_t1 = std::chrono::steady_clock::now();
             std::fprintf(stderr, "[mometal] Tokenizer loaded (%d tokens) in %.1f ms\n",
                          tok.vocab_size(), std::chrono::duration<double, std::milli>(tok_t1 - tok_t0).count());
 
-            // Optional workspace/repo suffix corpus indexing (--suffix-dir <path>) for zero-cost multi-branch drafting!
             if (!suffix_dirs.empty()) {
                 auto st0 = std::chrono::steady_clock::now();
                 size_t n_files = 0, n_toks = 0;
@@ -524,18 +581,20 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "[mometal] Indexed suffix corpus: %zu files, %zu tokens in %.1f ms\n",
                              n_files, n_toks, s_ms);
             }
+        }
 
-            if (cmd == "serve") {
-                ServerConfig srv_cfg;
-                srv_cfg.host = host;
-                srv_cfg.port = port;
-                srv_cfg.model_id = model_dir;
-                srv_cfg.cache_dir = cache_dir;
-                run_http_server(*model, tok, srv_cfg);
-                return 0;
-            }
+        if (cmd == "serve") {
+            ServerConfig srv_cfg;
+            srv_cfg.host = host;
+            srv_cfg.port = port;
+            srv_cfg.model_id = model_dir;
+            srv_cfg.cache_dir = cache_dir;
+            run_http_server(*model, tok, srv_cfg);
+            return 0;
+        }
 
-            if (cmd == "run") {
+        if (cmd == "run") {
+            @autoreleasepool {
                 std::string full_prompt = prompt;
                 if (!raw_prompt) {
                     std::vector<ChatMessage> msgs;
@@ -651,31 +710,33 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "\n");
                 return 0;
             }
+        }
 
-            if (cmd == "chat") {
-                std::vector<ChatMessage> history;
-                if (!system_prompt.empty()) history.push_back(ChatMessage{"system", system_prompt, {}, {}, {}, {}});
-                std::vector<int> cached_ids;
-                PrefixCacheManager disk_cache(cache_dir);
-                Sampler sampler(sc);
+        if (cmd == "chat") {
+            std::vector<ChatMessage> history;
+            if (!system_prompt.empty()) history.push_back(ChatMessage{"system", system_prompt, {}, {}, {}, {}});
+            std::vector<int> cached_ids;
+            PrefixCacheManager disk_cache(cache_dir);
+            Sampler sampler(sc);
 
-                std::fprintf(stderr, "Interactive chat started. Type /reset to clear context, /quit to exit.\n");
-                std::string line;
-                while (true) {
-                    std::fprintf(stderr, "\n> ");
-                    if (!std::getline(std::cin, line)) break;
-                    if (line == "/quit" || line == "/exit") break;
-                    if (line == "/reset") {
-                        history.clear();
-                        if (!system_prompt.empty()) history.push_back(ChatMessage{"system", system_prompt, {}, {}, {}, {}});
-                        cached_ids.clear();
-                        model->reset();
-                        sampler.reset(sc.seed);
-                        std::fprintf(stderr, "[context cleared]\n");
-                        continue;
-                    }
-                    if (line.empty()) continue;
+            std::fprintf(stderr, "Interactive chat started. Type /reset to clear context, /quit to exit.\n");
+            std::string line;
+            while (true) {
+                std::fprintf(stderr, "\n> ");
+                if (!std::getline(std::cin, line)) break;
+                if (line == "/quit" || line == "/exit") break;
+                if (line == "/reset") {
+                    history.clear();
+                    if (!system_prompt.empty()) history.push_back(ChatMessage{"system", system_prompt, {}, {}, {}, {}});
+                    cached_ids.clear();
+                    model->reset();
+                    sampler.reset(sc.seed);
+                    std::fprintf(stderr, "[context cleared]\n");
+                    continue;
+                }
+                if (line.empty()) continue;
 
+                @autoreleasepool {
                     history.push_back(ChatMessage{"user", line, {}, {}, {}, {}});
                     std::string rendered = tok.apply_chat_template(history, true, effort);
                     std::vector<int> ids = tok.encode(rendered, true);
@@ -766,15 +827,15 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "]\n");
                     history.push_back(ChatMessage{"assistant", reply, {}, {}, {}, {}});
                 }
-                return 0;
             }
-
-            std::fprintf(stderr, "Unknown command: %s\n", cmd.c_str());
-            print_usage();
-            return 1;
-        } catch (const std::exception& ex) {
-            std::fprintf(stderr, "Fatal: %s\n", ex.what());
-            return 1;
+            return 0;
         }
+
+        std::fprintf(stderr, "Unknown command: %s\n", cmd.c_str());
+        print_usage();
+        return 1;
+    } catch (const std::exception& ex) {
+        std::fprintf(stderr, "Fatal: %s\n", ex.what());
+        return 1;
     }
 }

@@ -10,11 +10,14 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
-#include <cstdlib>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <stdexcept>
+
+namespace fs = std::filesystem;
 
 namespace mi {
 
@@ -87,15 +90,37 @@ std::pair<int, int> smart_resize_qwen(int height, int width, int factor, int min
     return {h_bar, w_bar};
 }
 
+// Fast JSON-only probe to detect whether model_dir contains vision weights (0 MB mmap, 0 ms shader compile!)
+std::string probe_vision_prefix_on_disk(const std::string& model_dir) {
+    std::string index_path = model_dir + "/model.safetensors.index.json";
+    if (fs::is_regular_file(index_path)) {
+        Json idx = parse_json(read_file_to_string(index_path));
+        const auto& wm = idx["weight_map"].as_object();
+        if (wm.count("vision_tower.patch_embed.proj.weight")) return "vision_tower.";
+        if (wm.count("model.visual.patch_embed.proj.weight")) return "model.visual.";
+        return "";
+    }
+    std::string single = model_dir + "/model.safetensors";
+    if (fs::is_regular_file(single)) {
+        std::ifstream ifs(single, std::ios::binary);
+        if (!ifs) return "";
+        uint64_t hlen = 0;
+        ifs.read(reinterpret_cast<char*>(&hlen), 8);
+        if (!ifs || hlen == 0 || hlen > (64ull << 20)) return "";
+        std::string hstr(static_cast<size_t>(hlen), '\0');
+        ifs.read(hstr.data(), static_cast<std::streamsize>(hlen));
+        if (!ifs) return "";
+        Json hdr = parse_json(hstr);
+        const auto& obj = hdr.as_object();
+        if (obj.count("vision_tower.patch_embed.proj.weight")) return "vision_tower.";
+        if (obj.count("model.visual.patch_embed.proj.weight")) return "model.visual.";
+    }
+    return "";
+}
+
 } // namespace
 
-QwenVisionTower::QwenVisionTower(MetalContext& ctx, const SafetensorsStore& store, const std::string& model_dir)
-    : ctx_(ctx) {
-    std::string pfx;
-    if (store.has("vision_tower.patch_embed.proj.weight")) pfx = "vision_tower.";
-    else if (store.has("model.visual.patch_embed.proj.weight")) pfx = "model.visual.";
-    else return; // Text-only checkpoint (no vision weights)
-
+void QwenVisionTower::parse_vision_config(const std::string& model_dir) {
     Json cfg = parse_json(read_file_to_string(model_dir + "/config.json"));
     if (cfg.contains("vision_config") && cfg["vision_config"].is_object()) {
         const Json& vc = cfg["vision_config"];
@@ -111,16 +136,18 @@ QwenVisionTower::QwenVisionTower(MetalContext& ctx, const SafetensorsStore& stor
         num_pos_embed_       = static_cast<int>(vc["num_position_embeddings"].as_int(2304));
         num_grid_per_side_   = static_cast<int>(std::round(std::sqrt(static_cast<double>(num_pos_embed_))));
     }
+}
 
+void QwenVisionTower::init_pipelines_and_weights(const SafetensorsStore& store, const std::string& pfx) {
     std::string shader_dir = MOMETAL_SHADER_DIR;
     ctx_.load_shader_file("vision", shader_dir + "/vision.metal");
-    pso_gemm_            = ctx_.pipeline("vision", "vis_bf16_gemm_f16x");
-    pso_gemm_gelu_tanh_  = ctx_.pipeline("vision", "vis_bf16_gemm_gelu_tanh_f16x");
-    pso_gemm_gelu_exact_ = ctx_.pipeline("vision", "vis_bf16_gemm_gelu_exact_f16x");
+    pso_gemm_             = ctx_.pipeline("vision", "vis_bf16_gemm_f16x");
+    pso_gemm_gelu_tanh_   = ctx_.pipeline("vision", "vis_bf16_gemm_gelu_tanh_f16x");
+    pso_gemm_gelu_exact_  = ctx_.pipeline("vision", "vis_bf16_gemm_gelu_exact_f16x");
     pso_pos_add_norm_f16_ = ctx_.pipeline("vision", "vis_add_pos_and_norm_f16");
-    pso_norm_f16_        = ctx_.pipeline("vision", "vis_layernorm_f16");
-    pso_qkv_rope_        = ctx_.pipeline("vision", "vis_qkv_rope_split");
-    pso_flash_attn_      = ctx_.pipeline("vision", "vis_flash_attn_f16");
+    pso_norm_f16_         = ctx_.pipeline("vision", "vis_layernorm_f16");
+    pso_qkv_rope_         = ctx_.pipeline("vision", "vis_qkv_rope_split");
+    pso_flash_attn_       = ctx_.pipeline("vision", "vis_flash_attn_f16");
 
     // Precompute exact u8 -> BF16 LUT (round-to-nearest-even) for native M4 bfloat8x8 PatchEmbed!
     for (int i = 0; i < 256; ++i) {
@@ -158,8 +185,57 @@ QwenVisionTower::QwenVisionTower(MetalContext& ctx, const SafetensorsStore& stor
     merger_fc1_b_  = store.get(pfx + "merger.linear_fc1.bias");
     merger_fc2_w_  = store.get(pfx + "merger.linear_fc2.weight");
     merger_fc2_b_  = store.get(pfx + "merger.linear_fc2.bias");
+}
 
+QwenVisionTower::QwenVisionTower(MetalContext& ctx, const SafetensorsStore& store, const std::string& model_dir)
+    : ctx_(ctx), model_dir_(model_dir) {
+    if (store.has("vision_tower.patch_embed.proj.weight")) pfx_ = "vision_tower.";
+    else if (store.has("model.visual.patch_embed.proj.weight")) pfx_ = "model.visual.";
+    else return; // Text-only checkpoint (no vision weights)
+
+    parse_vision_config(model_dir);
+    init_pipelines_and_weights(store, pfx_);
     ready_ = true;
+    loaded_ = true;
+}
+
+QwenVisionTower::QwenVisionTower(MetalContext& ctx) : ctx_(ctx) {}
+
+bool QwenVisionTower::init_lazy(const std::string& model_dir) {
+    std::string pfx = probe_vision_prefix_on_disk(model_dir);
+    if (pfx.empty()) {
+        ready_ = false;
+        loaded_ = false;
+        return false;
+    }
+    model_dir_ = model_dir;
+    pfx_ = std::move(pfx);
+    parse_vision_config(model_dir);
+    ready_ = true;
+    loaded_ = false;
+    return true;
+}
+
+std::unique_ptr<QwenVisionTower> QwenVisionTower::create_lazy(MetalContext& ctx, const std::string& model_dir) {
+    auto v = std::make_unique<QwenVisionTower>(ctx);
+    v->init_lazy(model_dir);
+    return v;
+}
+
+void QwenVisionTower::ensure_loaded() {
+    if (loaded_) return;
+    std::lock_guard<std::mutex> lk(load_mtx_);
+    if (loaded_) return;
+    if (!ready_ || model_dir_.empty() || pfx_.empty()) {
+        throw std::runtime_error("Vision tower not available for this model");
+    }
+    auto t0 = std::chrono::steady_clock::now();
+    own_store_.load_dir_only(ctx_.device(), model_dir_, {pfx_}, true);
+    init_pipelines_and_weights(own_store_, pfx_);
+    loaded_ = true;
+    double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    std::fprintf(stderr, "[vision] Lazily loaded vision tower (%.1f MiB) in %.1f ms\n",
+                 own_store_.total_mapped_bytes() / (1024.0 * 1024.0), ms);
 }
 
 EncodedImage QwenVisionTower::encode_url(const std::string& url, int max_edge) {
@@ -182,6 +258,7 @@ EncodedImage QwenVisionTower::encode_url(const std::string& url, int max_edge) {
 
 EncodedImage QwenVisionTower::encode_bytes(const uint8_t* data, size_t len, int max_edge) {
     if (!ready_) throw std::runtime_error("Vision tower not loaded for this model");
+    ensure_loaded();
 
     uint64_t h = fnv1a_64(data, len);
     h = fnv1a_64(&max_edge, sizeof(max_edge), h);
@@ -419,7 +496,7 @@ EncodedImage QwenVisionTower::run_vit(const std::vector<uint16_t>& patches_f16, 
                  static_cast<uint32_t>(hidden_size_), static_cast<uint32_t>(patch_dim), false);
         barrier();
 
-        // Round 25: Fuse 2D PosEmbed add + Block 0 norm1 into ONE single-pass register-cached kernel!
+        // Fuse 2D PosEmbed add + Block 0 norm1 into ONE single-pass register-cached kernel!
         {
             [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_pos_add_norm_f16_];
             [enc setBuffer:(id<MTLBuffer>)b_hid_ offset:0 atIndex:0];
@@ -438,7 +515,6 @@ EncodedImage QwenVisionTower::run_vit(const std::vector<uint16_t>& patches_f16, 
         for (int i = 0; i < depth_; ++i) {
             const BlockWeights& bw = blocks_[i];
 
-            // norm1 -> b_norm_ (FP16; skipped for i==0 because fused with pos_embed!)
             if (i > 0) {
                 [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_norm_f16_];
                 [enc setBuffer:(id<MTLBuffer>)b_hid_ offset:0 atIndex:0];
@@ -450,12 +526,10 @@ EncodedImage QwenVisionTower::run_vit(const std::vector<uint16_t>& patches_f16, 
                 barrier();
             }
 
-            // QKV proj -> b_qkv_
             gemm_pso(pso_gemm_, bw.qkv_w, bw.qkv_b, b_norm_, b_qkv_, static_cast<uint32_t>(N),
                      static_cast<uint32_t>(3 * hidden_size_), static_cast<uint32_t>(hidden_size_), false);
             barrier();
 
-            // Round 25: Split + 2D Vision RoPE (1 TG/token, 16x fewer cos/sin!) -> b_q_, b_k_, b_v_ (FP16)
             [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_qkv_rope_];
             [enc setBuffer:(id<MTLBuffer>)b_qkv_ offset:0 atIndex:0];
             [enc setBuffer:(id<MTLBuffer>)b_freqs_ offset:0 atIndex:1];
@@ -466,7 +540,6 @@ EncodedImage QwenVisionTower::run_vit(const std::vector<uint16_t>& patches_f16, 
             [enc dispatchThreadgroups:MTLSizeMake(N, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
             barrier();
 
-            // Round 25: 2x-Bandwidth BQ=32, Exact-D=72 Bidirectional AMX FlashAttention -> b_aout_ (FP16)
             [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_flash_attn_];
             [enc setBuffer:(id<MTLBuffer>)b_q_ offset:0 atIndex:0];
             [enc setBuffer:(id<MTLBuffer>)b_k_ offset:0 atIndex:1];
@@ -477,12 +550,10 @@ EncodedImage QwenVisionTower::run_vit(const std::vector<uint16_t>& patches_f16, 
                 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
             barrier();
 
-            // Attn out proj + residual -> b_hid_
             gemm_pso(pso_gemm_, bw.proj_w, bw.proj_b, b_aout_, b_hid_, static_cast<uint32_t>(N),
                      static_cast<uint32_t>(hidden_size_), static_cast<uint32_t>(hidden_size_), true);
             barrier();
 
-            // norm2 -> b_norm_ (FP16, single-pass register-cached!)
             [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_norm_f16_];
             [enc setBuffer:(id<MTLBuffer>)b_hid_ offset:0 atIndex:0];
             [enc setBuffer:(id<MTLBuffer>)bw.norm2_w.buffer offset:bw.norm2_w.offset atIndex:1];
@@ -492,12 +563,10 @@ EncodedImage QwenVisionTower::run_vit(const std::vector<uint16_t>& patches_f16, 
             [enc dispatchThreadgroups:MTLSizeMake(N, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             barrier();
 
-            // Round 24: Fused MLP fc1 + bias + GELU(tanh) -> FP16 b_aout_ (zero FP32 [N,4304] round-trip!)
             gemm_pso(pso_gemm_gelu_tanh_, bw.fc1_w, bw.fc1_b, b_norm_, b_aout_, static_cast<uint32_t>(N),
                      static_cast<uint32_t>(intermediate_size_), static_cast<uint32_t>(hidden_size_), false);
             barrier();
 
-            // MLP fc2 + residual -> b_hid_
             gemm_pso(pso_gemm_, bw.fc2_w, bw.fc2_b, b_aout_, b_hid_, static_cast<uint32_t>(N),
                      static_cast<uint32_t>(hidden_size_), static_cast<uint32_t>(intermediate_size_), true);
             barrier();

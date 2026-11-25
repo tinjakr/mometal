@@ -6,6 +6,8 @@
 
 #include <cstdint>
 #include <list>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -14,15 +16,24 @@ namespace mi {
 
 // Native Zero-Python Qwen 3.5 / 3.8 Vision Tower (27-layer BF16 ViT + 2D RoPE + PatchMerger)
 // Uses macOS ImageIO/CoreGraphics for PNG/JPEG/WebP/HEIC decoding + Hardware AMX Metal kernels!
+// Supports lazy initialization (init_lazy / create_lazy) so text-only runs incur 0 B vision RAM & 0 ms vision.metal compile!
 class QwenVisionTower {
 public:
+    // Eager constructor (loads weights from an already-mapped SafetensorsStore)
     QwenVisionTower(MetalContext& ctx, const SafetensorsStore& store, const std::string& model_dir);
+
+    // Lazy constructor: call init_lazy(model_dir) to detect vision availability with 0 MB mmap & 0 ms shader compile
+    explicit QwenVisionTower(MetalContext& ctx);
+    bool init_lazy(const std::string& model_dir);
+    static std::unique_ptr<QwenVisionTower> create_lazy(MetalContext& ctx, const std::string& model_dir);
+
     ~QwenVisionTower() = default;
 
     QwenVisionTower(const QwenVisionTower&) = delete;
     QwenVisionTower& operator=(const QwenVisionTower&) = delete;
 
     bool ready() const { return ready_; }
+    bool loaded() const { return loaded_; }
     int out_hidden_size() const { return out_hidden_size_; }
     int spatial_merge_size() const { return spatial_merge_size_; }
 
@@ -46,6 +57,11 @@ private:
 
     MetalContext& ctx_;
     bool ready_ = false;
+    bool loaded_ = false;
+    std::string model_dir_;
+    std::string pfx_;
+    SafetensorsStore own_store_;
+    std::mutex load_mtx_;
 
     int depth_ = 27;
     int hidden_size_ = 1152;
@@ -75,7 +91,7 @@ private:
     id pso_qkv_rope_ = nil;
     id pso_flash_attn_ = nil;
 
-    // Round 24: Precomputed u8 -> FP16 LUT + persistent grow-on-demand GPU scratch arena!
+    // Precomputed u8 -> BF16 LUT + persistent grow-on-demand GPU scratch arena
     uint16_t lut_u8_to_f16_[256] = {};
     int scratch_cap_n_ = 0;
     id b_patches_ = nil;
@@ -91,6 +107,9 @@ private:
     id b_aout_ = nil;
     id b_out_ = nil;
 
+    void parse_vision_config(const std::string& model_dir);
+    void init_pipelines_and_weights(const SafetensorsStore& store, const std::string& pfx);
+    void ensure_loaded();
     void ensure_scratch(int N);
 
     // In-memory LRU Vision Feature Cache (up to 16 images -> 0 ms ViT on follow-up turns!)
