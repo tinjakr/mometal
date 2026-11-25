@@ -1,0 +1,47 @@
+==========================================================================================
+metal-infer [84517]: 64-bit    Footprint: 20083467248 B (16384 bytes per page)
+==========================================================================================
+
+      Dirty     (Swapped)         Clean   Reclaimable       (Wired)    Regions    Category
+        ---           ---           ---           ---           ---        ---    ---
+16551968768 B  1159151616 B           0 B           0 B 15388262400 B       1777    IOAccelerator (graphics)
+3378593792 B    47169536 B           0 B           0 B  3319087104 B        313    Owned physical footprint (unmapped) (graphics)
+ 66830336 B    26804224 B           0 B           0 B           0 B         38    Malloc Small
+ 40812544 B     7405568 B           0 B           0 B           0 B          8    Malloc Large
+ 21233664 B           0 B           0 B           0 B      114688 B         15    IOSurface
+ 17507312 B           0 B           0 B           0 B    17507312 B          1    page table
+  2260992 B       16384 B           0 B       98304 B           0 B        140    Stack
+  1343488 B      409600 B           0 B           0 B           0 B         10    Malloc Metadata
+   655360 B           0 B           0 B           0 B      655360 B         14    IOAccelerator
+   570920 B      278815 B           0 B           0 B           0 B        301    __DATA_DIRTY
+   338629 B      174441 B           0 B           0 B           0 B        354    __DATA
+   311296 B       32768 B           0 B           0 B           0 B          1    Malloc Tiny
+   271507 B      118664 B           0 B           0 B           0 B       1033    unused dyld shared cache area
+   212992 B      114688 B           0 B           0 B           0 B         15    Untagged
+   131072 B           0 B           0 B           0 B           0 B          4    Malloc Nano
+   101856 B       68296 B           0 B           0 B           0 B        181    __AUTH
+    65536 B       32768 B           0 B           0 B           0 B          1    Deferred Reclaim
+    65536 B           0 B           0 B           0 B       81920 B          6    IOKit
+    49080 B       32768 B           0 B           0 B           0 B          4    __TPRO_CONST
+    48000 B           0 B           0 B           0 B           0 B          1    __OBJC_RW
+    45416 B       15144 B       16384 B           0 B           0 B        345    __DATA_CONST
+    32768 B           0 B           0 B           0 B           0 B          1    Activity Tracing
+    16384 B       16384 B           0 B           0 B           0 B          1    OS Alloc Once
+        0 B           0 B 10314153984 B           0 B           0 B         13    mapped file
+        0 B           0 B  9335472128 B           0 B  9335472128 B        192    Owned physical footprint (unmapped) (neural) (nofootprint)
+        0 B           0 B      491520 B           0 B           0 B        411    __TEXT
+        0 B           0 B           0 B           0 B           0 B          1    __OBJC_RO
+        0 B           0 B           0 B           0 B           0 B          2    __LINKEDIT
+        0 B           0 B           0 B           0 B           0 B          1    __FONT_DATA
+        0 B           0 B           0 B           0 B           0 B          1    __CTF
+        0 B           0 B           0 B           0 B           0 B        346    __AUTH_CONST
+        0 B           0 B           0 B           0 B           0 B        128    Neural Engine
+        ---           ---           ---           ---           ---        ---    ---
+20083467248 B  1241841664 B 19650134016 B       98304 B 28061180912 B       5661    TOTAL
+
+Auxiliary data:
+    neural: 9335472128 B
+    neural_peak: 9335472128 B
+    phys_footprint: 20083467248 B
+    phys_footprint_peak: 20154016752 B
+

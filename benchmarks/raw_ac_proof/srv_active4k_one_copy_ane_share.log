@@ -1,0 +1,8 @@
+[ane-share] Shared 64/64 hf4 MLP layers (single-copy model.hwx) in 520.7 ms
+[metal-infer] GPU: Apple M4 Max (max working set 37.4 GB)
+[metal-infer] Model: qwen38 | Q4_AFFINE_G64 (MMA) + GDN-BF16 + KV8 + ANE(hf4) + ANE-Share(64/64) + Vision + MTP depth 5 + PLD | layers=64 visits=64 | weights=6.44 GB (mmap) | cache=0.46 GB | load=2063.2 ms
+[metal-infer] Tokenizer loaded (248077 tokens) in 94.5 ms
+[metal-infer] GPU warmup complete in 140.7 ms
+[metal-infer] Serving ~/models/qwen38-pi-adapted-mlx4 (qwen38) on http://127.0.0.1:8098
+[req] prompt=15 (cached=0, rest=0.0ms, vis=0.0ms, imgs=0) gen=1 tools=0 ttft=79.5ms decode=0.0 tok/s mtp=4/7(57%,pld=0)
+[req] prompt=3718 (cached=0, rest=0.0ms, vis=0.0ms, imgs=0) gen=64 tools=0 ttft=5812.9ms decode=56.4 tok/s mtp=42/154(27%,pld=0)

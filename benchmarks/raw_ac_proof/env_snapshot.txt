@@ -1,0 +1,38 @@
+{
+  "timestamp": "2026-11-25T12:26:41+0100",
+  "sw_vers": "ProductName:\t\tmacOS\nProductVersion:\t\t27.0\nBuildVersion:\t\t26A428",
+  "chip": "Apple M4 Max",
+  "memsize_gib": 48.0,
+  "pmset_batt": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=7667811)\t100%; charged; 0:00 remaining present: true",
+  "pmset_therm": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+  "binary_sha256": "8941b000e9ab5b9dd34319c99cb5f984b38315ac91d5c1c7eba7beb1fed42c3f",
+  "idle_vm_wired_gib": 2.78,
+  "idle_vm_compressor_gib": 1.672,
+  "idle_vm_free_gib": 18.699,
+  "top_background_processes": "PID    RSS COMM\n84103 455696 /Library/Frameworks/Python.framework/Versions/3.13/Resources/Python.app/Contents/MacOS/Python\n 8814 877632 /System/Library/Frameworks/Virtualization.framework/Versions/A/XPCServices/com.apple.Virtualization.VirtualMachine.xpc/Contents/MacOS/com.apple.Virtualization.VirtualMachine\n 8434 105488 /Applications/Docker.app/Contents/MacOS/com.docker.backend\n  171  40032 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer\n 8801  72016 /Applications/Docker.app/Contents/MacOS/Docker Desktop.app/Contents/MacOS/Docker Desktop\n 4721  39168 /Applications/Ghostty.app/Contents/MacOS/ghostty\n14659  20736 /Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Framework.framework/Versions/157.0.8103.80/Helpers/Google Chrome Helper (Aperitif Renderer).app/Contents/MacOS/Google Chrome Helper (Aperitif Renderer)\n61248  91952 /Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Framework.framework/Versions/157.0.8103.80/Helpers/Google Chrome Helper (Aperitif Renderer).app/Contents/MacOS/Google Chrome Helper (Aperitif Renderer)\n 8403  26256 /Applications/Docker.app/Contents/MacOS/com.docker.backend\n53723 174976 claude\n61121 903520 agy\n  166   4320 /usr/sbin/notifyd\n 8962 101808 /Applications/Docker.app/Contents/MacOS/Docker Desktop.app/Contents/Frameworks/Docker Desktop Helper (Renderer).app/Contents/MacOS/Docker Desktop Helper (Renderer)\n31869 461280 agy\n  296  43680 /System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN\n  101  26656 /usr/libexec/logd\n    1  20320 /sbin/launchd\n  174   5328 /usr/sbin/cfprefsd\n 5106  25552 ~/.local/bin/herdr\n  495  44032 /System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter"
+}
+
+--- IDLE vm_stat ---
+Mach Virtual Memory Statistics: (page size of 16384 bytes)
+Pages free:                                  1225440.
+Pages active:                                 785639.
+Pages inactive:                               766510.
+Pages speculative:                             18046.
+Pages throttled:                                   0.
+Pages wired down:                             182210.
+Pages purgeable:                               10466.
+"Translation faults":                     2022843611.
+Pages copy-on-write:                        65065488.
+Pages zero filled:                        1420790744.
+Pages reactivated:                         272988110.
+Pages purged:                                6376267.
+File-backed pages:                           1176620.
+Anonymous pages:                              393575.
+Pages stored in compressor:                   240887.
+Pages occupied by compressor:                 109574.
+Decompressions:                            633502989.
+Compressions:                              694008627.
+Pageins:                                   177794429.
+Pageouts:                                      81922.
+Swapins:                                      554361.
+Swapouts:                                    1313023.

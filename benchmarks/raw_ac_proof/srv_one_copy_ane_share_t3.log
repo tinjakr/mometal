@@ -1,0 +1,19 @@
+[ane-share] Shared 64/64 hf4 MLP layers (single-copy model.hwx) in 283.5 ms
+[metal-infer] GPU: Apple M4 Max (max working set 37.4 GB)
+[metal-infer] Model: qwen38 | Q4_AFFINE_G64 (MMA) + GDN-BF16 + KV8 + ANE(hf4) + ANE-Share(64/64) + Vision + MTP depth 5 + PLD | layers=64 visits=64 | weights=6.44 GB (mmap) | cache=0.46 GB | load=2449.7 ms
+[metal-infer] Tokenizer loaded (248077 tokens) in 95.8 ms
+[metal-infer] GPU warmup complete in 142.9 ms
+[metal-infer] Serving ~/models/qwen38-pi-adapted-mlx4 (qwen38) on http://127.0.0.1:8098
+[metal-infer] Disk prefix cache enabled: /tmp/mi_ac_verify_cache/one_copy_ane_share_t3
+[req] prompt=15 (cached=0, rest=0.0ms, vis=0.0ms, imgs=0) gen=1 tools=0 ttft=91.9ms decode=0.0 tok/s mtp=4/7(57%,pld=0)
+[req] prompt=21 (cached=0, rest=0.0ms, vis=0.0ms, imgs=0) gen=20 tools=0 ttft=122.3ms decode=138.3 tok/s mtp=17/21(81%,pld=0)
+[req] prompt=3717 (cached=0, rest=0.0ms, vis=0.0ms, imgs=0) gen=1 tools=0 ttft=5956.5ms decode=0.0 tok/s mtp=4/4(100%,pld=1)
+[req] prompt=3717 (cached=3710, rest=125.2ms, vis=0.0ms, imgs=0) gen=1 tools=0 ttft=196.8ms decode=0.0 tok/s mtp=4/4(100%,pld=1)
+[req] prompt=66 (cached=0, rest=0.0ms, vis=0.0ms, imgs=0) gen=384 tools=0 ttft=373.3ms decode=83.3 tok/s mtp=292/686(43%,pld=2)
+[req] prompt=54 (cached=0, rest=0.0ms, vis=0.0ms, imgs=0) gen=384 tools=0 ttft=270.2ms decode=114.5 tok/s mtp=319/497(64%,pld=14)
+[req] prompt=284 (cached=0, rest=0.0ms, vis=0.0ms, imgs=0) gen=384 tools=0 ttft=902.4ms decode=110.2 tok/s mtp=310/525(59%,pld=30)
+[req] prompt=50 (cached=0, rest=0.0ms, vis=0.0ms, imgs=0) gen=384 tools=0 ttft=269.3ms decode=67.1 tok/s mtp=261/855(31%,pld=3)
+[req] prompt=54 (cached=0, rest=0.0ms, vis=0.0ms, imgs=0) gen=384 tools=0 ttft=274.1ms decode=101.8 tok/s mtp=306/553(55%,pld=23)
+[req] prompt=54 (cached=0, rest=0.0ms, vis=0.0ms, imgs=0) gen=384 tools=0 ttft=276.4ms decode=113.1 tok/s mtp=312/504(62%,pld=36)
+[req] prompt=50 (cached=0, rest=0.0ms, vis=0.0ms, imgs=0) gen=384 tools=0 ttft=274.6ms decode=59.5 tok/s mtp=250/901(28%,pld=1)
+[req] prompt=50 (cached=0, rest=0.0ms, vis=0.0ms, imgs=0) gen=384 tools=0 ttft=276.8ms decode=72.7 tok/s mtp=273/760(36%,pld=14)

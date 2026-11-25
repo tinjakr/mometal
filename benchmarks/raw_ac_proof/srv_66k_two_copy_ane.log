@@ -1,0 +1,7 @@
+[metal-infer] GPU: Apple M4 Max (max working set 37.4 GB)
+[metal-infer] Model: qwen38 | Q4_AFFINE_G64 (MMA) + GDN-BF16 + KV8 + ANE(hf4) + Vision + MTP depth 5 + PLD | layers=64 visits=64 | weights=15.40 GB (mmap) | cache=0.46 GB | load=5763.9 ms
+[metal-infer] Tokenizer loaded (248077 tokens) in 109.8 ms
+[metal-infer] GPU warmup complete in 1659.7 ms
+[metal-infer] Serving ~/models/qwen38-pi-adapted-mlx4 (qwen38) on http://127.0.0.1:8098
+[req] prompt=15 (cached=0, rest=0.0ms, vis=0.0ms, imgs=0) gen=1 tools=0 ttft=83.6ms decode=0.0 tok/s mtp=4/7(57%,pld=0)
+[req] prompt=65865 (cached=0, rest=0.0ms, vis=0.0ms, imgs=0) gen=256 tools=0 ttft=211129.6ms decode=37.0 tok/s mtp=166/465(36%,pld=9)

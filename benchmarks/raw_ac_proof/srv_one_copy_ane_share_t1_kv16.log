@@ -1,0 +1,15 @@
+[ane-share] Shared 64/64 hf4 MLP layers (single-copy model.hwx) in 159.8 ms
+[metal-infer] GPU: Apple M4 Max (max working set 37.4 GB)
+[metal-infer] Model: qwen38 | Q4_AFFINE_G64 (MMA) + GDN-BF16 + ANE(hf4) + ANE-Share(64/64) + Vision + MTP depth 5 + PLD | layers=64 visits=64 | weights=6.44 GB (mmap) | cache=0.70 GB | load=1599.5 ms
+[metal-infer] Tokenizer loaded (248077 tokens) in 95.9 ms
+[metal-infer] GPU warmup complete in 151.1 ms
+[metal-infer] Serving ~/models/qwen38-pi-adapted-mlx4 (qwen38) on http://127.0.0.1:8098
+[metal-infer] Disk prefix cache enabled: /tmp/mi_ac_verify_cache/one_copy_ane_share_t1_kv16
+[req] prompt=15 (cached=0, rest=0.0ms, vis=0.0ms, imgs=0) gen=1 tools=0 ttft=79.6ms decode=0.0 tok/s mtp=4/7(57%,pld=0)
+[req] prompt=21 (cached=0, rest=0.0ms, vis=0.0ms, imgs=0) gen=20 tools=0 ttft=122.3ms decode=135.6 tok/s mtp=17/21(81%,pld=0)
+[req] prompt=3720 (cached=0, rest=0.0ms, vis=0.0ms, imgs=0) gen=1 tools=0 ttft=6047.1ms decode=0.0 tok/s mtp=4/4(100%,pld=1)
+[req] prompt=3720 (cached=3713, rest=207.6ms, vis=0.0ms, imgs=0) gen=1 tools=0 ttft=261.5ms decode=0.0 tok/s mtp=4/4(100%,pld=1)
+[req] prompt=66 (cached=0, rest=0.0ms, vis=0.0ms, imgs=0) gen=384 tools=0 ttft=372.4ms decode=82.8 tok/s mtp=288/693(42%,pld=6)
+[req] prompt=54 (cached=0, rest=0.0ms, vis=0.0ms, imgs=0) gen=384 tools=0 ttft=269.9ms decode=112.7 tok/s mtp=318/504(63%,pld=14)
+[req] prompt=284 (cached=0, rest=0.0ms, vis=0.0ms, imgs=0) gen=384 tools=0 ttft=928.5ms decode=106.6 tok/s mtp=309/539(57%,pld=22)
+[req] prompt=50 (cached=0, rest=0.0ms, vis=0.0ms, imgs=0) gen=384 tools=0 ttft=269.0ms decode=69.9 tok/s mtp=268/820(33%,pld=2)

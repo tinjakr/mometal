@@ -1,0 +1,18 @@
+[metal-infer] GPU: Apple M4 Max (max working set 37.4 GB)
+[metal-infer] Model: qwen38 | Q4_AFFINE_G64 (MMA) + GDN-BF16 + KV8 + Vision + MTP depth 5 + PLD | layers=64 visits=64 | weights=15.40 GB (mmap) | cache=0.46 GB | load=5621.5 ms
+[metal-infer] Tokenizer loaded (248077 tokens) in 105.9 ms
+[metal-infer] GPU warmup complete in 1207.2 ms
+[metal-infer] Serving ~/models/qwen38-pi-adapted-mlx4 (qwen38) on http://127.0.0.1:8098
+[metal-infer] Disk prefix cache enabled: /tmp/mi_ac_verify_cache/gpu_only_g64_t1
+[req] prompt=15 (cached=0, rest=0.0ms, vis=0.0ms, imgs=0) gen=1 tools=0 ttft=81.3ms decode=0.0 tok/s mtp=4/7(57%,pld=0)
+[req] prompt=21 (cached=0, rest=0.0ms, vis=0.0ms, imgs=0) gen=20 tools=0 ttft=140.8ms decode=103.8 tok/s mtp=20/28(71%,pld=0)
+[req] prompt=3717 (cached=0, rest=0.0ms, vis=0.0ms, imgs=0) gen=1 tools=0 ttft=13707.2ms decode=0.0 tok/s mtp=4/4(100%,pld=1)
+[req] prompt=3717 (cached=3710, rest=107.5ms, vis=0.0ms, imgs=0) gen=1 tools=0 ttft=163.2ms decode=0.0 tok/s mtp=4/4(100%,pld=1)
+[req] prompt=66 (cached=0, rest=0.0ms, vis=0.0ms, imgs=0) gen=384 tools=0 ttft=483.3ms decode=86.8 tok/s mtp=290/658(44%,pld=10)
+[req] prompt=54 (cached=0, rest=0.0ms, vis=0.0ms, imgs=0) gen=384 tools=0 ttft=326.4ms decode=100.7 tok/s mtp=310/539(58%,pld=9)
+[req] prompt=284 (cached=0, rest=0.0ms, vis=0.0ms, imgs=0) gen=384 tools=0 ttft=1338.3ms decode=108.7 tok/s mtp=310/532(58%,pld=47)
+[req] prompt=50 (cached=0, rest=0.0ms, vis=0.0ms, imgs=0) gen=384 tools=0 ttft=322.3ms decode=71.1 tok/s mtp=272/775(35%,pld=7)
+[req] prompt=54 (cached=0, rest=0.0ms, vis=0.0ms, imgs=0) gen=384 tools=0 ttft=323.1ms decode=132.1 tok/s mtp=328/427(77%,pld=31)
+[req] prompt=54 (cached=0, rest=0.0ms, vis=0.0ms, imgs=0) gen=384 tools=0 ttft=322.1ms decode=115.2 tok/s mtp=314/483(65%,pld=25)
+[req] prompt=50 (cached=0, rest=0.0ms, vis=0.0ms, imgs=0) gen=384 tools=0 ttft=322.8ms decode=62.4 tok/s mtp=258/865(30%,pld=13)
+[req] prompt=50 (cached=0, rest=0.0ms, vis=0.0ms, imgs=0) gen=384 tools=0 ttft=322.3ms decode=63.5 tok/s mtp=265/855(31%,pld=12)

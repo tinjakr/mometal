@@ -1,0 +1,18 @@
+[metal-infer] GPU: Apple M4 Max (max working set 37.4 GB)
+[metal-infer] Model: qwen38 | Q4_AFFINE_G64 (MMA) + GDN-BF16 + KV8 + ANE(hf4) + Vision + MTP depth 5 + PLD | layers=64 visits=64 | weights=15.40 GB (mmap) | cache=0.46 GB | load=6613.3 ms
+[metal-infer] Tokenizer loaded (248077 tokens) in 107.0 ms
+[metal-infer] GPU warmup complete in 1607.0 ms
+[metal-infer] Serving ~/models/qwen38-pi-adapted-mlx4 (qwen38) on http://127.0.0.1:8098
+[metal-infer] Disk prefix cache enabled: /tmp/mi_ac_verify_cache/two_copy_ane_t3
+[req] prompt=15 (cached=0, rest=0.0ms, vis=0.0ms, imgs=0) gen=1 tools=0 ttft=86.3ms decode=0.0 tok/s mtp=4/7(57%,pld=0)
+[req] prompt=21 (cached=0, rest=0.0ms, vis=0.0ms, imgs=0) gen=20 tools=0 ttft=141.0ms decode=103.2 tok/s mtp=20/28(71%,pld=0)
+[req] prompt=3716 (cached=0, rest=0.0ms, vis=0.0ms, imgs=0) gen=1 tools=0 ttft=7991.7ms decode=0.0 tok/s mtp=4/4(100%,pld=1)
+[req] prompt=3716 (cached=3709, rest=189.0ms, vis=0.0ms, imgs=0) gen=1 tools=0 ttft=244.2ms decode=0.0 tok/s mtp=4/4(100%,pld=1)
+[req] prompt=66 (cached=0, rest=0.0ms, vis=0.0ms, imgs=0) gen=384 tools=0 ttft=485.0ms decode=88.3 tok/s mtp=290/658(44%,pld=10)
+[req] prompt=54 (cached=0, rest=0.0ms, vis=0.0ms, imgs=0) gen=384 tools=0 ttft=307.5ms decode=105.8 tok/s mtp=310/539(58%,pld=9)
+[req] prompt=284 (cached=0, rest=0.0ms, vis=0.0ms, imgs=0) gen=384 tools=0 ttft=926.9ms decode=113.5 tok/s mtp=311/525(59%,pld=46)
+[req] prompt=50 (cached=0, rest=0.0ms, vis=0.0ms, imgs=0) gen=384 tools=0 ttft=307.6ms decode=73.0 tok/s mtp=272/775(35%,pld=7)
+[req] prompt=54 (cached=0, rest=0.0ms, vis=0.0ms, imgs=0) gen=384 tools=0 ttft=322.9ms decode=114.3 tok/s mtp=313/495(63%,pld=30)
+[req] prompt=54 (cached=0, rest=0.0ms, vis=0.0ms, imgs=0) gen=384 tools=0 ttft=319.3ms decode=123.1 tok/s mtp=317/462(69%,pld=35)
+[req] prompt=50 (cached=0, rest=0.0ms, vis=0.0ms, imgs=0) gen=384 tools=0 ttft=325.7ms decode=72.5 tok/s mtp=274/747(37%,pld=7)
+[req] prompt=50 (cached=0, rest=0.0ms, vis=0.0ms, imgs=0) gen=384 tools=0 ttft=320.1ms decode=71.3 tok/s mtp=272/773(35%,pld=21)
