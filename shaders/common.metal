@@ -3802,7 +3802,8 @@ kernel void mtp_sample_draft_gpu(
     float best_v = -INFINITY;
     uint  best_i = 0u;
     for (uint i = tid; i < p.n_parts; i += tg_size) {
-        if (parts[i].val > best_v) { best_v = parts[i].val; best_i = parts[i].idx; }
+        float pv = parts[i].val;
+        if (isfinite(pv) && pv > best_v) { best_v = pv; best_i = parts[i].idx; }
     }
     for (ushort off = 16; off > 0; off >>= 1) {
         float ov = simd_shuffle_down(best_v, off);
@@ -3828,20 +3829,22 @@ kernel void mtp_sample_draft_gpu(
 
     // 2. Scan V logits and compact all within [s_max - margin, s_max] into TG memory
     float cut = s_max - p.margin;
-    for (uint i = tid; i < p.V; i += tg_size) {
-        float v = logits[i];
-        if (v >= cut) {
-            uint slot = atomic_fetch_add_explicit(&c_cnt, 1u, memory_order_relaxed);
-            if (slot < 256u) {
-                c_val[slot] = v;
-                c_id[slot]  = i;
+    if (isfinite(s_max)) {
+        for (uint i = tid; i < p.V; i += tg_size) {
+            float v = logits[i];
+            if (isfinite(v) && v >= cut) {
+                uint slot = atomic_fetch_add_explicit(&c_cnt, 1u, memory_order_relaxed);
+                if (slot < 256u) {
+                    c_val[slot] = v;
+                    c_id[slot]  = i;
+                }
             }
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     uint cnt = atomic_load_explicit(&c_cnt, memory_order_relaxed);
-    if (cnt == 0u || cnt > 256u) {
+    if (!isfinite(s_max) || cnt == 0u || cnt > 256u) {
         // Fallback to deterministic argmax (still 100% mathematically exact in rejection sampling!)
         if (tid == 0u) {
             uint b = s_best;
@@ -4020,7 +4023,8 @@ kernel void mtp_sample_draft_batch_gpu(
     float best_v = -INFINITY;
     uint  best_i = 0u;
     for (uint i = tid; i < p.n_parts; i += tg_size) {
-        if (r_parts[i].val > best_v) { best_v = r_parts[i].val; best_i = r_parts[i].idx; }
+        float pv = r_parts[i].val;
+        if (isfinite(pv) && pv > best_v) { best_v = pv; best_i = r_parts[i].idx; }
     }
     for (ushort off = 16; off > 0; off >>= 1) {
         float ov = simd_shuffle_down(best_v, off);
@@ -4045,20 +4049,22 @@ kernel void mtp_sample_draft_batch_gpu(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     float cut = s_max - p.margin;
-    for (uint i = tid; i < p.V; i += tg_size) {
-        float v = r_logits[i];
-        if (v >= cut) {
-            uint slot = atomic_fetch_add_explicit(&c_cnt, 1u, memory_order_relaxed);
-            if (slot < 256u) {
-                c_val[slot] = v;
-                c_id[slot]  = r_map[i];
+    if (isfinite(s_max)) {
+        for (uint i = tid; i < p.V; i += tg_size) {
+            float v = r_logits[i];
+            if (isfinite(v) && v >= cut) {
+                uint slot = atomic_fetch_add_explicit(&c_cnt, 1u, memory_order_relaxed);
+                if (slot < 256u) {
+                    c_val[slot] = v;
+                    c_id[slot]  = r_map[i];
+                }
             }
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     uint cnt = atomic_load_explicit(&c_cnt, memory_order_relaxed);
-    if (cnt == 0u || cnt > 256u) {
+    if (!isfinite(s_max) || cnt == 0u || cnt > 256u) {
         if (tid == 0u) {
             uint b = s_best;
             tok_buf[p.out_tok_idx[row]] = b;

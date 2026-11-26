@@ -138,32 +138,36 @@ void MetalContext::load_shader_file(const std::string& tag, const std::string& p
         }
     }
 
-    // Fast path: load precompiled .metallib ONLY when present AND strictly newer than (or equal to) source .metal
+    // Fast path: load precompiled .metallib.
+    // When source .metal exists, require .metallib mtime >= source mtime so edits take effect;
+    // when source .metal is absent (relocated/installed binary), load adjacent .metallib directly.
     id<MTLLibrary> lib = nil;
     {
         std::error_code ec_src;
         auto src_mtime = fs::last_write_time(path, ec_src);
-        if (!ec_src) {
-            std::string lib_name = tag + (use_m31 ? "_m31.metallib" : "_m30.metallib");
-            std::vector<std::string> cands;
-            std::string exe_d = executable_dir();
-            if (!exe_d.empty()) cands.push_back(exe_d + "/" + lib_name);
+        const bool has_src = !ec_src;
+
+        std::string lib_name = tag + (use_m31 ? "_m31.metallib" : "_m30.metallib");
+        std::vector<std::string> cands;
+        std::string exe_d = executable_dir();
+        if (!exe_d.empty()) cands.push_back(exe_d + "/" + lib_name);
 #ifdef MOMETAL_METALLIB_DIR
-            std::string build_d = MOMETAL_METALLIB_DIR;
-            if (!build_d.empty() && build_d != exe_d) {
-                cands.push_back(build_d + "/" + lib_name);
-            }
+        std::string build_d = MOMETAL_METALLIB_DIR;
+        if (!build_d.empty() && build_d != exe_d) {
+            cands.push_back(build_d + "/" + lib_name);
+        }
 #endif
-            for (const std::string& cand : cands) {
-                std::error_code ec_c;
-                if (!fs::is_regular_file(cand, ec_c) || ec_c) continue;
+        for (const std::string& cand : cands) {
+            std::error_code ec_c;
+            if (!fs::is_regular_file(cand, ec_c) || ec_c) continue;
+            if (has_src) {
                 auto lib_mtime = fs::last_write_time(cand, ec_c);
                 if (ec_c || lib_mtime < src_mtime) continue; // Never load stale .metallib!
-                NSURL* url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:cand.c_str()]];
-                NSError* lerr = nil;
-                lib = [dev newLibraryWithURL:url error:&lerr];
-                if (lib) break;
             }
+            NSURL* url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:cand.c_str()]];
+            NSError* lerr = nil;
+            lib = [dev newLibraryWithURL:url error:&lerr];
+            if (lib) break;
         }
     }
 

@@ -82,13 +82,25 @@ public:
         if (restored_image_hashes) restored_image_hashes->clear();
         if (dir_.empty() || prompt_ids.size() < 2) return 0;
 
+        // Ensure any in-flight async save finishes renaming .tmp -> .micache before scanning dir_
+        model.wait_pending_save();
+
         uint64_t want_hash = compute_model_hash(model.info());
-        std::string best_path;
-        size_t best_len = 0;
+        const uint32_t max_seq = (model.info().max_seq_len > 0)
+            ? static_cast<uint32_t>(model.info().max_seq_len) : UINT32_MAX;
+
+        struct Candidate {
+            size_t len;
+            std::string path;
+        };
+        std::vector<Candidate> candidates;
 
         std::error_code ec;
         for (const auto& entry : std::filesystem::directory_iterator(dir_, ec)) {
-            if (!entry.is_regular_file() || entry.path().extension() != ".micache") continue;
+            if (!entry.is_regular_file(ec) || entry.path().extension() != ".micache") continue;
+            uint64_t fsz = entry.file_size(ec);
+            if (ec || fsz < sizeof(PrefixCacheHeader)) continue;
+
             std::ifstream ifs(entry.path(), std::ios::binary);
             if (!ifs) continue;
             PrefixCacheHeader hdr{};
@@ -98,34 +110,53 @@ public:
             bool is_v2 = (std::memcmp(hdr.magic, "MICACHE2", 8) == 0);
             if (!is_v1 && !is_v2) continue;
             if (hdr.model_hash != want_hash) continue;
-            if (hdr.pos == 0 || hdr.pos >= prompt_ids.size() || hdr.pos <= best_len) continue;
+            if (hdr.pos == 0 || hdr.pos >= prompt_ids.size() || hdr.pos > max_seq) continue;
+
+            uint64_t tok_bytes = static_cast<uint64_t>(hdr.pos) * sizeof(int);
+            uint64_t cursor = sizeof(PrefixCacheHeader) + tok_bytes;
+            if (cursor > fsz) continue;
 
             std::vector<int> cached_ids(hdr.pos);
-            ifs.read(reinterpret_cast<char*>(cached_ids.data()), hdr.pos * sizeof(int));
+            ifs.read(reinterpret_cast<char*>(cached_ids.data()), static_cast<std::streamsize>(tok_bytes));
             if (!ifs) continue;
-            if (std::memcmp(cached_ids.data(), prompt_ids.data(), hdr.pos * sizeof(int)) != 0) continue;
+            if (std::memcmp(cached_ids.data(), prompt_ids.data(), static_cast<size_t>(tok_bytes)) != 0) continue;
 
             if (is_v2) {
+                if (fsz - cursor < sizeof(MultimodalCacheMeta)) continue;
                 MultimodalCacheMeta meta{};
                 ifs.read(reinterpret_cast<char*>(&meta), sizeof(meta));
+                cursor += sizeof(meta);
                 if (!ifs || meta.num_images > req_image_hashes.size()) continue;
+                uint64_t img_bytes = static_cast<uint64_t>(meta.num_images) * sizeof(uint64_t);
+                if (fsz - cursor < img_bytes) continue;
                 if (meta.num_images > 0) {
                     std::vector<uint64_t> cached_imgs(meta.num_images);
-                    ifs.read(reinterpret_cast<char*>(cached_imgs.data()), meta.num_images * sizeof(uint64_t));
+                    ifs.read(reinterpret_cast<char*>(cached_imgs.data()), static_cast<std::streamsize>(img_bytes));
                     if (!ifs) continue;
                     if (!std::equal(cached_imgs.begin(), cached_imgs.end(), req_image_hashes.begin())) continue;
                 }
+                cursor += img_bytes;
             }
 
-            best_len = hdr.pos;
-            best_path = entry.path().string();
+            // Skip truncated payloads early so a damaged file never masks shorter valid checkpoints
+            if (hdr.state_bytes > fsz - cursor) continue;
+
+            candidates.push_back({static_cast<size_t>(hdr.pos), entry.path().string()});
         }
 
-        if (best_path.empty()) return 0;
-        std::vector<uint64_t> loaded_imgs;
-        if (model.load_state_from_file(best_path, restored_tokens, loaded_imgs)) {
-            if (restored_image_hashes) *restored_image_hashes = std::move(loaded_imgs);
-            return static_cast<int>(restored_tokens.size());
+        if (candidates.empty()) return 0;
+        std::sort(candidates.begin(), candidates.end(),
+                  [](const Candidate& a, const Candidate& b) { return a.len > b.len; });
+
+        for (const auto& cand : candidates) {
+            std::vector<uint64_t> loaded_imgs;
+            if (model.load_state_from_file(cand.path, restored_tokens, loaded_imgs)) {
+                // Touch mtime on cache hit so eviction is true LRU rather than FIFO
+                std::error_code tec;
+                std::filesystem::last_write_time(cand.path, std::filesystem::file_time_type::clock::now(), tec);
+                if (restored_image_hashes) *restored_image_hashes = std::move(loaded_imgs);
+                return static_cast<int>(restored_tokens.size());
+            }
         }
         return 0;
     }
@@ -135,11 +166,17 @@ public:
         if (dir_.empty() || tokens.empty()) return false;
         uint64_t mhash = compute_model_hash(model.info());
         std::string path = dir_ + "/" + token_prefix_filename(mhash, tokens, image_hashes);
-        if (std::filesystem::exists(path)) {
-            std::error_code ec;
+
+        // Wait for any previous async save so its renamed .micache is visible to exists() and evict_lru()
+        model.wait_pending_save();
+
+        std::error_code ec;
+        if (std::filesystem::exists(path, ec)) {
             std::filesystem::last_write_time(path, std::filesystem::file_time_type::clock::now(), ec);
+            evict_lru(6ull * 1024 * 1024 * 1024);
             return true;
         }
+        evict_lru(6ull * 1024 * 1024 * 1024);
         bool ok = model.save_state_to_file(path, tokens, image_hashes);
         if (ok) evict_lru(6ull * 1024 * 1024 * 1024); // Cap disk cache at 6 GB (oldest evicted first)
         return ok;
@@ -152,17 +189,31 @@ private:
         std::vector<Entry> items;
         uint64_t total = 0;
         for (const auto& e : std::filesystem::directory_iterator(dir_, ec)) {
-            if (!e.is_regular_file() || e.path().extension() != ".micache") continue;
+            if (!e.is_regular_file(ec)) continue;
+            auto ext = e.path().extension();
             uint64_t sz = e.file_size(ec);
+            if (ec) { ec.clear(); continue; }
+            if (ext == ".tmp") {
+                // Account for any in-flight .micache.tmp toward the cap without deleting it
+                total += sz;
+                continue;
+            }
+            if (ext != ".micache") continue;
             auto mt = e.last_write_time(ec);
+            if (ec) { ec.clear(); continue; }
             items.push_back({e.path(), mt, sz});
             total += sz;
         }
-        if (total <= max_bytes || items.size() <= 2) return;
+        // Keep >= 1 newest checkpoint if a single file exceeds max_bytes; otherwise evict down to cap
+        if (total <= max_bytes || items.size() <= 1) return;
         std::sort(items.begin(), items.end(), [](const Entry& a, const Entry& b) { return a.mtime < b.mtime; });
-        for (size_t i = 0; i + 2 < items.size() && total > max_bytes; ++i) {
+        for (size_t i = 0; i + 1 < items.size() && total > max_bytes; ++i) {
             std::filesystem::remove(items[i].p, ec);
-            total -= items[i].sz;
+            if (!ec) {
+                total = (total >= items[i].sz) ? (total - items[i].sz) : 0;
+            } else {
+                ec.clear();
+            }
         }
     }
 

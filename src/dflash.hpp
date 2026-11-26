@@ -88,6 +88,7 @@ public:
 
     size_t gpu_weight_bytes() const { return gpu_weight_bytes_; }
     double load_time_ms() const { return load_time_ms_; }
+    uint64_t fingerprint() const { return fingerprint_; }
 
     // CPU ARM64 NEON CandidateSelector (<20 us, 0 B Metal wired RAM for codebooks!).
     //   n_pos = config().block_size - 1 (7 proposal positions), topk = config().selector_top_k (16).
@@ -146,8 +147,9 @@ private:
     // (All quantized BF16 projection ranges are MADV_DONTNEED'd immediately after load.)
     void* mmap_ptr_ = nullptr;
     size_t mmap_size_ = 0;
-    const uint16_t* pred_cb_bf16_ = nullptr; // [vocab_size, selector_rank] BF16
-    const uint16_t* succ_cb_bf16_ = nullptr; // [vocab_size, selector_rank] BF16
+    const uint8_t* pred_cb_bytes_ = nullptr; // [vocab_size, selector_rank] BF16 (unaligned-safe byte ptr)
+    const uint8_t* succ_cb_bytes_ = nullptr; // [vocab_size, selector_rank] BF16 (unaligned-safe byte ptr)
+    uint64_t fingerprint_ = 0;
 };
 
 } // namespace mi

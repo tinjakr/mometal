@@ -168,10 +168,17 @@ bool parse_hwx_kernel_tensors(std::ifstream& f, size_t file_size, std::vector<Ke
             if (sym.name.size() >= 70 && sym.name[0] == 'K') {
                 size_t pos = sym.name.find("_ne_");
                 if (pos == 65) {
-                    int idx = std::atoi(sym.name.c_str() + 69);
-                    if (idx >= 0 && idx < 16) {
+                    bool all_digits = true;
+                    uint64_t idx_u = 0;
+                    for (size_t di = 69; di < sym.name.size(); ++di) {
+                        unsigned char ch = static_cast<unsigned char>(sym.name[di]);
+                        if (!std::isdigit(ch)) { all_digits = false; break; }
+                        idx_u = idx_u * 10ull + static_cast<uint64_t>(ch - '0');
+                        if (idx_u >= 16ull) break;
+                    }
+                    if (all_digits && idx_u < 16ull) {
                         std::string hash = sym.name.substr(1, 64);
-                        fam[hash][idx] = {true, sym.nval};
+                        fam[hash][static_cast<size_t>(idx_u)] = {true, sym.nval};
                     }
                 }
             }
@@ -223,16 +230,16 @@ struct SrcLinear {
     std::array<uint32_t, 8> fp0{};      // first 8 k-words of group 0 (rows 0..7)
 };
 
-uint64_t read_blob_data_offset(std::ifstream& wf, uint64_t meta_off) {
+bool read_blob_data_offset(std::ifstream& wf, uint64_t meta_off, uint64_t& out_data_off) {
     uint8_t hdr[24];
     wf.seekg(static_cast<std::streamoff>(meta_off));
     wf.read(reinterpret_cast<char*>(hdr), 24);
-    uint64_t data_off = 0;
-    std::memcpy(&data_off, hdr + 16, 8);
-    return data_off;
+    if (!wf.good()) return false;
+    std::memcpy(&out_data_off, hdr + 16, 8);
+    return true;
 }
 
-void pack_group_words(std::ifstream& wf, uint64_t w_data_off, uint32_t K,
+bool pack_group_words(std::ifstream& wf, uint64_t w_data_off, uint32_t K,
                       uint32_t gi, uint32_t k0, uint32_t* out_words, uint32_t n_words) {
     uint32_t row_bytes = K >> 1;
     uint32_t byte_k0 = k0 >> 1;
@@ -248,6 +255,7 @@ void pack_group_words(std::ifstream& wf, uint64_t w_data_off, uint32_t K,
         uint64_t pos = w_data_off + static_cast<uint64_t>(gi * 8u + j) * row_bytes + byte_k0;
         wf.seekg(static_cast<std::streamoff>(pos));
         wf.read(reinterpret_cast<char*>(rbuf + j * n_bytes), n_bytes);
+        if (!wf.good()) return false;
     }
     for (uint32_t k = 0; k < n_words; ++k) {
         uint32_t w = 0u;
@@ -258,6 +266,7 @@ void pack_group_words(std::ifstream& wf, uint64_t w_data_off, uint32_t K,
         }
         out_words[k] = w;
     }
+    return true;
 }
 
 struct ParsedMlpSource {
@@ -479,16 +488,16 @@ bool parse_source_4bit(const std::string& mlmodelc_dir,
 
     for (uint32_t li = 0; li < out.n_linears; ++li) {
         SrcLinear& sl = out.lins[li];
-        sl.w_off = read_blob_data_offset(wf, sl.w_off);
-        sl.s_off = read_blob_data_offset(wf, sl.s_off);
-        if (sl.has_offset) sl.o_off = read_blob_data_offset(wf, sl.o_off);
+        if (!read_blob_data_offset(wf, sl.w_off, sl.w_off)) return false;
+        if (!read_blob_data_offset(wf, sl.s_off, sl.s_off)) return false;
+        if (sl.has_offset && !read_blob_data_offset(wf, sl.o_off, sl.o_off)) return false;
         if (sl.is_lut4) {
-            sl.lut_off = read_blob_data_offset(wf, sl.lut_off);
+            if (!read_blob_data_offset(wf, sl.lut_off, sl.lut_off)) return false;
             if (!read_and_classify_lut4(wf, sl.lut_off, sl.lut_f16, sl.is_nonuniform_lut)) return false;
             if (sl.is_nonuniform_lut) out.is_nonuniform_lut = true;
         }
 
-        pack_group_words(wf, sl.w_off, sl.K, 0u, 0u, sl.fp0.data(), 8u);
+        if (!pack_group_words(wf, sl.w_off, sl.K, 0u, 0u, sl.fp0.data(), 8u)) return false;
 
         uint32_t sb = li >> 2;
         uint32_t role = li & 3u;
@@ -500,6 +509,7 @@ bool parse_source_4bit(const std::string& mlmodelc_dir,
         std::vector<uint16_t> s_raw(sl.O);
         wf.seekg(static_cast<std::streamoff>(sl.s_off));
         wf.read(reinterpret_cast<char*>(s_raw.data()), static_cast<std::streamsize>(sl.O * sizeof(uint16_t)));
+        if (!wf.good()) return false;
         for (uint32_t i = 0; i < sl.O; ++i) {
             __fp16 h;
             std::memcpy(&h, &s_raw[i], 2);
@@ -511,6 +521,7 @@ bool parse_source_4bit(const std::string& mlmodelc_dir,
             std::vector<uint8_t> o_raw((sl.O + 1u) >> 1);
             wf.seekg(static_cast<std::streamoff>(sl.o_off));
             wf.read(reinterpret_cast<char*>(o_raw.data()), static_cast<std::streamsize>(o_raw.size()));
+            if (!wf.good()) return false;
             for (uint32_t i = 0; i < sl.O; ++i) {
                 uint8_t b = o_raw[i >> 1];
                 int nib = ((i & 1u) == 0u) ? (b & 0xF) : ((b >> 4) & 0xF);
@@ -535,7 +546,7 @@ bool verify_and_bind_hwx(id<MTLDevice> device, MetalContext& ctx, size_t page_sz
     int fd = open(hwx_path.c_str(), O_RDONLY);
     if (fd < 0) return false;
     struct stat st{};
-    if (fstat(fd, &st) != 0) { close(fd); return false; }
+    if (fstat(fd, &st) != 0 || st.st_size <= 0) { close(fd); return false; }
     size_t fsz = static_cast<size_t>(st.st_size);
     size_t aligned_sz = ((fsz + page_sz - 1) / page_sz) * page_sz;
     void* ptr = mmap(nullptr, aligned_sz, PROT_READ, MAP_SHARED, fd, 0);
@@ -547,6 +558,10 @@ bool verify_and_bind_hwx(id<MTLDevice> device, MetalContext& ctx, size_t page_sz
     uint32_t base_w[16] = {}, chunk_w[16] = {}, hdr_w[16] = {};
     bool all_ok = true;
     std::ifstream wf(mdir + "/weights/weight.bin", std::ios::binary);
+    if (!wf) {
+        munmap(ptr, aligned_sz);
+        return false;
+    }
 
     const std::array<uint32_t, 3> cand_hdrs = src.is_lut4
         ? std::array<uint32_t, 3>{16u, 0u, 24u}
@@ -585,7 +600,10 @@ bool verify_and_bind_hwx(id<MTLDevice> device, MetalContext& ctx, size_t page_sz
                     uint32_t ch = cgi & 15u;
                     uint32_t slot = cgi >> 4;
                     uint32_t ref_w[8];
-                    pack_group_words(wf, sl.w_off, sl.K, cgi, sl.K - 8u, ref_w, 8u);
+                    if (!pack_group_words(wf, sl.w_off, sl.K, cgi, sl.K - 8u, ref_w, 8u)) {
+                        spot_ok = false;
+                        break;
+                    }
                     uint64_t hoff = kt.chunk_off[ch] + LUT4_BYTES + static_cast<uint64_t>(slot) * g_bytes
                                     + hb + static_cast<uint64_t>(sl.K - 8u) * 4u;
                     if (hoff + 32 > fsz || std::memcmp(hbytes + hoff, ref_w, 32) != 0) {
@@ -761,14 +779,23 @@ AneShareManager::AneShareManager(MetalContext& ctx, const std::string& ane_model
                 if ((iss >> magic >> mhid >> minter >> mnl >> mfmt) &&
                     magic == "MIHWX1" && mhid == hidden_size && minter == intermediate_size &&
                     mnl == num_layers && mfmt == format_name_) {
+                    std::vector<bool> seen_hint(static_cast<size_t>(num_layers), false);
                     std::string line;
                     while (std::getline(mf, line)) {
                         size_t t1 = line.find('\t');
                         size_t t2 = (t1 == std::string::npos) ? std::string::npos : line.find('\t', t1 + 1);
                         if (t1 == std::string::npos || t2 == std::string::npos) continue;
-                        int L = std::atoi(line.substr(0, t1).c_str());
+                        uint64_t L_u = 0;
+                        size_t l_end = 0;
+                        std::string_view l_sv(line.data(), t1);
+                        if (!parse_u64_at(l_sv, 0, L_u, &l_end) || l_end != l_sv.size() ||
+                            L_u >= static_cast<uint64_t>(num_layers)) {
+                            continue;
+                        }
+                        int L = static_cast<int>(L_u);
                         std::string hp = line.substr(t2 + 1);
-                        if (L >= 0 && L < num_layers && !hp.empty()) {
+                        if (!hp.empty() && !seen_hint[static_cast<size_t>(L)]) {
+                            seen_hint[static_cast<size_t>(L)] = true;
                             hints.emplace_back(L, std::move(hp));
                         }
                     }
@@ -1014,6 +1041,10 @@ AneShareManager::AneShareManager(MetalContext& ctx, const std::string& ane_model
                 if (ofs.good()) {
                     std::error_code ec_rn;
                     fs::rename(tmp_mf, manifest_path, ec_rn);
+                    if (ec_rn) {
+                        std::error_code ec_rm;
+                        fs::remove(tmp_mf, ec_rm);
+                    }
                 } else {
                     std::error_code ec_rm;
                     fs::remove(tmp_mf, ec_rm);

@@ -254,23 +254,39 @@ struct RawShard {
         const uint8_t* base = reinterpret_cast<const uint8_t*>(m);
         uint64_t hlen = 0;
         std::memcpy(&hlen, base, 8);
-        if (8u + hlen > fsz) { munmap(m, fsz); return false; }
-        std::string_view hsv(reinterpret_cast<const char*>(base + 8), static_cast<size_t>(hlen));
-        Json hdr = parse_json(hsv);
-        size_t data_base = 8u + static_cast<size_t>(hlen);
-        for (const auto& kv : hdr.as_object()) {
-            if (kv.first == "__metadata__") continue;
-            const Json& obj = kv.second;
-            RawTensorMeta tm;
-            tm.dtype = parse_dtype(obj["dtype"].as_string());
-            for (const auto& s : obj["shape"].as_array()) tm.shape.push_back(s.as_int());
-            const auto& offs = obj["data_offsets"].as_array();
-            size_t b0 = static_cast<size_t>(offs[0].as_int());
-            size_t b1 = static_cast<size_t>(offs[1].as_int());
-            tm.data_off = data_base + b0;
-            tm.nbytes = b1 - b0;
-            metas.emplace(kv.first, std::move(tm));
+        if (fsz < 8u || hlen > fsz - 8u) { munmap(m, fsz); return false; }
+        std::unordered_map<std::string, RawTensorMeta> parsed_metas;
+        try {
+            std::string_view hsv(reinterpret_cast<const char*>(base + 8), static_cast<size_t>(hlen));
+            Json hdr = parse_json(hsv);
+            size_t data_base = 8u + static_cast<size_t>(hlen);
+            for (const auto& kv : hdr.as_object()) {
+                if (kv.first == "__metadata__") continue;
+                const Json& obj = kv.second;
+                RawTensorMeta tm;
+                tm.dtype = parse_dtype(obj["dtype"].as_string());
+                for (const auto& s : obj["shape"].as_array()) {
+                    int64_t dim = s.as_int();
+                    if (dim < 0) { munmap(m, fsz); return false; }
+                    tm.shape.push_back(dim);
+                }
+                const auto& offs = obj["data_offsets"].as_array();
+                if (offs.size() != 2) { munmap(m, fsz); return false; }
+                int64_t b0_i = offs[0].as_int();
+                int64_t b1_i = offs[1].as_int();
+                if (b0_i < 0 || b1_i < b0_i) { munmap(m, fsz); return false; }
+                size_t b0 = static_cast<size_t>(b0_i);
+                size_t b1 = static_cast<size_t>(b1_i);
+                if (b1 > fsz - data_base) { munmap(m, fsz); return false; }
+                tm.data_off = data_base + b0;
+                tm.nbytes = b1 - b0;
+                parsed_metas.emplace(kv.first, std::move(tm));
+            }
+        } catch (...) {
+            munmap(m, fsz);
+            return false;
         }
+        metas = std::move(parsed_metas);
         path = p;
         ptr = m;
         size = fsz;
@@ -394,13 +410,23 @@ bool resolve_weight_ref(const ShardPool& pool,
     auto wmit = wsh->metas.find(key_prefix + ".weight");
     if (wmit == wsh->metas.end()) return false;
     const RawTensorMeta& wm = wmit->second;
+    if (wm.shape.size() != 2 || wm.shape[0] != static_cast<int64_t>(exp_O)) return false;
 
     out.O = exp_O;
     out.K = exp_K;
     out.w_dtype = wm.dtype;
     out.w_ptr = reinterpret_cast<const uint8_t*>(wsh->ptr) + wm.data_off;
 
+    auto is_float_dtype = [](DType dt) {
+        return dt == DType::F16 || dt == DType::BF16 || dt == DType::F32;
+    };
+
     if (wm.dtype == DType::U32) {
+        // Strictly validate 4-bit MLX U32 packing (8 nibbles per uint32 => shape[1] == exp_K / 8)
+        if ((exp_K % 8u) != 0u || wm.shape[1] != static_cast<int64_t>(exp_K / 8u)) return false;
+        const size_t exp_w_bytes = static_cast<size_t>(exp_O) * (exp_K >> 1);
+        if (wm.nbytes != exp_w_bytes) return false;
+
         auto sit = wmap.find(key_prefix + ".scales");
         auto bit = wmap.find(key_prefix + ".biases");
         if (sit == wmap.end() || bit == wmap.end()) return false;
@@ -410,19 +436,28 @@ bool resolve_weight_ref(const ShardPool& pool,
         auto smit = ssh->metas.find(key_prefix + ".scales");
         auto bmit = bsh->metas.find(key_prefix + ".biases");
         if (smit == ssh->metas.end() || bmit == bsh->metas.end()) return false;
-        if (smit->second.shape.size() < 2 || smit->second.shape[1] <= 0) return false;
+        const RawTensorMeta& sm = smit->second;
+        const RawTensorMeta& bm = bmit->second;
+        if (sm.shape.size() != 2 || sm.shape[0] != static_cast<int64_t>(exp_O) || sm.shape[1] <= 0) return false;
+        if (bm.shape != sm.shape) return false;
+        if (!is_float_dtype(sm.dtype) || !is_float_dtype(bm.dtype)) return false;
 
         out.is_q4 = true;
-        out.s_dtype = smit->second.dtype;
-        out.b_dtype = bmit->second.dtype;
-        out.s_ptr = reinterpret_cast<const uint8_t*>(ssh->ptr) + smit->second.data_off;
-        out.b_ptr = reinterpret_cast<const uint8_t*>(bsh->ptr) + bmit->second.data_off;
-        out.groups_per_row = static_cast<uint32_t>(smit->second.shape[1]);
+        out.s_dtype = sm.dtype;
+        out.b_dtype = bm.dtype;
+        out.s_ptr = reinterpret_cast<const uint8_t*>(ssh->ptr) + sm.data_off;
+        out.b_ptr = reinterpret_cast<const uint8_t*>(bsh->ptr) + bm.data_off;
+        out.groups_per_row = static_cast<uint32_t>(sm.shape[1]);
         out.gsize = exp_K / out.groups_per_row;
         out.bytes_per_row = exp_K >> 1;
+        const size_t n_groups = static_cast<size_t>(exp_O) * out.groups_per_row;
+        if (sm.nbytes < n_groups * dtype_size(sm.dtype)) return false;
+        if (bm.nbytes < n_groups * dtype_size(bm.dtype)) return false;
         return (out.gsize > 0 && out.groups_per_row * out.gsize == exp_K);
     }
-    return (wm.dtype == DType::F16 || wm.dtype == DType::BF16 || wm.dtype == DType::F32);
+    if (!is_float_dtype(wm.dtype)) return false;
+    if (wm.shape[1] != static_cast<int64_t>(exp_K)) return false;
+    return wm.nbytes == static_cast<size_t>(exp_O) * exp_K * dtype_size(wm.dtype);
 }
 
 // Reusable tiny per-worker L1-resident scratch buffers (20 KB row_f32 + 10 KB row_f16 vs old 1.07 GB!)
@@ -1343,17 +1378,37 @@ std::vector<int> parse_layers_spec(const std::string& spec, int n_layers) {
         for (int i = 0; i < n_layers; ++i) out.push_back(i);
         return out;
     }
+    auto parse_nonneg = [&](const std::string& tok) -> int {
+        if (tok.empty()) throw std::runtime_error("Invalid --layers spec: \"" + spec + "\"");
+        int64_t val = 0;
+        for (char c : tok) {
+            if (c < '0' || c > '9') {
+                throw std::runtime_error("Invalid --layers spec: \"" + spec + "\"");
+            }
+            val = val * 10 + (c - '0');
+            if (val > 1000000) {
+                throw std::runtime_error("Invalid --layers spec (out of range): \"" + spec + "\"");
+            }
+        }
+        return static_cast<int>(val);
+    };
     std::stringstream ss(spec);
     std::string part;
     while (std::getline(ss, part, ',')) {
         if (part.empty()) continue;
         size_t dash = part.find('-');
         if (dash != std::string::npos) {
-            int a = std::stoi(part.substr(0, dash));
-            int b = std::stoi(part.substr(dash + 1));
+            if (part.find('-', dash + 1) != std::string::npos) {
+                throw std::runtime_error("Invalid --layers range: \"" + part + "\"");
+            }
+            int a = parse_nonneg(part.substr(0, dash));
+            int b = parse_nonneg(part.substr(dash + 1));
+            if (a > b) {
+                throw std::runtime_error("Invalid --layers range (start > end): \"" + part + "\"");
+            }
             for (int i = a; i <= b; ++i) if (i >= 0 && i < n_layers) out.push_back(i);
         } else {
-            int v = std::stoi(part);
+            int v = parse_nonneg(part);
             if (v >= 0 && v < n_layers) out.push_back(v);
         }
     }
@@ -1555,9 +1610,12 @@ bool build_one_layer(const ShardPool& pool,
         << "        } -> (down_proj);\n"
         << "}\n";
 
-    std::string tmp_mlc = mlc_path + ".tmp." + std::to_string(getpid());
+    std::string pid_suf = ".tmp." + std::to_string(getpid());
+    std::string tmp_mlc = mlc_path + pid_suf;
+    std::string tmp_inv1 = inv1_path + pid_suf;
     std::error_code ec;
     fs::remove_all(tmp_mlc, ec);
+    fs::remove(tmp_inv1, ec);
     fs::create_directories(tmp_mlc + "/weights", ec);
     if (ec) return false;
 
@@ -1566,19 +1624,29 @@ bool build_one_layer(const ShardPool& pool,
     ok = ok && write_bytes_fd(tmp_mlc + "/coremldata.bin", coremldata_bytes.data(), coremldata_bytes.size());
     ok = ok && write_bytes_fd(tmp_mlc + "/model.mil", mstr.data(), mstr.size());
     ok = ok && ws.bw.write_to(tmp_mlc + "/weights/weight.bin");
-    ok = ok && write_npy_f16(inv1_path + ".tmp", ws.inv1_f16);
+    ok = ok && write_npy_f16(tmp_inv1, ws.inv1_f16);
 
     if (!ok) {
         fs::remove_all(tmp_mlc, ec);
-        fs::remove(inv1_path + ".tmp", ec);
+        fs::remove(tmp_inv1, ec);
         return false;
     }
 
     fs::remove_all(mlc_path, ec);
     fs::rename(tmp_mlc, mlc_path, ec);
-    if (ec) return false;
-    fs::rename(inv1_path + ".tmp", inv1_path, ec);
-    return !ec;
+    if (ec) {
+        std::error_code ec_rm;
+        fs::remove_all(tmp_mlc, ec_rm);
+        fs::remove(tmp_inv1, ec_rm);
+        return false;
+    }
+    fs::rename(tmp_inv1, inv1_path, ec);
+    if (ec) {
+        std::error_code ec_rm;
+        fs::remove(tmp_inv1, ec_rm);
+        return false;
+    }
+    return true;
 }
 
 } // namespace
@@ -1606,156 +1674,185 @@ AneBuildResult build_ane_mlps_native(const AneBuildOptions& opts) {
     auto t0 = std::chrono::steady_clock::now();
     AneBuildResult res;
 
-    if (!fs::is_directory(opts.model_dir)) {
-        res.error = "Model directory not found: " + opts.model_dir;
-        return res;
-    }
-
-    std::string fmt = resolve_ane_build_format(opts.format);
-    std::string tag = (opts.tag.empty() || opts.tag == "auto") ? fmt : opts.tag;
-    std::string out_dir = opts.out_dir.empty() ? default_ane_cache_dir(opts.model_dir, fmt) : opts.out_dir;
-
-    res.format = fmt;
-    res.tag = tag;
-    res.out_dir = out_dir;
-
-    Json cfg = parse_json(read_file_to_string(opts.model_dir + "/config.json"));
-    const Json& tc = cfg.contains("text_config") ? cfg["text_config"] : cfg;
-    uint32_t HID   = static_cast<uint32_t>(tc["hidden_size"].as_int(5120));
-    uint32_t INTER = static_cast<uint32_t>(tc["intermediate_size"].as_int(17408));
-    int n_layers   = static_cast<int>(tc["num_hidden_layers"].as_int(64));
-
-    uint32_t n_sb = choose_subblocks(INTER);
-    if ((HID % 128u) != 0u || n_sb == 0u) {
-        res.error = "Unsupported MLP dims for ANE-Share: HID=" + std::to_string(HID) +
-                    " INTER=" + std::to_string(INTER);
-        return res;
-    }
-
-    std::unordered_map<std::string, std::string> wmap;
-    std::string idx_path = opts.model_dir + "/model.safetensors.index.json";
-    if (fs::is_regular_file(idx_path)) {
-        Json idx = parse_json(read_file_to_string(idx_path));
-        for (const auto& kv : idx["weight_map"].as_object()) {
-            wmap.emplace(kv.first, kv.second.as_string());
-        }
-    } else {
-        std::string single = opts.model_dir + "/model.safetensors";
-        RawShard sh;
-        if (!sh.open_file(single)) {
-            res.error = "Could not open model.safetensors or model.safetensors.index.json in " + opts.model_dir;
+    try {
+        if (!fs::is_directory(opts.model_dir)) {
+            res.error = "Model directory not found: " + opts.model_dir;
             return res;
         }
-        for (const auto& kv : sh.metas) wmap.emplace(kv.first, "model.safetensors");
-    }
-
-    std::string pfx = "language_model.model.";
-    if (!wmap.count(pfx + "layers.0.mlp.gate_proj.weight")) {
-        if (wmap.count("model.language_model.layers.0.mlp.gate_proj.weight")) {
-            pfx = "model.language_model.";
-        } else {
-            pfx = "model.";
+        if (opts.rows <= 0) {
+            res.error = "Invalid ANE rows: " + std::to_string(opts.rows);
+            return res;
         }
-    }
 
-    std::vector<int> layers = parse_layers_spec(opts.layers_spec, n_layers);
-    res.total_layers = static_cast<int>(layers.size());
-    std::error_code ec;
-    fs::create_directories(out_dir, ec);
-    if (ec) {
-        res.error = "Failed to create output directory: " + out_dir;
-        return res;
-    }
+        std::string fmt = resolve_ane_build_format(opts.format);
+        std::string tag = (opts.tag.empty() || opts.tag == "auto") ? fmt : opts.tag;
+        std::string out_dir = opts.out_dir.empty() ? default_ane_cache_dir(opts.model_dir, fmt) : opts.out_dir;
 
-    std::vector<int> todo;
-    int cached = 0;
-    for (int L : layers) {
-        std::string mlc = out_dir + "/L" + std::to_string(L) + "_mlp_p0_" + tag + ".mlmodelc";
-        std::string inv = out_dir + "/pieces_inv1_" + tag + "_L" + std::to_string(L) + ".npy";
-        if (fs::is_directory(mlc) && fs::is_regular_file(inv)) {
-            ++cached;
-        } else {
-            todo.push_back(L);
+        res.format = fmt;
+        res.tag = tag;
+        res.out_dir = out_dir;
+
+        Json cfg = parse_json(read_file_to_string(opts.model_dir + "/config.json"));
+        const Json& tc = cfg.contains("text_config") ? cfg["text_config"] : cfg;
+        const Json* qcfg = cfg.contains("quantization") ? &cfg["quantization"]
+                         : (tc.contains("quantization") ? &tc["quantization"] : nullptr);
+        if (qcfg && qcfg->is_object() && qcfg->contains("bits")) {
+            int qbits = static_cast<int>((*qcfg)["bits"].as_int(4));
+            if (qbits != 4) {
+                res.error = "Unsupported quantized model bits=" + std::to_string(qbits) +
+                            " for ANE-Share builder (only 4-bit MLX or unquantized F16/BF16/F32 supported)";
+                return res;
+            }
         }
-    }
-    res.cached_layers = cached;
+        uint32_t HID   = static_cast<uint32_t>(tc["hidden_size"].as_int(5120));
+        uint32_t INTER = static_cast<uint32_t>(tc["intermediate_size"].as_int(17408));
+        int n_layers   = static_cast<int>(tc["num_hidden_layers"].as_int(64));
+        if (n_layers <= 0) {
+            res.error = "Invalid num_hidden_layers=" + std::to_string(n_layers);
+            return res;
+        }
 
-    if (todo.empty()) {
+        uint32_t n_sb = choose_subblocks(INTER);
+        if ((HID % 128u) != 0u || n_sb == 0u) {
+            res.error = "Unsupported MLP dims for ANE-Share: HID=" + std::to_string(HID) +
+                        " INTER=" + std::to_string(INTER);
+            return res;
+        }
+
+        std::unordered_map<std::string, std::string> wmap;
+        std::string idx_path = opts.model_dir + "/model.safetensors.index.json";
+        if (fs::is_regular_file(idx_path)) {
+            Json idx = parse_json(read_file_to_string(idx_path));
+            for (const auto& kv : idx["weight_map"].as_object()) {
+                wmap.emplace(kv.first, kv.second.as_string());
+            }
+        } else {
+            std::string single = opts.model_dir + "/model.safetensors";
+            RawShard sh;
+            if (!sh.open_file(single)) {
+                res.error = "Could not open model.safetensors or model.safetensors.index.json in " + opts.model_dir;
+                return res;
+            }
+            for (const auto& kv : sh.metas) wmap.emplace(kv.first, "model.safetensors");
+        }
+
+        std::string pfx = "language_model.model.";
+        if (!wmap.count(pfx + "layers.0.mlp.gate_proj.weight")) {
+            if (wmap.count("model.language_model.layers.0.mlp.gate_proj.weight")) {
+                pfx = "model.language_model.";
+            } else {
+                pfx = "model.";
+            }
+        }
+
+        std::vector<int> layers = parse_layers_spec(opts.layers_spec, n_layers);
+        res.total_layers = static_cast<int>(layers.size());
+        std::error_code ec;
+        fs::create_directories(out_dir, ec);
+        if (ec) {
+            res.error = "Failed to create output directory: " + out_dir;
+            return res;
+        }
+
+        std::vector<int> todo;
+        int cached = 0;
+        for (int L : layers) {
+            std::string mlc = out_dir + "/L" + std::to_string(L) + "_mlp_p0_" + tag + ".mlmodelc";
+            std::string inv = out_dir + "/pieces_inv1_" + tag + "_L" + std::to_string(L) + ".npy";
+            if (fs::is_directory(mlc) &&
+                fs::is_regular_file(mlc + "/model.mil") &&
+                fs::is_regular_file(mlc + "/weights/weight.bin") &&
+                fs::is_regular_file(mlc + "/coremldata.bin") &&
+                fs::is_regular_file(inv)) {
+                ++cached;
+            } else {
+                todo.push_back(L);
+            }
+        }
+        res.cached_layers = cached;
+
+        if (todo.empty()) {
+            res.ok = true;
+            res.elapsed_sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            return res;
+        }
+
+        // Invalidate any stale .hwx_manifest_<tag> before emitting new layer bundles
+        fs::remove(out_dir + "/.hwx_manifest_" + tag, ec);
+
+        // Pre-open all needed safetensors shards ONCE in a shared read-only pool!
+        ShardPool pool;
+        if (!pool.load_needed(opts.model_dir, wmap, pfx, todo)) {
+            res.error = "Failed opening safetensors shards in " + opts.model_dir;
+            return res;
+        }
+
+        const uint32_t PW = ((HID + 64u) / 64u) * 64u;
+        const std::vector<uint8_t> coremldata_bytes = make_coremldata_bin(opts.rows, static_cast<int>(PW), static_cast<int>(HID));
+
+        int hw_thr = static_cast<int>(std::thread::hardware_concurrency());
+        int req_workers = (opts.workers > 0) ? opts.workers : std::min<int>(12, std::max<int>(4, hw_thr));
+        int n_workers = std::max(1, std::min<int>(req_workers, static_cast<int>(todo.size())));
+
+        std::string arch = AneMlpEngine::detect_ane_arch();
+        std::fprintf(stderr,
+                     "[ane-build] Native C++ NEON streaming builder | ANE=%s | format=%s | tag=%s | dims=(%ux%u, %u sb) | workers=%d | building %zu/%d layers -> %s\n",
+                     arch.empty() ? "unknown" : arch.c_str(), fmt.c_str(), tag.c_str(),
+                     HID, INTER, n_sb, n_workers, todo.size(), res.total_layers, out_dir.c_str());
+
+        // Dynamic work-stealing queue (eliminates per-worker tail stragglers!)
+        std::atomic<size_t> next_todo{0};
+        std::atomic<int> done_cnt{0};
+        std::atomic<bool> failed{false};
+        std::mutex err_mtx;
+        std::string err_msg;
+        const size_t est_blob_bytes = (3ull * HID * INTER) / 2ull + 2097152ull;
+
+        std::vector<std::thread> threads;
+        for (int wi = 0; wi < n_workers; ++wi) {
+            threads.emplace_back([&]() {
+                WorkerScratch ws;
+                ws.bw.reserve(est_blob_bytes);
+                while (!failed.load()) {
+                    size_t ti = next_todo.fetch_add(1);
+                    if (ti >= todo.size()) break;
+                    int L = todo[ti];
+                    bool ok = build_one_layer(
+                        pool, wmap, pfx, coremldata_bytes, ws, out_dir, fmt, tag,
+                        L, HID, INTER, n_sb, opts.rows, opts.alpha, opts.max_sq_scale, opts.mse_clip
+                    );
+                    if (!ok) {
+                        failed.store(true);
+                        std::lock_guard<std::mutex> lk(err_mtx);
+                        if (err_msg.empty()) err_msg = "Failed building ANE MLP layer L" + std::to_string(L);
+                        break;
+                    }
+                    int c = done_cnt.fetch_add(1) + 1;
+                    if (c == static_cast<int>(todo.size()) || (c % 8) == 0) {
+                        double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                        std::fprintf(stderr, "[ane-build] %d/%zu layers (%.1fs)\n", c, todo.size(), dt);
+                    }
+                }
+            });
+        }
+        for (auto& th : threads) th.join();
+
+        res.built_layers = done_cnt.load();
+        res.elapsed_sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        if (failed.load()) {
+            res.error = err_msg;
+            return res;
+        }
+        std::fprintf(stderr, "[ane-build] Built %d layers (+%d cached) in %.2fs -> %s\n",
+                     res.built_layers, res.cached_layers, res.elapsed_sec, out_dir.c_str());
         res.ok = true;
+        return res;
+    } catch (const std::exception& e) {
+        res.ok = false;
+        res.error = e.what();
         res.elapsed_sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         return res;
     }
-
-    // Invalidate any stale .hwx_manifest_<tag> before emitting new layer bundles
-    fs::remove(out_dir + "/.hwx_manifest_" + tag, ec);
-
-    // Pre-open all needed safetensors shards ONCE in a shared read-only pool!
-    ShardPool pool;
-    if (!pool.load_needed(opts.model_dir, wmap, pfx, todo)) {
-        res.error = "Failed opening safetensors shards in " + opts.model_dir;
-        return res;
-    }
-
-    const uint32_t PW = ((HID + 64u) / 64u) * 64u;
-    const std::vector<uint8_t> coremldata_bytes = make_coremldata_bin(opts.rows, static_cast<int>(PW), static_cast<int>(HID));
-
-    int hw_thr = static_cast<int>(std::thread::hardware_concurrency());
-    int req_workers = (opts.workers > 0) ? opts.workers : std::min<int>(12, std::max<int>(4, hw_thr));
-    int n_workers = std::max(1, std::min<int>(req_workers, static_cast<int>(todo.size())));
-
-    std::string arch = AneMlpEngine::detect_ane_arch();
-    std::fprintf(stderr,
-                 "[ane-build] Native C++ NEON streaming builder | ANE=%s | format=%s | tag=%s | dims=(%ux%u, %u sb) | workers=%d | building %zu/%d layers -> %s\n",
-                 arch.empty() ? "unknown" : arch.c_str(), fmt.c_str(), tag.c_str(),
-                 HID, INTER, n_sb, n_workers, todo.size(), res.total_layers, out_dir.c_str());
-
-    // Dynamic work-stealing queue (eliminates per-worker tail stragglers!)
-    std::atomic<size_t> next_todo{0};
-    std::atomic<int> done_cnt{0};
-    std::atomic<bool> failed{false};
-    std::mutex err_mtx;
-    std::string err_msg;
-    const size_t est_blob_bytes = (3ull * HID * INTER) / 2ull + 2097152ull;
-
-    std::vector<std::thread> threads;
-    for (int wi = 0; wi < n_workers; ++wi) {
-        threads.emplace_back([&]() {
-            WorkerScratch ws;
-            ws.bw.reserve(est_blob_bytes);
-            while (!failed.load()) {
-                size_t ti = next_todo.fetch_add(1);
-                if (ti >= todo.size()) break;
-                int L = todo[ti];
-                bool ok = build_one_layer(
-                    pool, wmap, pfx, coremldata_bytes, ws, out_dir, fmt, tag,
-                    L, HID, INTER, n_sb, opts.rows, opts.alpha, opts.max_sq_scale, opts.mse_clip
-                );
-                if (!ok) {
-                    failed.store(true);
-                    std::lock_guard<std::mutex> lk(err_mtx);
-                    if (err_msg.empty()) err_msg = "Failed building ANE MLP layer L" + std::to_string(L);
-                    break;
-                }
-                int c = done_cnt.fetch_add(1) + 1;
-                if (c == static_cast<int>(todo.size()) || (c % 8) == 0) {
-                    double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-                    std::fprintf(stderr, "[ane-build] %d/%zu layers (%.1fs)\n", c, todo.size(), dt);
-                }
-            }
-        });
-    }
-    for (auto& th : threads) th.join();
-
-    res.built_layers = done_cnt.load();
-    res.elapsed_sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    if (failed.load()) {
-        res.error = err_msg;
-        return res;
-    }
-    std::fprintf(stderr, "[ane-build] Built %d layers (+%d cached) in %.2fs -> %s\n",
-                 res.built_layers, res.cached_layers, res.elapsed_sec, out_dir.c_str());
-    res.ok = true;
-    return res;
 }
 
 } // namespace mi

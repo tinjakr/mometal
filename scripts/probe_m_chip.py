@@ -4,7 +4,7 @@
 
 Checks on the local Apple Silicon Mac:
   1. SoC, macOS version, Metal GPU family, and ANE architecture (h13g M1 .. h17g M5)
-  2. Metal 3.0 compilation of all 4 mometal shaders (common, qwen38, inkling2, vision)
+  2. Metal 3.0 compilation of all 5 mometal shaders (common, qwen38, dflash, inkling2, vision)
   3. /Library/Caches/com.apple.aned readability & MAP_SHARED mmap permissions
   4. (If coremltools is installed) Compiles & executes universal `lut4` (M1-M5) and
      native `hf4` (M4/M5+) 4-bit linears on ANE, reports NeuralEngine placement,
@@ -108,7 +108,7 @@ int main(int argc, char** argv) {
         )
         shaders = [
             os.path.join(REPO_ROOT, "shaders", f)
-            for f in ("common.metal", "qwen38.metal", "inkling2.metal", "vision.metal")
+            for f in ("common.metal", "qwen38.metal", "dflash.metal", "inkling2.metal", "vision.metal")
         ]
         r = subprocess.run([exe] + shaders, capture_output=True, text=True)
         print(r.stdout.strip())
@@ -122,6 +122,9 @@ def check_aned_cache():
     if not os.path.isdir(root):
         print(f"  [FAIL] {root} does not exist")
         return False
+    if not os.access(root, os.R_OK | os.X_OK):
+        print(f"  [FAIL] Cannot read {root} (EACCES — requires SIP disabled + read ACL)")
+        return False
     hwxs = glob.glob(f"{root}/*/ModelAssetsCache/**/model.hwx", recursive=True)
     print(f"  aned cache root: {root} | readable model.hwx count: {len(hwxs)}")
     if not hwxs:
@@ -130,6 +133,9 @@ def check_aned_cache():
     sample = max(hwxs, key=os.path.getmtime)
     st = os.stat(sample)
     mode = stat.filemode(st.st_mode)
+    if st.st_size < 4:
+        print(f"  [FAIL] {sample} too small ({st.st_size} bytes)")
+        return False
     try:
         fd = os.open(sample, os.O_RDONLY)
         try:
@@ -180,8 +186,11 @@ def parse_hwx_chunks(path):
         fam = {}
         for nm, ns, nv in syms:
             if ns == idx + 1 and nm.startswith("K") and "_ne_" in nm:
-                h, ci = nm[1:].split("_ne_")
-                fam.setdefault(h, {})[int(ci)] = nv
+                parts = nm[1:].split("_ne_")
+                if len(parts) == 2 and parts[1].isdigit():
+                    ci = int(parts[1])
+                    if 0 <= ci < 16:
+                        fam.setdefault(parts[0], {})[ci] = nv
         for h, d in fam.items():
             if len(d) == 16:
                 cb = nxt[d[0]] - d[0]
@@ -231,6 +240,8 @@ def check_ane_4bit_share():
         )
 
     tmp = tempfile.mkdtemp(prefix="mometal_ane_probe_")
+    compiled_mlcs = []
+    aned_readable = os.access("/Library/Caches/com.apple.aned", os.R_OK | os.X_OK)
     try:
         for mode in ("lut4_a8", "lut4_a16", "hf4_w4a8"):
             if mode.startswith("lut4"):
@@ -259,6 +270,7 @@ def check_ane_4bit_share():
             pkg = os.path.join(tmp, f"{mode}.mlpackage")
             m.save(pkg)
             mlc = ct.models.utils.compile_model(pkg)
+            compiled_mlcs.append(mlc)
 
             plan = MLComputePlan.load_from_path(mlc, ct.ComputeUnit.CPU_AND_NE)
             devs = {}
@@ -268,7 +280,10 @@ def check_ane_4bit_share():
                     dn = type(u.preferred_compute_device).__name__.replace("ComputeDevice", "").replace("ML", "")
                     devs[dn] = devs.get(dn, 0) + 1
 
-            before = {p: os.path.getmtime(p) for p in glob.glob("/Library/Caches/com.apple.aned/*/ModelAssetsCache/**/model.hwx", recursive=True)}
+            before = (
+                {p: os.path.getmtime(p) for p in glob.glob("/Library/Caches/com.apple.aned/*/ModelAssetsCache/**/model.hwx", recursive=True)}
+                if aned_readable else {}
+            )
             cm = ct.models.CompiledMLModel(mlc, compute_units=ct.ComputeUnit.CPU_AND_NE)
             x_in = np.zeros((R, K), dtype=np.float16)
             for _ in range(3):
@@ -281,7 +296,10 @@ def check_ane_4bit_share():
             med_ms = sorted(ts)[len(ts) // 2]
             tops = (2 * R * O * K) / (med_ms * 1e-3) / 1e12
 
-            after = {p: os.path.getmtime(p) for p in glob.glob("/Library/Caches/com.apple.aned/*/ModelAssetsCache/**/model.hwx", recursive=True)}
+            after = (
+                {p: os.path.getmtime(p) for p in glob.glob("/Library/Caches/com.apple.aned/*/ModelAssetsCache/**/model.hwx", recursive=True)}
+                if aned_readable else {}
+            )
             changed = [p for p, mt in after.items() if p not in before or mt > before[p]]
             hwx = sorted(changed, key=lambda p: after[p], reverse=True)[0] if changed else None
 
@@ -307,12 +325,21 @@ def check_ane_4bit_share():
                         if bit_exact:
                             break
 
-            status = "PASS (1-copy ready!)" if bit_exact else ("2x INT8 promoted" if b_per_wt > 0.9 else "layout mismatch")
+            if not aned_readable:
+                status = "aned cache unreadable (SIP/ACL)"
+            elif bit_exact:
+                status = "PASS (1-copy ready!)"
+            elif b_per_wt > 0.9:
+                status = "2x INT8 promoted"
+            else:
+                status = "layout mismatch"
             print(
                 f"  [{mode:8s}] {med_ms:5.2f} ms ({tops:5.2f} TOPS) | {b_per_wt:.2f} B/wt | "
                 f"hdr={str(hdr_found):>4s} | placement={devs} | {status}"
             )
     finally:
+        for mlc in compiled_mlcs:
+            shutil.rmtree(mlc, ignore_errors=True)
         shutil.rmtree(tmp, ignore_errors=True)
 
 

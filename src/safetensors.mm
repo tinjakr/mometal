@@ -46,22 +46,75 @@ bool matches_any_prefix(const std::string& key, const std::vector<std::string>& 
     return false;
 }
 
+struct MmapGuard {
+    void* ptr = MAP_FAILED;
+    size_t len = 0;
+    ~MmapGuard() {
+        if (ptr && ptr != MAP_FAILED && len > 0) {
+            munmap(ptr, len);
+        }
+    }
+    void release() {
+        ptr = MAP_FAILED;
+        len = 0;
+    }
+};
+
 bool is_unaligned_q4_key(const std::string& key, DType dt) {
     auto ends_with = [](const std::string& s, const char* suf) {
         size_t n = std::strlen(suf);
         return s.size() >= n && s.compare(s.size() - n, n, suf) == 0;
     };
     if (ends_with(key, ".weight") && dt == DType::U32) return true;
-    if (ends_with(key, ".scales") && (dt == DType::BF16 || dt == DType::F16)) return true;
-    if (ends_with(key, ".biases") && (dt == DType::BF16 || dt == DType::F16)) return true;
+    if (ends_with(key, ".scales") && dt == DType::BF16) return true;
+    if (ends_with(key, ".biases") && dt == DType::BF16) return true;
     return false;
+}
+
+void parse_checked_offsets(const Json& info, size_t data_base, size_t file_size,
+                           const std::string& path, size_t& out_raw_off, size_t& out_nbytes) {
+    const auto& offs = info["data_offsets"].as_array();
+    if (offs.size() != 2) {
+        throw std::runtime_error("Corrupt safetensors data_offsets in " + path);
+    }
+    int64_t s64 = offs[0].as_int();
+    int64_t e64 = offs[1].as_int();
+    if (s64 < 0 || e64 < s64) {
+        throw std::runtime_error("Corrupt safetensors negative/inverted data_offsets in " + path);
+    }
+    size_t s = static_cast<size_t>(s64);
+    size_t e = static_cast<size_t>(e64);
+    if (e > file_size - data_base) {
+        throw std::runtime_error("Corrupt safetensors data_offsets out of bounds in " + path);
+    }
+    out_raw_off = data_base + s;
+    out_nbytes = e - s;
+}
+
+id<MTLBuffer> make_aligned_copy_buffer(id<MTLDevice> device, const uint8_t* src, size_t nbytes) {
+    size_t alloc_len = std::max<size_t>(nbytes, 16u);
+    id<MTLBuffer> copy_buf = [device newBufferWithLength:alloc_len
+                                                 options:MTLResourceStorageModeShared];
+    if (!copy_buf) {
+        throw std::runtime_error("Metal aligned copy buffer allocation failed");
+    }
+    if (nbytes < alloc_len) {
+        std::memset([copy_buf contents], 0, alloc_len);
+    }
+    if (nbytes > 0 && src) {
+        std::memcpy([copy_buf contents], src, nbytes);
+    }
+    return copy_buf;
 }
 
 ShardLoadResult load_shard_isolated(id device_id, const std::string& path, const std::string& key_prefix,
                                     bool prefetch_now,
                                     const std::vector<std::string>& skip_prefixes,
                                     const std::vector<std::string>& include_prefixes,
-                                    bool allow_unaligned_q4) {
+                                    bool allow_unaligned_q4,
+                                    bool allow_unaligned_bf16) {
+    // Declare map_guard BEFORE out so if an exception unwinds, ARC releases out's MTLBuffers BEFORE munmap!
+    MmapGuard map_guard;
     ShardLoadResult out;
     id<MTLDevice> device = device_id;
     int fd = open(path.c_str(), O_RDONLY);
@@ -71,6 +124,10 @@ ShardLoadResult load_shard_isolated(id device_id, const std::string& path, const
     if (fstat(fd, &st) != 0) {
         close(fd);
         throw std::runtime_error("fstat failed: " + path);
+    }
+    if (st.st_size < static_cast<off_t>(sizeof(uint64_t))) {
+        close(fd);
+        throw std::runtime_error("Corrupt safetensors file (too small): " + path);
     }
     size_t file_size = static_cast<size_t>(st.st_size);
     size_t page_size = static_cast<size_t>(getpagesize());
@@ -82,11 +139,12 @@ ShardLoadResult load_shard_isolated(id device_id, const std::string& path, const
     if (ptr == MAP_FAILED) {
         throw std::runtime_error("mmap failed for " + path);
     }
+    map_guard.ptr = ptr;
+    map_guard.len = aligned_size;
 
     uint64_t header_len = 0;
     std::memcpy(&header_len, ptr, sizeof(uint64_t));
-    if (8 + header_len > file_size) {
-        munmap(ptr, aligned_size);
+    if (header_len > file_size - sizeof(uint64_t)) {
         throw std::runtime_error("Corrupt safetensors header in " + path);
     }
     std::string_view hdr_sv(reinterpret_cast<const char*>(ptr) + 8, static_cast<size_t>(header_len));
@@ -114,15 +172,16 @@ ShardLoadResult load_shard_isolated(id device_id, const std::string& path, const
             if (k == "__metadata__") continue;
             std::string full_key = key_prefix.empty() ? k : (key_prefix + k);
             if (!keep_key(full_key)) continue;
-            const auto& offs = info["data_offsets"].as_array();
-            size_t s = static_cast<size_t>(offs[0].as_int());
-            size_t e = static_cast<size_t>(offs[1].as_int());
-            size_t raw_off = data_base + s;
-            size_t nbytes = e - s;
+            size_t raw_off = 0, nbytes = 0;
+            parse_checked_offsets(info, data_base, file_size, path, raw_off, nbytes);
             PendingTensor pt;
             pt.full_key = std::move(full_key);
             pt.dtype = parse_dtype(info["dtype"].as_string());
-            for (const auto& dim : info["shape"].as_array()) pt.shape.push_back(dim.as_int());
+            for (const auto& dim : info["shape"].as_array()) {
+                int64_t d = dim.as_int();
+                if (d < 0) throw std::runtime_error("Negative tensor dimension in " + path);
+                pt.shape.push_back(d);
+            }
             pt.raw_off = raw_off;
             pt.nbytes = nbytes;
             kept.push_back(std::move(pt));
@@ -134,8 +193,7 @@ ShardLoadResult load_shard_isolated(id device_id, const std::string& path, const
             }
         }
         if (kept.empty()) {
-            munmap(ptr, aligned_size);
-            return out;
+            return out; // map_guard cleans up ptr cleanly
         }
         std::sort(ranges.begin(), ranges.end());
         std::vector<std::pair<size_t, size_t>> merged;
@@ -164,8 +222,6 @@ ShardLoadResult load_shard_isolated(id device_id, const std::string& path, const
                                                              options:MTLResourceStorageModeShared
                                                          deallocator:nil];
             if (!sub_buf) {
-                for (auto& sr : out.shard.sub_ranges) sr.mtl_buffer = nil;
-                munmap(ptr, aligned_size);
                 throw std::runtime_error("Metal newBufferWithBytesNoCopy sub-range failed for " + path);
             }
             out.shard.sub_ranges.push_back(MappedSubRange{r_lo, r_len, sub_buf});
@@ -174,35 +230,44 @@ ShardLoadResult load_shard_isolated(id device_id, const std::string& path, const
 
         out.tensors.reserve(kept.size());
         for (auto& pt : kept) {
-            size_t lo = 0, hi = out.shard.sub_ranges.size();
-            while (lo + 1 < hi) {
-                size_t mid = (lo + hi) >> 1;
-                if (out.shard.sub_ranges[mid].offset <= pt.raw_off) lo = mid;
-                else hi = mid;
-            }
-            const MappedSubRange& sr = out.shard.sub_ranges[lo];
             TensorView tv;
             tv.dtype = pt.dtype;
             tv.shape = std::move(pt.shape);
-            tv.offset = pt.raw_off - sr.offset;
             tv.nbytes = pt.nbytes;
-            tv.host_ptr = reinterpret_cast<const uint8_t*>(ptr) + pt.raw_off;
-            tv.buffer = sr.mtl_buffer;
 
-            size_t req_align = std::max<size_t>(4, dtype_size(tv.dtype));
-            bool skip_copy = allow_unaligned_q4 && is_unaligned_q4_key(pt.full_key, tv.dtype);
-            if (!skip_copy && (tv.offset % req_align != 0)) {
-                id<MTLBuffer> copy_buf = [device newBufferWithBytes:tv.host_ptr
-                                                             length:std::max<size_t>(tv.nbytes, 16)
-                                                            options:MTLResourceStorageModeShared];
-                out.aligned_copies.push_back(copy_buf);
-                tv.buffer = copy_buf;
+            if (pt.nbytes == 0 || out.shard.sub_ranges.empty()) {
+                id<MTLBuffer> dummy_buf = make_aligned_copy_buffer(device, nullptr, 0);
+                out.aligned_copies.push_back(dummy_buf);
+                tv.buffer = dummy_buf;
                 tv.offset = 0;
-                tv.host_ptr = reinterpret_cast<const uint8_t*>([copy_buf contents]);
+                tv.host_ptr = reinterpret_cast<const uint8_t*>([dummy_buf contents]);
+            } else {
+                size_t lo = 0, hi = out.shard.sub_ranges.size();
+                while (lo + 1 < hi) {
+                    size_t mid = (lo + hi) >> 1;
+                    if (out.shard.sub_ranges[mid].offset <= pt.raw_off) lo = mid;
+                    else hi = mid;
+                }
+                const MappedSubRange& sr = out.shard.sub_ranges[lo];
+                tv.offset = pt.raw_off - sr.offset;
+                tv.host_ptr = reinterpret_cast<const uint8_t*>(ptr) + pt.raw_off;
+                tv.buffer = sr.mtl_buffer;
+
+                size_t req_align = std::max<size_t>(4, dtype_size(tv.dtype));
+                bool skip_copy = (allow_unaligned_q4 && is_unaligned_q4_key(pt.full_key, tv.dtype)) ||
+                                 (allow_unaligned_bf16 && tv.dtype == DType::BF16);
+                if (!skip_copy && (tv.offset % req_align != 0)) {
+                    id<MTLBuffer> copy_buf = make_aligned_copy_buffer(device, tv.host_ptr, tv.nbytes);
+                    out.aligned_copies.push_back(copy_buf);
+                    tv.buffer = copy_buf;
+                    tv.offset = 0;
+                    tv.host_ptr = reinterpret_cast<const uint8_t*>([copy_buf contents]);
+                }
             }
             out.tensors.emplace_back(std::move(pt.full_key), std::move(tv));
         }
         out.has_shard = true;
+        map_guard.release();
         return out;
     }
 
@@ -215,7 +280,6 @@ ShardLoadResult load_shard_isolated(id device_id, const std::string& path, const
                                                      options:MTLResourceStorageModeShared
                                                  deallocator:nil];
     if (!mtl_buf) {
-        munmap(ptr, aligned_size);
         throw std::runtime_error("Metal newBufferWithBytesNoCopy failed for " + path +
                                  " (size=" + std::to_string(aligned_size) + ")");
     }
@@ -233,22 +297,22 @@ ShardLoadResult load_shard_isolated(id device_id, const std::string& path, const
         TensorView tv;
         tv.dtype = parse_dtype(info["dtype"].as_string());
         for (const auto& dim : info["shape"].as_array()) {
-            tv.shape.push_back(dim.as_int());
+            int64_t d = dim.as_int();
+            if (d < 0) throw std::runtime_error("Negative tensor dimension in " + path);
+            tv.shape.push_back(d);
         }
-        const auto& offs = info["data_offsets"].as_array();
-        size_t s = static_cast<size_t>(offs[0].as_int());
-        size_t e = static_cast<size_t>(offs[1].as_int());
-        tv.offset = data_base + s;
-        tv.nbytes = e - s;
+        size_t raw_off = 0, nbytes = 0;
+        parse_checked_offsets(info, data_base, file_size, path, raw_off, nbytes);
+        tv.offset = raw_off;
+        tv.nbytes = nbytes;
         tv.host_ptr = reinterpret_cast<const uint8_t*>(ptr) + tv.offset;
         tv.buffer = mtl_buf;
 
         size_t req_align = std::max<size_t>(4, dtype_size(tv.dtype));
-        bool skip_copy = allow_unaligned_q4 && is_unaligned_q4_key(full_key, tv.dtype);
+        bool skip_copy = (allow_unaligned_q4 && is_unaligned_q4_key(full_key, tv.dtype)) ||
+                         (allow_unaligned_bf16 && tv.dtype == DType::BF16);
         if (!skip_copy && (tv.offset % req_align != 0)) {
-            id<MTLBuffer> copy_buf = [device newBufferWithBytes:tv.host_ptr
-                                                         length:std::max<size_t>(tv.nbytes, 16)
-                                                        options:MTLResourceStorageModeShared];
+            id<MTLBuffer> copy_buf = make_aligned_copy_buffer(device, tv.host_ptr, tv.nbytes);
             out.aligned_copies.push_back(copy_buf);
             tv.buffer = copy_buf;
             tv.offset = 0;
@@ -257,6 +321,7 @@ ShardLoadResult load_shard_isolated(id device_id, const std::string& path, const
         out.tensors.emplace_back(std::move(full_key), std::move(tv));
     }
     out.has_shard = true;
+    map_guard.release();
     return out;
 }
 
@@ -330,8 +395,9 @@ SafetensorsStore::~SafetensorsStore() {
 
 void SafetensorsStore::load_file(id device_id, const std::string& path, const std::string& key_prefix,
                                  bool prefetch_now, const std::vector<std::string>& skip_prefixes,
-                                 bool allow_unaligned_q4) {
-    ShardLoadResult r = load_shard_isolated(device_id, path, key_prefix, prefetch_now, skip_prefixes, {}, allow_unaligned_q4);
+                                 bool allow_unaligned_q4, bool allow_unaligned_bf16) {
+    ShardLoadResult r = load_shard_isolated(device_id, path, key_prefix, prefetch_now, skip_prefixes, {},
+                                            allow_unaligned_q4, allow_unaligned_bf16);
     if (!r.has_shard) return;
     shards_.push_back(std::move(r.shard));
     for (auto& c : r.aligned_copies) aligned_copies_.push_back(c);
@@ -340,7 +406,7 @@ void SafetensorsStore::load_file(id device_id, const std::string& path, const st
 }
 
 void SafetensorsStore::load_dir(id device_id, const std::string& dir, const std::vector<std::string>& skip_prefixes,
-                                bool prefetch_now, bool allow_unaligned_q4) {
+                                bool prefetch_now, bool allow_unaligned_q4, bool allow_unaligned_bf16) {
     std::string index_path = dir + "/model.safetensors.index.json";
     std::set<std::string> shard_files;
     if (fs::exists(index_path)) {
@@ -366,7 +432,7 @@ void SafetensorsStore::load_dir(id device_id, const std::string& dir, const std:
 
     std::vector<std::string> files(shard_files.begin(), shard_files.end());
     if (files.size() == 1u) {
-        load_file(device_id, files[0], "", prefetch_now, skip_prefixes, allow_unaligned_q4);
+        load_file(device_id, files[0], "", prefetch_now, skip_prefixes, allow_unaligned_q4, allow_unaligned_bf16);
         return;
     }
 
@@ -386,7 +452,8 @@ void SafetensorsStore::load_dir(id device_id, const std::string& dir, const std:
                     size_t idx = next_i.fetch_add(1);
                     if (idx >= files.size()) break;
                     try {
-                        results[idx] = load_shard_isolated(device_id, files[idx], "", prefetch_now, skip_prefixes, {}, allow_unaligned_q4);
+                        results[idx] = load_shard_isolated(device_id, files[idx], "", prefetch_now, skip_prefixes, {},
+                                                           allow_unaligned_q4, allow_unaligned_bf16);
                     } catch (...) {
                         std::lock_guard<std::mutex> lk(exc_mtx);
                         if (!first_exc) first_exc = std::current_exception();
@@ -422,7 +489,8 @@ void SafetensorsStore::load_dir(id device_id, const std::string& dir, const std:
 
 void SafetensorsStore::load_dir_only(id device_id, const std::string& dir,
                                      const std::vector<std::string>& include_prefixes,
-                                     bool prefetch_now, bool allow_unaligned_q4) {
+                                     bool prefetch_now, bool allow_unaligned_q4,
+                                     bool allow_unaligned_bf16) {
     if (include_prefixes.empty()) return;
     std::string index_path = dir + "/model.safetensors.index.json";
     std::set<std::string> shard_files;
@@ -442,7 +510,8 @@ void SafetensorsStore::load_dir_only(id device_id, const std::string& dir,
     }
 
     for (const auto& sf : shard_files) {
-        ShardLoadResult r = load_shard_isolated(device_id, sf, "", prefetch_now, {}, include_prefixes, allow_unaligned_q4);
+        ShardLoadResult r = load_shard_isolated(device_id, sf, "", prefetch_now, {}, include_prefixes,
+                                                allow_unaligned_q4, allow_unaligned_bf16);
         if (!r.has_shard) continue;
         shards_.push_back(std::move(r.shard));
         for (auto& c : r.aligned_copies) aligned_copies_.push_back(c);
@@ -452,14 +521,50 @@ void SafetensorsStore::load_dir_only(id device_id, const std::string& dir,
 }
 
 void SafetensorsStore::prefetch() const {
+    // Merge evicted intervals so MADV_WILLNEED NEVER re-faults pages freed by evict_tensor()!
+    std::vector<std::pair<uintptr_t, uintptr_t>> evicted;
+    if (!evicted_ranges_.empty()) {
+        auto sorted = evicted_ranges_;
+        std::sort(sorted.begin(), sorted.end());
+        for (const auto& er : sorted) {
+            if (evicted.empty() || er.first > evicted.back().second) {
+                evicted.push_back(er);
+            } else if (er.second > evicted.back().second) {
+                evicted.back().second = er.second;
+            }
+        }
+    }
+
+    auto advise_non_evicted = [&](uintptr_t lo, uintptr_t hi) {
+        if (hi <= lo) return;
+        if (evicted.empty()) {
+            madvise(reinterpret_cast<void*>(lo), hi - lo, MADV_WILLNEED);
+            return;
+        }
+        uintptr_t cur = lo;
+        for (const auto& [e_lo, e_hi] : evicted) {
+            if (e_hi <= cur) continue;
+            if (e_lo >= hi) break;
+            if (e_lo > cur) {
+                madvise(reinterpret_cast<void*>(cur), e_lo - cur, MADV_WILLNEED);
+            }
+            cur = std::max(cur, e_hi);
+            if (cur >= hi) break;
+        }
+        if (cur < hi) {
+            madvise(reinterpret_cast<void*>(cur), hi - cur, MADV_WILLNEED);
+        }
+    };
+
     for (const auto& sh : shards_) {
         if (!sh.mmap_ptr || sh.mmap_ptr == MAP_FAILED) continue;
+        uintptr_t base = reinterpret_cast<uintptr_t>(sh.mmap_ptr);
         if (!sh.sub_ranges.empty()) {
             for (const auto& sr : sh.sub_ranges) {
-                madvise(reinterpret_cast<uint8_t*>(sh.mmap_ptr) + sr.offset, sr.length, MADV_WILLNEED);
+                advise_non_evicted(base + sr.offset, base + sr.offset + sr.length);
             }
         } else if (sh.file_size > 0) {
-            madvise(sh.mmap_ptr, sh.file_size, MADV_WILLNEED);
+            advise_non_evicted(base, base + sh.file_size);
         }
     }
 }
@@ -560,38 +665,76 @@ bool CpuMmapQ4Weight::open(const std::string& model_dir, const std::string& pref
     if (!mw || !ms || !mb) { close(); return false; }
 
     auto locate = [](const RawMap* rm, const std::string& key,
-                     DType& dt, std::vector<int64_t>& shape, const uint8_t*& ptr) -> bool {
-        const uint8_t* base = reinterpret_cast<const uint8_t*>(rm->ptr);
-        uint64_t hlen = 0;
-        std::memcpy(&hlen, base, 8);
-        if (8u + hlen > rm->size) return false;
-        Json hdr = parse_json(std::string_view(reinterpret_cast<const char*>(base + 8), static_cast<size_t>(hlen)));
-        const auto& obj = hdr.as_object();
-        auto it = obj.find(key);
-        if (it == obj.end()) return false;
-        dt = parse_dtype(it->second["dtype"].as_string());
-        shape.clear();
-        for (const auto& d : it->second["shape"].as_array()) shape.push_back(d.as_int());
-        size_t off0 = static_cast<size_t>(it->second["data_offsets"].as_array()[0].as_int());
-        ptr = base + 8u + static_cast<size_t>(hlen) + off0;
-        return true;
+                     DType& dt, std::vector<int64_t>& shape,
+                     const uint8_t*& ptr, size_t& nbytes) -> bool {
+        try {
+            const uint8_t* base = reinterpret_cast<const uint8_t*>(rm->ptr);
+            if (rm->size < 8u) return false;
+            uint64_t hlen = 0;
+            std::memcpy(&hlen, base, 8);
+            if (hlen > rm->size - 8u) return false;
+            size_t data_base = 8u + static_cast<size_t>(hlen);
+            Json hdr = parse_json(std::string_view(reinterpret_cast<const char*>(base + 8), static_cast<size_t>(hlen)));
+            const auto& obj = hdr.as_object();
+            auto it = obj.find(key);
+            if (it == obj.end()) return false;
+            dt = parse_dtype(it->second["dtype"].as_string());
+            shape.clear();
+            for (const auto& d : it->second["shape"].as_array()) {
+                int64_t dv = d.as_int();
+                if (dv < 0) return false;
+                shape.push_back(dv);
+            }
+            const auto& offs = it->second["data_offsets"].as_array();
+            if (offs.size() != 2) return false;
+            int64_t s64 = offs[0].as_int();
+            int64_t e64 = offs[1].as_int();
+            if (s64 < 0 || e64 < s64) return false;
+            size_t off0 = static_cast<size_t>(s64);
+            size_t off1 = static_cast<size_t>(e64);
+            if (off1 > rm->size - data_base) return false;
+            ptr = base + data_base + off0;
+            nbytes = off1 - off0;
+            return true;
+        } catch (...) {
+            return false;
+        }
+    };
+
+    auto is_float_dt = [](DType d) {
+        return d == DType::BF16 || d == DType::F16 || d == DType::F32;
     };
 
     DType wdt = DType::UNKNOWN;
     std::vector<int64_t> wsh, ssh, bsh;
     const uint8_t* wp = nullptr;
-    if (!locate(mw, kw, wdt, wsh, wp) || wdt != DType::U32 || wsh.size() != 2 ||
-        !locate(ms, ks, s_dtype_, ssh, s_ptr_) || ssh.size() != 2 ||
-        !locate(mb, kb, b_dtype_, bsh, b_ptr_) || bsh.size() != 2) {
+    size_t w_nbytes = 0, s_nbytes = 0, b_nbytes = 0;
+    if (!locate(mw, kw, wdt, wsh, wp, w_nbytes) || wdt != DType::U32 || wsh.size() != 2 ||
+        !locate(ms, ks, s_dtype_, ssh, s_ptr_, s_nbytes) || ssh.size() != 2 ||
+        !locate(mb, kb, b_dtype_, bsh, b_ptr_, b_nbytes) || bsh.size() != 2 ||
+        !is_float_dt(s_dtype_) || !is_float_dt(b_dtype_)) {
         close();
         return false;
     }
 
-    w_ptr_ = reinterpret_cast<const uint32_t*>(wp);
+    if (wsh[0] <= 0 || wsh[1] <= 0 || ssh[0] != wsh[0] || ssh[1] <= 0 || bsh != ssh) {
+        close();
+        return false;
+    }
+
+    w_ptr_ = wp;
     out_dim_ = static_cast<uint32_t>(wsh[0]);
     in_dim_ = static_cast<uint32_t>(wsh[1] * 8);
     groups_per_row_ = static_cast<uint32_t>(ssh[1]);
-    if (groups_per_row_ == 0 || (in_dim_ % groups_per_row_) != 0) {
+    if (groups_per_row_ == 0 || (in_dim_ % groups_per_row_) != 0 || ((in_dim_ / groups_per_row_) & 7u) != 0u) {
+        close();
+        return false;
+    }
+    const size_t exp_w_bytes = static_cast<size_t>(out_dim_) * static_cast<size_t>(wsh[1]) * 4u;
+    const size_t n_groups = static_cast<size_t>(out_dim_) * groups_per_row_;
+    if (w_nbytes < exp_w_bytes ||
+        s_nbytes < n_groups * dtype_size(s_dtype_) ||
+        b_nbytes < n_groups * dtype_size(b_dtype_)) {
         close();
         return false;
     }
@@ -607,7 +750,7 @@ void CpuMmapQ4Weight::gather_f32(const int* token_ids, int M, float* out_f32) co
     for (int m = 0; m < M; ++m) {
         uint32_t row = (token_ids[m] >= 0 && static_cast<uint32_t>(token_ids[m]) < out_dim_)
             ? static_cast<uint32_t>(token_ids[m]) : 0u;
-        const uint32_t* wr = w_ptr_ + static_cast<size_t>(row) * words_per_row;
+        const uint8_t* wr = w_ptr_ + static_cast<size_t>(row) * words_per_row * 4u;
         float* dst = out_f32 + static_cast<size_t>(m) * in_dim_;
 
         for (uint32_t g = 0; g < groups_per_row_; ++g) {
@@ -617,10 +760,11 @@ void CpuMmapQ4Weight::gather_f32(const int* token_ids, int M, float* out_f32) co
 #if defined(__aarch64__) || defined(__ARM_NEON)
             float32x4_t vsc = vdupq_n_f32(sc);
             float32x4_t vbi = vdupq_n_f32(bi);
-            const uint32_t* wg = wr + g * words_per_g;
+            const uint8_t* wg = wr + static_cast<size_t>(g) * words_per_g * 4u;
             float* dg = dst + g * gsize;
             for (uint32_t wi = 0; wi < words_per_g; ++wi) {
-                uint32_t word = wg[wi];
+                uint32_t word = 0;
+                std::memcpy(&word, wg + static_cast<size_t>(wi) * 4u, 4);
                 uint32_t n_lo[4] = {
                     (word >> 0)  & 0xFu, (word >> 4)  & 0xFu,
                     (word >> 8)  & 0xFu, (word >> 12) & 0xFu
@@ -635,10 +779,11 @@ void CpuMmapQ4Weight::gather_f32(const int* token_ids, int M, float* out_f32) co
                 vst1q_f32(dg + wi * 8u + 4u, vfmaq_f32(vbi, fhi, vsc));
             }
 #else
-            const uint32_t* wg = wr + g * words_per_g;
+            const uint8_t* wg = wr + static_cast<size_t>(g) * words_per_g * 4u;
             float* dg = dst + g * gsize;
             for (uint32_t wi = 0; wi < words_per_g; ++wi) {
-                uint32_t word = wg[wi];
+                uint32_t word = 0;
+                std::memcpy(&word, wg + static_cast<size_t>(wi) * 4u, 4);
                 for (uint32_t b = 0; b < 8u; ++b) {
                     dg[wi * 8u + b] = static_cast<float>((word >> (4u * b)) & 0xFu) * sc + bi;
                 }

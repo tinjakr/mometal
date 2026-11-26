@@ -128,7 +128,7 @@ void QwenVisionTower::parse_vision_config(const std::string& model_dir) {
         hidden_size_         = static_cast<int>(vc["hidden_size"].as_int(1152));
         intermediate_size_   = static_cast<int>(vc["intermediate_size"].as_int(4304));
         num_heads_           = static_cast<int>(vc["num_heads"].as_int(16));
-        head_dim_            = hidden_size_ / num_heads_;
+        head_dim_            = (num_heads_ > 0) ? (hidden_size_ / num_heads_) : 0;
         out_hidden_size_     = static_cast<int>(vc["out_hidden_size"].as_int(5120));
         patch_size_          = static_cast<int>(vc["patch_size"].as_int(16));
         temporal_patch_size_ = static_cast<int>(vc["temporal_patch_size"].as_int(2));
@@ -139,6 +139,15 @@ void QwenVisionTower::parse_vision_config(const std::string& model_dir) {
 }
 
 void QwenVisionTower::init_pipelines_and_weights(const SafetensorsStore& store, const std::string& pfx) {
+    if (depth_ <= 0 || num_heads_ <= 0 || head_dim_ != 72 || hidden_size_ != num_heads_ * head_dim_ ||
+        patch_size_ <= 0 || spatial_merge_size_ <= 0 || temporal_patch_size_ <= 0) {
+        throw std::runtime_error(
+            "Unsupported vision tower config (depth=" + std::to_string(depth_) +
+            ", hidden_size=" + std::to_string(hidden_size_) +
+            ", num_heads=" + std::to_string(num_heads_) +
+            ", head_dim=" + std::to_string(head_dim_) + "; expected head_dim=72)");
+    }
+
     std::string shader_dir = MOMETAL_SHADER_DIR;
     ctx_.load_shader_file("vision", shader_dir + "/vision.metal");
     pso_gemm_             = ctx_.pipeline("vision", "vis_bf16_gemm_f16x");
@@ -196,7 +205,7 @@ QwenVisionTower::QwenVisionTower(MetalContext& ctx, const SafetensorsStore& stor
     parse_vision_config(model_dir);
     init_pipelines_and_weights(store, pfx_);
     ready_ = true;
-    loaded_ = true;
+    loaded_.store(true, std::memory_order_release);
 }
 
 QwenVisionTower::QwenVisionTower(MetalContext& ctx) : ctx_(ctx) {}
@@ -205,14 +214,14 @@ bool QwenVisionTower::init_lazy(const std::string& model_dir) {
     std::string pfx = probe_vision_prefix_on_disk(model_dir);
     if (pfx.empty()) {
         ready_ = false;
-        loaded_ = false;
+        loaded_.store(false, std::memory_order_release);
         return false;
     }
     model_dir_ = model_dir;
     pfx_ = std::move(pfx);
     parse_vision_config(model_dir);
     ready_ = true;
-    loaded_ = false;
+    loaded_.store(false, std::memory_order_release);
     return true;
 }
 
@@ -223,16 +232,17 @@ std::unique_ptr<QwenVisionTower> QwenVisionTower::create_lazy(MetalContext& ctx,
 }
 
 void QwenVisionTower::ensure_loaded() {
-    if (loaded_) return;
+    if (loaded_.load(std::memory_order_acquire)) return;
     std::lock_guard<std::mutex> lk(load_mtx_);
-    if (loaded_) return;
+    if (loaded_.load(std::memory_order_acquire)) return;
     if (!ready_ || model_dir_.empty() || pfx_.empty()) {
         throw std::runtime_error("Vision tower not available for this model");
     }
     auto t0 = std::chrono::steady_clock::now();
-    own_store_.load_dir_only(ctx_.device(), model_dir_, {pfx_}, true);
+    // Zero-copy MAP_SHARED BF16 mapping (shaders handle arbitrary byte alignment -> 0 MiB dirty aligned_copies!)
+    own_store_.load_dir_only(ctx_.device(), model_dir_, {pfx_}, true, false, true);
     init_pipelines_and_weights(own_store_, pfx_);
-    loaded_ = true;
+    loaded_.store(true, std::memory_order_release);
     double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     std::fprintf(stderr, "[vision] Lazily loaded vision tower (%.1f MiB) in %.1f ms\n",
                  own_store_.total_mapped_bytes() / (1024.0 * 1024.0), ms);
@@ -247,27 +257,49 @@ EncodedImage QwenVisionTower::encode_url(const std::string& url, int max_edge) {
         return encode_bytes(raw.data(), raw.size(), max_edge);
     }
 
+    const char* allow_local = std::getenv("MI_ALLOW_LOCAL_IMAGE_PATHS");
+    if (!allow_local || std::strcmp(allow_local, "1") != 0) {
+        throw std::runtime_error(
+            "Local image file paths are disabled by default (use data: URLs or set MI_ALLOW_LOCAL_IMAGE_PATHS=1)");
+    }
+
     std::string path = url;
     if (path.rfind("file://", 0) == 0) path = path.substr(7);
+    std::error_code ec;
+    if (!fs::is_regular_file(path, ec) || ec) {
+        throw std::runtime_error("Image path is not a regular file: " + path);
+    }
+    constexpr uintmax_t kMaxImageBytes = 64ull * 1024ull * 1024ull;
+    uintmax_t fsz = fs::file_size(path, ec);
+    if (ec || fsz == 0 || fsz > kMaxImageBytes) {
+        throw std::runtime_error("Image file empty or exceeds 64 MiB limit: " + path);
+    }
     std::ifstream ifs(path, std::ios::binary);
     if (!ifs) throw std::runtime_error("Failed to open image file: " + path);
-    std::vector<uint8_t> raw((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
-    if (raw.empty()) throw std::runtime_error("Empty image file: " + path);
+    std::vector<uint8_t> raw(static_cast<size_t>(fsz));
+    ifs.read(reinterpret_cast<char*>(raw.data()), static_cast<std::streamsize>(fsz));
+    std::streamsize got = ifs.gcount();
+    if (got <= 0) throw std::runtime_error("Empty image file: " + path);
+    raw.resize(static_cast<size_t>(got));
     return encode_bytes(raw.data(), raw.size(), max_edge);
 }
 
 EncodedImage QwenVisionTower::encode_bytes(const uint8_t* data, size_t len, int max_edge) {
     if (!ready_) throw std::runtime_error("Vision tower not loaded for this model");
+    if (!data || len == 0) throw std::runtime_error("Empty image data");
     ensure_loaded();
 
     uint64_t h = fnv1a_64(data, len);
     h = fnv1a_64(&max_edge, sizeof(max_edge), h);
-    auto cit = cache_.find(h);
-    if (cit != cache_.end()) {
-        lru_order_.erase(cit->second.second);
-        lru_order_.push_front(h);
-        cit->second.second = lru_order_.begin();
-        return cit->second.first;
+    {
+        std::lock_guard<std::mutex> lk(run_mtx_);
+        auto cit = cache_.find(h);
+        if (cit != cache_.end()) {
+            lru_order_.erase(cit->second.second);
+            lru_order_.push_front(h);
+            cit->second.second = lru_order_.begin();
+            return cit->second.first;
+        }
     }
 
     // Decode compressed image (PNG / JPEG / WebP / HEIC / GIF) via macOS ImageIO + CoreGraphics
@@ -351,6 +383,15 @@ EncodedImage QwenVisionTower::encode_bytes(const uint8_t* data, size_t len, int 
                 }
             }
         }
+    }
+
+    std::lock_guard<std::mutex> lk(run_mtx_);
+    auto cit2 = cache_.find(h);
+    if (cit2 != cache_.end()) {
+        lru_order_.erase(cit2->second.second);
+        lru_order_.push_front(h);
+        cit2->second.second = lru_order_.begin();
+        return cit2->second.first;
     }
 
     EncodedImage enc_img = run_vit(patches_f16, gh, gw, h);

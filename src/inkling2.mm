@@ -14,6 +14,7 @@
 #include <fstream>
 #include <set>
 #include <stdexcept>
+#include <unistd.h>
 
 namespace mi {
 
@@ -21,6 +22,7 @@ namespace {
 
 struct QmmParams { uint32_t M, N, K, add_residual; };
 struct EmbedParams { uint32_t M, D; float eps; };
+struct InkEmbedParams { uint32_t M, D; float eps; uint32_t V; };
 struct NormParams { uint32_t M, D; float eps; };
 struct AttnResParams {
     uint32_t M, D, n_closed, use_partial, n_q, closed_stride;
@@ -90,6 +92,9 @@ Inkling2Model::Inkling2Model(
 )
     : ctx_(ctx), max_seq_len_(max_seq_len), exact_nvfp4_act_(exact_nvfp4_act),
       mtp_depth_(std::clamp(mtp_depth, 1, 3)) {
+    if (max_seq_len_ <= 0) {
+        throw std::runtime_error("max_seq_len must be > 0 (got " + std::to_string(max_seq_len_) + ")");
+    }
     auto t0 = std::chrono::steady_clock::now();
 
     std::string shader_dir = MOMETAL_SHADER_DIR;
@@ -732,7 +737,7 @@ void Inkling2Model::encode_chunk(
 
     // 1. Embedding + embed_norm
     if (embed_.kind == LinKind::BF16) {
-        EmbedParams ep{M, D, rms_eps_};
+        InkEmbedParams ep{M, D, rms_eps_, static_cast<uint32_t>(vocab_size_)};
         [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_ink_embed_];
         [enc setBuffer:(id<MTLBuffer>)embed_.w.buffer offset:embed_.w.offset atIndex:0];
         [enc setBuffer:(id<MTLBuffer>)embed_norm_.buffer offset:embed_norm_.offset atIndex:1];
@@ -1448,7 +1453,7 @@ void Inkling2Model::encode_mtp_propose(id enc_id, int /*anchor_token*/, int coun
 
     // 1. Row 0 = embed_norm(embed(anchor)) from buf_mtp_tok_ring_[0], rows 1..7 = mask_embed
     if (embed_.kind == LinKind::BF16) {
-        EmbedParams ep{1u, D, rms_eps_};
+        InkEmbedParams ep{1u, D, rms_eps_, static_cast<uint32_t>(vocab_size_)};
         [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_ink_embed_];
         [enc setBuffer:(id<MTLBuffer>)embed_.w.buffer offset:embed_.w.offset atIndex:0];
         [enc setBuffer:(id<MTLBuffer>)embed_norm_.buffer offset:embed_norm_.offset atIndex:1];
@@ -1670,7 +1675,11 @@ const float* Inkling2Model::forward(const int* tokens, int n_tokens, int* out_ar
     while (offset < n_tokens) {
         int m = std::min(chunk_size_, n_tokens - offset);
         bool is_last = (offset + m == n_tokens);
-        std::memcpy([(id<MTLBuffer>)buf_token_ids_ contents], tokens + offset, static_cast<size_t>(m) * sizeof(int));
+        int* dst_ids = reinterpret_cast<int*>([(id<MTLBuffer>)buf_token_ids_ contents]);
+        for (int i = 0; i < m; ++i) {
+            int tid = tokens[offset + i];
+            dst_ids[i] = (tid >= 0 && tid < vocab_size_) ? tid : 0;
+        }
 
         @autoreleasepool {
             id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)ctx_.queue() commandBuffer];
@@ -1724,7 +1733,8 @@ void Inkling2Model::forward_mtp_greedy(int anchor_token, std::vector<int>& out_t
 
     // Seed anchor_token into tok_ring[0]
     uint32_t* ring = reinterpret_cast<uint32_t*>([(id<MTLBuffer>)buf_mtp_tok_ring_ contents]);
-    ring[0] = static_cast<uint32_t>(anchor_token);
+    int safe_anchor = (anchor_token >= 0 && anchor_token < vocab_size_) ? anchor_token : 0;
+    ring[0] = static_cast<uint32_t>(safe_anchor);
 
     // Execute ENTIRE DSpark propose (3 blocks + K Markov steps) AND target M-token verify in ONE command buffer!
     @autoreleasepool {
@@ -1833,8 +1843,10 @@ bool Inkling2Model::save_state_to_file(const std::string& path, const std::vecto
             for (const auto& bs : mtp_states_) {
                 size_t kv_rows = (bs.is_sliding && mtp_pos_ >= bs.kv_cap) ? static_cast<size_t>(bs.kv_cap) : static_cast<size_t>(mtp_pos_);
                 size_t kv_sz = kv_rows * kv_dim * sizeof(uint16_t);
-                [blit copyFromBuffer:(id<MTLBuffer>)bs.k_cache sourceOffset:0 toBuffer:stage destinationOffset:off size:kv_sz]; off += kv_sz;
-                [blit copyFromBuffer:(id<MTLBuffer>)bs.v_cache sourceOffset:0 toBuffer:stage destinationOffset:off size:kv_sz]; off += kv_sz;
+                if (kv_sz > 0) {
+                    [blit copyFromBuffer:(id<MTLBuffer>)bs.k_cache sourceOffset:0 toBuffer:stage destinationOffset:off size:kv_sz]; off += kv_sz;
+                    [blit copyFromBuffer:(id<MTLBuffer>)bs.v_cache sourceOffset:0 toBuffer:stage destinationOffset:off size:kv_sz]; off += kv_sz;
+                }
             }
             size_t mctx_sz = static_cast<size_t>(hidden_size_) * sizeof(float);
             [blit copyFromBuffer:(id<MTLBuffer>)buf_mtp_markov_ctx_ sourceOffset:0 toBuffer:stage destinationOffset:off size:mctx_sz]; off += mctx_sz;
@@ -1842,8 +1854,11 @@ bool Inkling2Model::save_state_to_file(const std::string& path, const std::vecto
         [blit endEncoding];
         [cb commit];
         [cb waitUntilCompleted];
+        if (cb.error) return false;
 
-        std::ofstream ofs(path, std::ios::binary | std::ios::trunc);
+        namespace fs = std::filesystem;
+        std::string tmp_path = path + ".tmp." + std::to_string(getpid());
+        std::ofstream ofs(tmp_path, std::ios::binary | std::ios::trunc);
         if (!ofs) return false;
         PrefixCacheHeader hdr{};
         std::memcpy(hdr.magic, "MICACHE1", 8);
@@ -1854,32 +1869,75 @@ bool Inkling2Model::save_state_to_file(const std::string& path, const std::vecto
         ofs.write(reinterpret_cast<const char*>(&hdr), sizeof(hdr));
         ofs.write(reinterpret_cast<const char*>(tokens.data()), tokens.size() * sizeof(int));
         ofs.write(reinterpret_cast<const char*>([stage contents]), total_state);
-        return ofs.good();
+        ofs.close();
+        if (!ofs.good()) {
+            std::error_code ec_rm;
+            fs::remove(tmp_path, ec_rm);
+            return false;
+        }
+        std::error_code ec_rn;
+        fs::rename(tmp_path, path, ec_rn);
+        if (ec_rn) {
+            std::error_code ec_rm;
+            fs::remove(tmp_path, ec_rm);
+            return false;
+        }
+        return true;
     }
 }
 
 bool Inkling2Model::load_state_from_file(const std::string& path, std::vector<int>& out_tokens) {
+    namespace fs = std::filesystem;
+    std::error_code ec_sz;
+    uintmax_t file_sz = fs::file_size(path, ec_sz);
+    if (ec_sz || file_sz < sizeof(PrefixCacheHeader)) return false;
+
     std::ifstream ifs(path, std::ios::binary);
     if (!ifs) return false;
     PrefixCacheHeader hdr{};
     ifs.read(reinterpret_cast<char*>(&hdr), sizeof(hdr));
     if (!ifs || std::memcmp(hdr.magic, "MICACHE1", 8) != 0) return false;
     if (hdr.model_hash != compute_model_hash(info_)) return false;
-    if (static_cast<int>(hdr.pos) > max_seq_len_) return false;
+    if (hdr.pos == 0u || hdr.pos > static_cast<uint32_t>(max_seq_len_)) return false;
 
-    out_tokens.resize(hdr.pos);
-    ifs.read(reinterpret_cast<char*>(out_tokens.data()), hdr.pos * sizeof(int));
-    if (!ifs) return false;
+    const bool has_mtp_payload = (hdr.reserved & 0x80000000u) != 0u;
+    const uint32_t saved_mtp_pos_u = hdr.reserved & 0x7FFFFFFFu;
+    if (has_mtp_payload != mtp_loaded_) return false;
+    if (has_mtp_payload && saved_mtp_pos_u > static_cast<uint32_t>(max_seq_len_)) return false;
+    const int saved_mtp_pos = static_cast<int>(saved_mtp_pos_u);
 
     size_t kv_dim = static_cast<size_t>(num_kv_heads_) * head_dim_;
     size_t conv_kv_bytes = 3ull * kv_dim * sizeof(float);
     size_t conv_d_bytes  = 3ull * hidden_size_ * sizeof(float);
-    bool has_mtp_payload = (hdr.reserved & 0x80000000u) != 0u;
-    int saved_mtp_pos = static_cast<int>(hdr.reserved & 0x7FFFFFFFu);
+    size_t expected_state = 0;
+    for (const auto& vs : visit_states_) {
+        if (!vs.is_sliding && hdr.pos > static_cast<uint32_t>(vs.kv_cap)) return false;
+        size_t kv_rows = (vs.is_sliding && static_cast<int>(hdr.pos) >= vs.kv_cap)
+            ? static_cast<size_t>(vs.kv_cap) : static_cast<size_t>(hdr.pos);
+        expected_state += 2 * kv_rows * kv_dim * sizeof(uint16_t) + 2 * conv_kv_bytes + 2 * conv_d_bytes;
+    }
+    if (has_mtp_payload) {
+        for (const auto& bs : mtp_states_) {
+            if (!bs.is_sliding && saved_mtp_pos_u > static_cast<uint32_t>(bs.kv_cap)) return false;
+            size_t kv_rows = (bs.is_sliding && saved_mtp_pos >= bs.kv_cap)
+                ? static_cast<size_t>(bs.kv_cap) : static_cast<size_t>(saved_mtp_pos);
+            expected_state += 2 * kv_rows * kv_dim * sizeof(uint16_t);
+        }
+        expected_state += static_cast<size_t>(hidden_size_) * sizeof(float);
+    }
+
+    if (expected_state == 0 || hdr.state_bytes != expected_state) return false;
+    const uint64_t tok_bytes = static_cast<uint64_t>(hdr.pos) * sizeof(int);
+    const uint64_t rem_after_hdr = static_cast<uint64_t>(file_sz) - sizeof(PrefixCacheHeader);
+    if (tok_bytes > rem_after_hdr || hdr.state_bytes > rem_after_hdr - tok_bytes) return false;
+
+    std::vector<int> loaded_tokens(hdr.pos);
+    ifs.read(reinterpret_cast<char*>(loaded_tokens.data()), static_cast<std::streamsize>(tok_bytes));
+    if (!ifs) return false;
 
     @autoreleasepool {
         id<MTLBuffer> stage = ctx_.alloc_shared(hdr.state_bytes);
-        ifs.read(reinterpret_cast<char*>([stage contents]), hdr.state_bytes);
+        ifs.read(reinterpret_cast<char*>([stage contents]), static_cast<std::streamsize>(hdr.state_bytes));
         if (!ifs) return false;
 
         id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)ctx_.queue() commandBuffer];
@@ -1901,8 +1959,10 @@ bool Inkling2Model::load_state_from_file(const std::string& path, std::vector<in
                 size_t kv_rows = (bs.is_sliding && saved_mtp_pos >= bs.kv_cap)
                     ? static_cast<size_t>(bs.kv_cap) : static_cast<size_t>(saved_mtp_pos);
                 size_t kv_sz = kv_rows * kv_dim * sizeof(uint16_t);
-                [blit copyFromBuffer:stage sourceOffset:off toBuffer:(id<MTLBuffer>)bs.k_cache destinationOffset:0 size:kv_sz]; off += kv_sz;
-                [blit copyFromBuffer:stage sourceOffset:off toBuffer:(id<MTLBuffer>)bs.v_cache destinationOffset:0 size:kv_sz]; off += kv_sz;
+                if (kv_sz > 0) {
+                    [blit copyFromBuffer:stage sourceOffset:off toBuffer:(id<MTLBuffer>)bs.k_cache destinationOffset:0 size:kv_sz]; off += kv_sz;
+                    [blit copyFromBuffer:stage sourceOffset:off toBuffer:(id<MTLBuffer>)bs.v_cache destinationOffset:0 size:kv_sz]; off += kv_sz;
+                }
             }
             size_t mctx_sz = static_cast<size_t>(hidden_size_) * sizeof(float);
             [blit copyFromBuffer:stage sourceOffset:off toBuffer:(id<MTLBuffer>)buf_mtp_markov_ctx_ destinationOffset:0 size:mctx_sz]; off += mctx_sz;
@@ -1910,8 +1970,10 @@ bool Inkling2Model::load_state_from_file(const std::string& path, std::vector<in
         [blit endEncoding];
         [cb commit];
         [cb waitUntilCompleted];
+        if (cb.error) return false;
     }
 
+    out_tokens = std::move(loaded_tokens);
     pos_ = static_cast<int>(hdr.pos);
     mtp_pos_ = (has_mtp_payload && mtp_loaded_) ? saved_mtp_pos : 0;
     return true;

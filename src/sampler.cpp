@@ -10,7 +10,12 @@
 
 namespace mi {
 
-Sampler::Sampler(SamplerConfig cfg) : cfg_(cfg), rng_(cfg.seed) {}
+Sampler::Sampler(SamplerConfig cfg) : cfg_(cfg), rng_(cfg.seed) {
+    if (!std::isfinite(cfg_.repeat_penalty) || cfg_.repeat_penalty <= 0.0f) cfg_.repeat_penalty = 1.0f;
+    if (!std::isfinite(cfg_.presence_penalty)) cfg_.presence_penalty = 0.0f;
+    if (!std::isfinite(cfg_.temperature) || cfg_.temperature < 0.0f) cfg_.temperature = 0.0f;
+    if (!std::isfinite(cfg_.top_p)) cfg_.top_p = 1.0f;
+}
 
 void Sampler::reset(uint64_t seed) {
     rng_.seed(seed);
@@ -32,67 +37,103 @@ void Sampler::observe(int token) {
 }
 
 size_t Sampler::build_distribution(const float* logits, int vocab_size) {
-    const bool has_pen = (cfg_.presence_penalty != 0.0f || cfg_.repeat_penalty != 1.0f);
+    if (vocab_size <= 0 || logits == nullptr) {
+        cands_.clear();
+        probs_.clear();
+        cands_.emplace_back(0.0f, 0);
+        probs_.push_back(1.0f);
+        return 1;
+    }
+
+    const float rp = (std::isfinite(cfg_.repeat_penalty) && cfg_.repeat_penalty > 0.0f)
+        ? cfg_.repeat_penalty : 1.0f;
+    const bool has_pen = (cfg_.presence_penalty != 0.0f || rp != 1.0f);
     const int seen_n = static_cast<int>(seen_counts_.size());
 
     auto adj = [&](float v, int i) -> float {
-        if (has_pen && i < seen_n && seen_counts_[i] > 0) {
+        if (std::isnan(v)) return -std::numeric_limits<float>::infinity();
+        if (has_pen && i >= 0 && i < seen_n && seen_counts_[i] > 0) {
             if (cfg_.presence_penalty != 0.0f) v -= cfg_.presence_penalty;
-            if (cfg_.repeat_penalty != 1.0f) {
-                v = (v > 0.0f) ? (v / cfg_.repeat_penalty) : (v * cfg_.repeat_penalty);
+            if (rp != 1.0f) {
+                v = (v > 0.0f) ? (v / rp) : (v * rp);
             }
         }
         return v;
     };
 
-    // Fast pass 1: NEON-vectorized max scan across all 248k logits (~0.04 ms vs 0.65 ms scalar!)
-    float max_v = -1e30f;
+    // Fast pass 1: NaN-safe NEON-vectorized max scan across all logits (~0.04 ms vs 0.65 ms scalar!)
+    float max_v = -std::numeric_limits<float>::infinity();
     int best_id = 0;
     if (!has_pen) {
 #if defined(__ARM_NEON)
-        float32x4_t vm0 = vdupq_n_f32(-1e30f);
-        float32x4_t vm1 = vdupq_n_f32(-1e30f);
-        float32x4_t vm2 = vdupq_n_f32(-1e30f);
-        float32x4_t vm3 = vdupq_n_f32(-1e30f);
+        float32x4_t vm0 = vdupq_n_f32(-std::numeric_limits<float>::infinity());
+        float32x4_t vm1 = vdupq_n_f32(-std::numeric_limits<float>::infinity());
+        float32x4_t vm2 = vdupq_n_f32(-std::numeric_limits<float>::infinity());
+        float32x4_t vm3 = vdupq_n_f32(-std::numeric_limits<float>::infinity());
         int i = 0;
         for (; i + 16 <= vocab_size; i += 16) {
-            vm0 = vmaxq_f32(vm0, vld1q_f32(logits + i));
-            vm1 = vmaxq_f32(vm1, vld1q_f32(logits + i + 4));
-            vm2 = vmaxq_f32(vm2, vld1q_f32(logits + i + 8));
-            vm3 = vmaxq_f32(vm3, vld1q_f32(logits + i + 12));
+            vm0 = vmaxnmq_f32(vm0, vld1q_f32(logits + i));
+            vm1 = vmaxnmq_f32(vm1, vld1q_f32(logits + i + 4));
+            vm2 = vmaxnmq_f32(vm2, vld1q_f32(logits + i + 8));
+            vm3 = vmaxnmq_f32(vm3, vld1q_f32(logits + i + 12));
         }
-        float32x4_t vm = vmaxq_f32(vmaxq_f32(vm0, vm1), vmaxq_f32(vm2, vm3));
-        max_v = vmaxvq_f32(vm);
+        float32x4_t vm = vmaxnmq_f32(vmaxnmq_f32(vm0, vm1), vmaxnmq_f32(vm2, vm3));
+        max_v = vmaxnmvq_f32(vm);
         for (; i < vocab_size; ++i) {
-            if (logits[i] > max_v) max_v = logits[i];
+            if (!std::isnan(logits[i]) && logits[i] > max_v) max_v = logits[i];
         }
 #else
         for (int i = 0; i < vocab_size; ++i) {
-            if (logits[i] > max_v) { max_v = logits[i]; best_id = i; }
+            if (!std::isnan(logits[i]) && logits[i] > max_v) { max_v = logits[i]; best_id = i; }
         }
 #endif
     } else {
-        // Even with penalties: NEON max over raw logits, then exact check if top raw token was penalized
+        // Even with penalties: NaN-safe NEON max over raw logits, then exact pass over all possible winners
 #if defined(__ARM_NEON)
-        float32x4_t vm0 = vdupq_n_f32(-1e30f);
-        float32x4_t vm1 = vdupq_n_f32(-1e30f);
-        float32x4_t vm2 = vdupq_n_f32(-1e30f);
-        float32x4_t vm3 = vdupq_n_f32(-1e30f);
+        float32x4_t vm0 = vdupq_n_f32(-std::numeric_limits<float>::infinity());
+        float32x4_t vm1 = vdupq_n_f32(-std::numeric_limits<float>::infinity());
+        float32x4_t vm2 = vdupq_n_f32(-std::numeric_limits<float>::infinity());
+        float32x4_t vm3 = vdupq_n_f32(-std::numeric_limits<float>::infinity());
         int i = 0;
         for (; i + 16 <= vocab_size; i += 16) {
-            vm0 = vmaxq_f32(vm0, vld1q_f32(logits + i));
-            vm1 = vmaxq_f32(vm1, vld1q_f32(logits + i + 4));
-            vm2 = vmaxq_f32(vm2, vld1q_f32(logits + i + 8));
-            vm3 = vmaxq_f32(vm3, vld1q_f32(logits + i + 12));
+            vm0 = vmaxnmq_f32(vm0, vld1q_f32(logits + i));
+            vm1 = vmaxnmq_f32(vm1, vld1q_f32(logits + i + 4));
+            vm2 = vmaxnmq_f32(vm2, vld1q_f32(logits + i + 8));
+            vm3 = vmaxnmq_f32(vm3, vld1q_f32(logits + i + 12));
         }
-        float raw_max = vmaxvq_f32(vmaxq_f32(vmaxq_f32(vm0, vm1), vmaxq_f32(vm2, vm3)));
-        for (; i < vocab_size; ++i) if (logits[i] > raw_max) raw_max = logits[i];
-        // Any token within penalty margin of raw_max could be the adjusted max; collect directly in pass 2!
-        float pen_margin = std::fabs(cfg_.presence_penalty) +
-                           (cfg_.repeat_penalty > 1.0f ? std::fabs(raw_max) * (1.0f - 1.0f / cfg_.repeat_penalty) : 0.0f) + 2.0f;
+        float raw_max = vmaxnmvq_f32(vmaxnmq_f32(vmaxnmq_f32(vm0, vm1), vmaxnmq_f32(vm2, vm3)));
+        for (; i < vocab_size; ++i) {
+            if (!std::isnan(logits[i]) && logits[i] > raw_max) raw_max = logits[i];
+        }
+        cands_.clear();
+        if (!std::isfinite(raw_max)) {
+            // Handle +INFINITY or all-(-INF/NaN) rows safely without inf - inf NaNs
+            if (raw_max > 0.0f) {
+                for (int j = 0; j < vocab_size; ++j) {
+                    if (std::isinf(logits[j]) && logits[j] > 0.0f) {
+                        max_v = std::numeric_limits<float>::infinity();
+                        if (cands_.empty()) best_id = j;
+                        cands_.emplace_back(max_v, j);
+                    }
+                }
+            }
+            if (cands_.empty()) {
+                cands_.emplace_back(0.0f, 0);
+                probs_.assign(1, 1.0f);
+                return 1;
+            }
+            return finalize_candidates(max_v);
+        }
+        // Conservative penalty margin for both positive and negative raw_max (and rp > 1 or 0 < rp < 1)
+        float rp_margin = 0.0f;
+        if (rp > 1.0f) {
+            rp_margin = std::fabs(raw_max) * std::max(1.0f - 1.0f / rp, rp - 1.0f);
+        } else if (rp < 1.0f) {
+            rp_margin = std::fabs(raw_max) * std::max(1.0f / rp - 1.0f, 1.0f - rp);
+        }
+        float pen_margin = std::fabs(cfg_.presence_penalty) + rp_margin + 2.0f;
         float pre_cut = raw_max - std::max(18.5f * std::max(cfg_.temperature, 0.01f), 0.0f) - pen_margin;
         float32x4_t vcut = vdupq_n_f32(pre_cut);
-        cands_.clear();
         i = 0;
         for (; i + 16 <= vocab_size; i += 16) {
             uint32x4_t m0 = vcgeq_f32(vld1q_f32(logits + i), vcut);
@@ -102,7 +143,7 @@ size_t Sampler::build_distribution(const float* logits, int vocab_size) {
             uint32x4_t any = vorrq_u32(vorrq_u32(m0, m1), vorrq_u32(m2, m3));
             if (vmaxvq_u32(any) != 0u) {
                 for (int j = i; j < i + 16; ++j) {
-                    if (logits[j] >= pre_cut) {
+                    if (!std::isnan(logits[j]) && logits[j] >= pre_cut) {
                         float av = adj(logits[j], j);
                         if (av > max_v) { max_v = av; best_id = j; }
                         cands_.emplace_back(av, j);
@@ -111,7 +152,7 @@ size_t Sampler::build_distribution(const float* logits, int vocab_size) {
             }
         }
         for (; i < vocab_size; ++i) {
-            if (logits[i] >= pre_cut) {
+            if (!std::isnan(logits[i]) && logits[i] >= pre_cut) {
                 float av = adj(logits[i], i);
                 if (av > max_v) { max_v = av; best_id = i; }
                 cands_.emplace_back(av, i);
@@ -119,33 +160,55 @@ size_t Sampler::build_distribution(const float* logits, int vocab_size) {
         }
         if (cands_.empty()) {
             for (int j = 0; j < vocab_size; ++j) {
+                if (std::isnan(logits[j])) continue;
                 float av = adj(logits[j], j);
                 if (av > max_v) { max_v = av; best_id = j; }
             }
-            cands_.emplace_back(max_v, best_id);
+            cands_.emplace_back(std::isfinite(max_v) ? max_v : 0.0f, best_id);
         }
         if (cfg_.temperature <= 0.0f) {
             cands_.clear(); probs_.clear();
             cands_.emplace_back(max_v, best_id); probs_.push_back(1.0f);
             return 1;
         }
-        float cutoff = max_v - 18.5f * cfg_.temperature;
-        cands_.erase(std::remove_if(cands_.begin(), cands_.end(),
-                                    [cutoff](const auto& p) { return p.first < cutoff; }),
-                     cands_.end());
-        if (cands_.empty()) cands_.emplace_back(max_v, best_id);
-        goto finalize_cands;
+        if (std::isfinite(max_v)) {
+            float cutoff = max_v - 18.5f * cfg_.temperature;
+            cands_.erase(std::remove_if(cands_.begin(), cands_.end(),
+                                        [cutoff](const auto& p) { return !(p.first >= cutoff); }),
+                         cands_.end());
+        }
+        if (cands_.empty()) cands_.emplace_back(std::isfinite(max_v) ? max_v : 0.0f, best_id);
+        return finalize_candidates(max_v);
 #else
         for (int i = 0; i < vocab_size; ++i) {
+            if (std::isnan(logits[i])) continue;
             float v = adj(logits[i], i);
             if (v > max_v) { max_v = v; best_id = i; }
         }
 #endif
     }
 
+    if (!std::isfinite(max_v)) {
+        cands_.clear();
+        if (max_v > 0.0f) {
+            for (int i = 0; i < vocab_size; ++i) {
+                if (std::isinf(logits[i]) && logits[i] > 0.0f) {
+                    if (cands_.empty()) best_id = i;
+                    cands_.emplace_back(max_v, i);
+                }
+            }
+        }
+        if (cands_.empty()) {
+            cands_.emplace_back(0.0f, 0);
+            probs_.assign(1, 1.0f);
+            return 1;
+        }
+        return finalize_candidates(max_v);
+    }
+
     if (cfg_.temperature <= 0.0f) {
         for (int i = 0; i < vocab_size; ++i) {
-            if (logits[i] >= max_v) { best_id = i; break; }
+            if (!std::isnan(logits[i]) && logits[i] >= max_v) { best_id = i; break; }
         }
         cands_.clear();
         probs_.clear();
@@ -169,15 +232,16 @@ size_t Sampler::build_distribution(const float* logits, int vocab_size) {
             uint32x4_t any = vorrq_u32(vorrq_u32(m0, m1), vorrq_u32(m2, m3));
             if (vmaxvq_u32(any) != 0u) {
                 for (int j = i; j < i + 16; ++j) {
-                    if (logits[j] >= cutoff) cands_.emplace_back(logits[j], j);
+                    if (!std::isnan(logits[j]) && logits[j] >= cutoff) cands_.emplace_back(logits[j], j);
                 }
             }
         }
         for (; i < vocab_size; ++i) {
-            if (logits[i] >= cutoff) cands_.emplace_back(logits[i], i);
+            if (!std::isnan(logits[i]) && logits[i] >= cutoff) cands_.emplace_back(logits[i], i);
         }
 #else
         for (int i = 0; i < vocab_size; ++i) {
+            if (std::isnan(logits[i])) continue;
             float v = adj(logits[i], i);
             if (v >= cutoff) cands_.emplace_back(v, i);
         }
@@ -185,52 +249,23 @@ size_t Sampler::build_distribution(const float* logits, int vocab_size) {
         if (cands_.empty()) cands_.emplace_back(max_v, best_id);
     }
 
-finalize_cands:
-    int k = (cfg_.top_k > 0 && cfg_.top_k < static_cast<int>(cands_.size()))
-        ? cfg_.top_k : static_cast<int>(cands_.size());
-    if (k < static_cast<int>(cands_.size())) {
-        std::nth_element(cands_.begin(), cands_.begin() + k, cands_.end(),
-                         [](const auto& a, const auto& b) { return a.first > b.first; });
-        cands_.resize(static_cast<size_t>(k));
-    }
-    std::sort(cands_.begin(), cands_.end(),
-              [](const auto& a, const auto& b) { return a.first > b.first; });
-
-    float inv_t = 1.0f / cfg_.temperature;
-    probs_.resize(cands_.size());
-    float sum = 0.0f;
-    for (size_t i = 0; i < cands_.size(); ++i) {
-        probs_[i] = std::exp((cands_[i].first - max_v) * inv_t);
-        sum += probs_[i];
-    }
-    float inv_sum = 1.0f / sum;
-    for (float& p : probs_) p *= inv_sum;
-
-    size_t keep = probs_.size();
-    if (cfg_.top_p > 0.0f && cfg_.top_p < 1.0f) {
-        float cum = 0.0f;
-        for (size_t i = 0; i < probs_.size(); ++i) {
-            cum += probs_[i];
-            if (cum >= cfg_.top_p) {
-                keep = i + 1;
-                break;
-            }
-        }
-    }
-
-    float renorm = 0.0f;
-    for (size_t i = 0; i < keep; ++i) renorm += probs_[i];
-    float inv_r = (renorm > 0.0f) ? (1.0f / renorm) : 1.0f;
-    for (size_t i = 0; i < keep; ++i) probs_[i] *= inv_r;
-    return keep;
+    return finalize_candidates(max_v);
 }
 
 int Sampler::sample(const float* logits, int vocab_size) {
+    if (vocab_size <= 0 || logits == nullptr) return 0;
     if (is_greedy()) {
         int best = 0;
-        float best_v = logits[0];
-        for (int i = 1; i < vocab_size; ++i) {
-            if (logits[i] > best_v) { best_v = logits[i]; best = i; }
+        float best_v = -std::numeric_limits<float>::infinity();
+        bool found = false;
+        for (int i = 0; i < vocab_size; ++i) {
+            float v = logits[i];
+            if (std::isnan(v)) continue;
+            if (!found || v > best_v) {
+                best_v = v;
+                best = i;
+                found = true;
+            }
         }
         return best;
     }
@@ -275,7 +310,7 @@ int Sampler::sample_or_accept_draft(const float* logits, int vocab_size, int dra
     }
     if (rem_sum <= 1e-12f) {
         accepted = (draft_idx < keep);
-        return cands_[0].second;
+        return accepted ? draft_tok : cands_[0].second;
     }
     float r = dist(rng_) * rem_sum;
     float acc = 0.0f;
@@ -290,18 +325,23 @@ int Sampler::sample_or_accept_draft(const float* logits, int vocab_size, int dra
 }
 
 float Sampler::compact_margin() const {
+    // Multiplicative repeat_penalty shifts logits proportionally to |raw_max|, which cannot be
+    // bounded by a fixed constant margin without risking truncation of true post-penalty winners.
+    // Return 0.0f to disable GPU logit compaction and use the exact NEON full-logit pass instead!
+    if (cfg_.repeat_penalty != 1.0f) return 0.0f;
     float t = std::max(cfg_.temperature, 0.01f);
     float m = 18.5f * t;
-    if (cfg_.presence_penalty != 0.0f || cfg_.repeat_penalty != 1.0f) {
-        m += std::fabs(cfg_.presence_penalty) + (cfg_.repeat_penalty > 1.0f ? 8.0f : 0.0f) + 2.0f;
+    if (cfg_.presence_penalty != 0.0f) {
+        m += std::fabs(cfg_.presence_penalty) + 2.0f;
     }
     return m;
 }
 
 size_t Sampler::finalize_candidates(float max_v) {
     if (cands_.empty()) {
-        probs_.clear();
-        return 0;
+        cands_.emplace_back(0.0f, 0);
+        probs_.assign(1, 1.0f);
+        return 1;
     }
     if (cfg_.temperature <= 0.0f) {
         auto best_it = std::max_element(cands_.begin(), cands_.end(),
@@ -323,14 +363,30 @@ size_t Sampler::finalize_candidates(float max_v) {
     std::sort(cands_.begin(), cands_.end(),
               [](const auto& a, const auto& b) { return a.first > b.first; });
 
-    float inv_t = 1.0f / cfg_.temperature;
     probs_.resize(cands_.size());
     float sum = 0.0f;
-    for (size_t i = 0; i < cands_.size(); ++i) {
-        probs_[i] = std::exp((cands_[i].first - max_v) * inv_t);
-        sum += probs_[i];
+    if (std::isinf(max_v) && max_v > 0.0f) {
+        for (size_t i = 0; i < cands_.size(); ++i) {
+            probs_[i] = (std::isinf(cands_[i].first) && cands_[i].first > 0.0f) ? 1.0f : 0.0f;
+            sum += probs_[i];
+        }
+    } else if (std::isfinite(max_v)) {
+        float inv_t = 1.0f / cfg_.temperature;
+        for (size_t i = 0; i < cands_.size(); ++i) {
+            float p = std::isfinite(cands_[i].first)
+                ? std::exp((cands_[i].first - max_v) * inv_t)
+                : 0.0f;
+            if (!std::isfinite(p)) p = 0.0f;
+            probs_[i] = p;
+            sum += p;
+        }
     }
-    float inv_sum = (sum > 0.0f) ? (1.0f / sum) : 1.0f;
+    if (!(sum > 0.0f) || !std::isfinite(sum)) {
+        std::fill(probs_.begin(), probs_.end(), 0.0f);
+        probs_[0] = 1.0f;
+        return 1;
+    }
+    float inv_sum = 1.0f / sum;
     for (float& p : probs_) p *= inv_sum;
 
     size_t keep = probs_.size();
@@ -346,37 +402,49 @@ size_t Sampler::finalize_candidates(float max_v) {
     }
     float renorm = 0.0f;
     for (size_t i = 0; i < keep; ++i) renorm += probs_[i];
-    float inv_r = (renorm > 0.0f) ? (1.0f / renorm) : 1.0f;
+    if (!(renorm > 0.0f) || !std::isfinite(renorm)) {
+        probs_[0] = 1.0f;
+        return 1;
+    }
+    float inv_r = 1.0f / renorm;
     for (size_t i = 0; i < keep; ++i) probs_[i] *= inv_r;
     return keep;
 }
 
 size_t Sampler::build_distribution_from_cands(const LogitCand* gpu_cands, uint32_t cand_cnt) {
-    const bool has_pen = (cfg_.presence_penalty != 0.0f || cfg_.repeat_penalty != 1.0f);
+    const float rp = (std::isfinite(cfg_.repeat_penalty) && cfg_.repeat_penalty > 0.0f)
+        ? cfg_.repeat_penalty : 1.0f;
+    const bool has_pen = (cfg_.presence_penalty != 0.0f || rp != 1.0f);
     const int seen_n = static_cast<int>(seen_counts_.size());
     cands_.clear();
     cands_.reserve(cand_cnt);
-    float max_v = -1e30f;
+    float max_v = -std::numeric_limits<float>::infinity();
     for (uint32_t i = 0; i < cand_cnt; ++i) {
         int id = static_cast<int>(gpu_cands[i].id);
         float v = gpu_cands[i].val;
-        if (has_pen && id < seen_n && seen_counts_[id] > 0) {
+        if (std::isnan(v)) continue;
+        if (has_pen && id >= 0 && id < seen_n && seen_counts_[id] > 0) {
             if (cfg_.presence_penalty != 0.0f) v -= cfg_.presence_penalty;
-            if (cfg_.repeat_penalty != 1.0f) {
-                v = (v > 0.0f) ? (v / cfg_.repeat_penalty) : (v * cfg_.repeat_penalty);
+            if (rp != 1.0f) {
+                v = (v > 0.0f) ? (v / rp) : (v * rp);
             }
         }
         if (v > max_v) max_v = v;
         cands_.emplace_back(v, id);
     }
+    if (cands_.empty()) return 0;
     return finalize_candidates(max_v);
 }
 
 int Sampler::sample_from_cands(const LogitCand* gpu_cands, uint32_t cand_cnt, uint32_t max_cands,
                                const float* full_logits, int vocab_size) {
-    size_t keep = (gpu_cands != nullptr && cand_cnt > 0 && cand_cnt <= max_cands)
-        ? build_distribution_from_cands(gpu_cands, cand_cnt)
-        : build_distribution(full_logits, vocab_size);
+    size_t keep = 0;
+    if (cfg_.repeat_penalty == 1.0f && gpu_cands != nullptr && cand_cnt > 0 && cand_cnt <= max_cands) {
+        keep = build_distribution_from_cands(gpu_cands, cand_cnt);
+    }
+    if (keep == 0) {
+        keep = build_distribution(full_logits, vocab_size);
+    }
     if (keep <= 1) return cands_[0].second;
     std::uniform_real_distribution<float> dist(0.0f, 1.0f);
     float r = dist(rng_);
@@ -393,9 +461,13 @@ int Sampler::sample_or_accept_draft_dist(
     const float* full_logits, int vocab_size,
     int draft_tok, const DraftDist* draft_dist, bool& accepted
 ) {
-    size_t keep = (gpu_cands != nullptr && cand_cnt > 0 && cand_cnt <= max_cands)
-        ? build_distribution_from_cands(gpu_cands, cand_cnt)
-        : build_distribution(full_logits, vocab_size);
+    size_t keep = 0;
+    if (cfg_.repeat_penalty == 1.0f && gpu_cands != nullptr && cand_cnt > 0 && cand_cnt <= max_cands) {
+        keep = build_distribution_from_cands(gpu_cands, cand_cnt);
+    }
+    if (keep == 0) {
+        keep = build_distribution(full_logits, vocab_size);
+    }
 
     float p_draft = 0.0f;
     size_t draft_idx = keep;
@@ -442,7 +514,7 @@ int Sampler::sample_or_accept_draft_dist(
     }
     if (rem_sum <= 1e-12f) {
         accepted = (draft_idx < keep);
-        return cands_[0].second;
+        return accepted ? draft_tok : cands_[0].second;
     }
     float r = dist(rng_) * rem_sum;
     float acc = 0.0f;
@@ -463,9 +535,13 @@ int Sampler::verify_tree_node_dist(
     const DraftDist* child0_dist, int& chosen_child
 ) {
     chosen_child = -1;
-    size_t keep = (gpu_cands != nullptr && cand_cnt > 0 && cand_cnt <= max_cands)
-        ? build_distribution_from_cands(gpu_cands, cand_cnt)
-        : build_distribution(full_logits, vocab_size);
+    size_t keep = 0;
+    if (cfg_.repeat_penalty == 1.0f && gpu_cands != nullptr && cand_cnt > 0 && cand_cnt <= max_cands) {
+        keep = build_distribution_from_cands(gpu_cands, cand_cnt);
+    }
+    if (keep == 0) {
+        keep = build_distribution(full_logits, vocab_size);
+    }
 
     if (num_children <= 0) {
         if (keep <= 1) return cands_[0].second;
@@ -515,7 +591,7 @@ int Sampler::verify_tree_node_dist(
     }
     if (rem_sum <= 1e-12f) {
         chosen_child = (idx0 < keep) ? 0 : -1;
-        return cands_[0].second;
+        return (chosen_child == 0) ? c0 : cands_[0].second;
     }
 
     // 2. Test distinct backup children b = 1..num_children-1 against exact normalized residual r(x)!

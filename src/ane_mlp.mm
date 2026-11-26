@@ -34,6 +34,7 @@ bool load_npy_f32(const std::string& path, std::vector<float>& out) {
     if (!ifs || std::memcmp(magic, "\x93NUMPY", 6) != 0) return false;
     uint8_t ver[2];
     ifs.read(reinterpret_cast<char*>(ver), 2);
+    if (!ifs) return false;
     uint32_t hdr_len = 0;
     if (ver[0] == 1) {
         uint16_t l16 = 0;
@@ -42,6 +43,7 @@ bool load_npy_f32(const std::string& path, std::vector<float>& out) {
     } else {
         ifs.read(reinterpret_cast<char*>(&hdr_len), 4);
     }
+    if (!ifs || hdr_len > (1u << 20)) return false;
     std::string hdr(hdr_len, '\0');
     ifs.read(hdr.data(), hdr_len);
     if (!ifs) return false;
@@ -52,7 +54,9 @@ bool load_npy_f32(const std::string& path, std::vector<float>& out) {
 
     auto cur = ifs.tellg();
     ifs.seekg(0, std::ios::end);
-    size_t rem = static_cast<size_t>(ifs.tellg() - cur);
+    auto end = ifs.tellg();
+    if (cur < 0 || end < cur) return false;
+    size_t rem = static_cast<size_t>(end - cur);
     ifs.seekg(cur, std::ios::beg);
 
     if (is_f32) {
@@ -195,6 +199,17 @@ void AneMlpEngine::destroy_iosurface_io(IoSurfaceBinding& b) {
     }
 }
 
+void AneMlpEngine::cleanup_iosurfaces() noexcept {
+    for (int s = 0; s < MAX_SLOTS; ++s) {
+        for (int sub = 0; sub < MAX_SUBS; ++sub) {
+            destroy_iosurface_io(in_io_[s][sub]);
+            for (int k = 0; k < MAX_PIECES; ++k) {
+                destroy_iosurface_io(out_io_[s][sub][k]);
+            }
+        }
+    }
+}
+
 AneMlpEngine::AneMlpEngine(MetalContext& ctx, const std::string& models_dir, int num_layers,
                            int hidden_width, const std::string& tag, bool defer_warmup)
     : ctx_(ctx), num_layers_(num_layers), hidden_width_(hidden_width),
@@ -224,13 +239,18 @@ AneMlpEngine::AneMlpEngine(MetalContext& ctx, const std::string& models_dir, int
     }
 
     // Create zero-copy IOSurface IO slots (2 halves x 2 sub-blocks = 4 input + 4*pieces output)
-    for (int s = 0; s < MAX_SLOTS; ++s) {
-        for (int sub = 0; sub < MAX_SUBS; ++sub) {
-            in_io_[s][sub] = create_iosurface_io(block_rows_, packed_width_);
-            for (int k = 0; k < num_pieces_; ++k) {
-                out_io_[s][sub][k] = create_iosurface_io(block_rows_, hidden_width_);
+    try {
+        for (int s = 0; s < MAX_SLOTS; ++s) {
+            for (int sub = 0; sub < MAX_SUBS; ++sub) {
+                in_io_[s][sub] = create_iosurface_io(block_rows_, packed_width_);
+                for (int k = 0; k < num_pieces_; ++k) {
+                    out_io_[s][sub][k] = create_iosurface_io(block_rows_, hidden_width_);
+                }
             }
         }
+    } catch (...) {
+        cleanup_iosurfaces();
+        throw;
     }
 
     layers_.resize(static_cast<size_t>(num_layers_));
@@ -255,55 +275,79 @@ AneMlpEngine::AneMlpEngine(MetalContext& ctx, const std::string& models_dir, int
                 }
 
                 @autoreleasepool {
-                    LayerData& ld = layers_[L];
+                    try {
+                        LayerData& ld = layers_[L];
 
-                    // Optional inv1 SmoothQuant vector
-                    std::string inv1_path = models_dir + "/pieces_inv1_" + tag_ + "_L" + std::to_string(L) + ".npy";
-                    std::vector<float> inv1_vec;
-                    if (load_npy_f32(inv1_path, inv1_vec) && static_cast<int>(inv1_vec.size()) == hidden_width_) {
-                        bool all_ones = true;
-                        for (float v : inv1_vec) {
-                            if (std::fabs(v - 1.0f) > 1e-5f) { all_ones = false; break; }
-                        }
-                        if (!all_ones) {
-                            id<MTLBuffer> buf = ctx_.alloc_shared(inv1_vec.size() * sizeof(float));
-                            std::memcpy([buf contents], inv1_vec.data(), inv1_vec.size() * sizeof(float));
-                            ld.inv1_buf = buf;
-                        }
-                    }
-
-                    for (int k = 0; k < num_pieces_; ++k) {
-                        std::string path = models_dir + "/L" + std::to_string(L) + "_mlp_p" +
-                                           std::to_string(k) + "_" + tag_ + ".mlmodelc";
-                        NSURL* url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:path.c_str()]];
-                        NSError* err = nil;
-                        MLModel* m = [MLModel modelWithContentsOfURL:url configuration:cfg error:&err];
-                        if (!m) {
-                            std::lock_guard<std::mutex> lk(err_mtx);
-                            if (load_err.empty()) {
-                                load_err = "Failed loading " + path + ": " +
-                                           (err ? [[err localizedDescription] UTF8String] : "unknown error");
+                        // Optional inv1 SmoothQuant vector
+                        std::string inv1_path = models_dir + "/pieces_inv1_" + tag_ + "_L" + std::to_string(L) + ".npy";
+                        std::vector<float> inv1_vec;
+                        if (load_npy_f32(inv1_path, inv1_vec) && static_cast<int>(inv1_vec.size()) == hidden_width_) {
+                            bool all_ones = true;
+                            for (float v : inv1_vec) {
+                                if (std::fabs(v - 1.0f) > 1e-5f) { all_ones = false; break; }
                             }
-                            return;
-                        }
-                        ld.models[k] = m;
-
-                        MLModelDescription* desc = m.modelDescription;
-                        NSString* iname = desc.inputDescriptionsByName.allKeys.firstObject;
-                        NSString* oname = desc.outputDescriptionsByName.allKeys.firstObject;
-
-                        // Pre-bind providers & outputBackings for all (slot, sub) pairs (ZERO runtime allocs!)
-                        for (int s = 0; s < MAX_SLOTS; ++s) {
-                            for (int sub = 0; sub < MAX_SUBS; ++sub) {
-                                MLFeatureValue* fv = [MLFeatureValue featureValueWithMultiArray:(MLMultiArray*)in_io_[s][sub].multi_array];
-                                NSError* perr = nil;
-                                MLDictionaryFeatureProvider* prov =
-                                    [[MLDictionaryFeatureProvider alloc] initWithDictionary:@{iname : fv} error:&perr];
-                                MLPredictionOptions* opts = [[MLPredictionOptions alloc] init];
-                                opts.outputBackings = @{oname : (MLMultiArray*)out_io_[s][sub][k].multi_array};
-                                ld.calls[s][sub].pieces[k] = PieceCall{m, prov, opts};
+                            if (!all_ones) {
+                                id<MTLBuffer> buf = ctx_.alloc_shared(inv1_vec.size() * sizeof(float));
+                                std::memcpy([buf contents], inv1_vec.data(), inv1_vec.size() * sizeof(float));
+                                ld.inv1_buf = buf;
                             }
                         }
+
+                        for (int k = 0; k < num_pieces_; ++k) {
+                            std::string path = models_dir + "/L" + std::to_string(L) + "_mlp_p" +
+                                               std::to_string(k) + "_" + tag_ + ".mlmodelc";
+                            NSURL* url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:path.c_str()]];
+                            NSError* err = nil;
+                            MLModel* m = [MLModel modelWithContentsOfURL:url configuration:cfg error:&err];
+                            if (!m) {
+                                std::lock_guard<std::mutex> lk(err_mtx);
+                                if (load_err.empty()) {
+                                    load_err = "Failed loading " + path + ": " +
+                                               (err ? [[err localizedDescription] UTF8String] : "unknown error");
+                                }
+                                return;
+                            }
+                            ld.models[k] = m;
+
+                            MLModelDescription* desc = m.modelDescription;
+                            NSString* iname = desc.inputDescriptionsByName.allKeys.firstObject;
+                            NSString* oname = desc.outputDescriptionsByName.allKeys.firstObject;
+                            if (!iname || !oname) {
+                                std::lock_guard<std::mutex> lk(err_mtx);
+                                if (load_err.empty()) {
+                                    load_err = "Malformed ANE model (missing input/output description): " + path;
+                                }
+                                return;
+                            }
+
+                            // Pre-bind providers & outputBackings for all (slot, sub) pairs (ZERO runtime allocs!)
+                            for (int s = 0; s < MAX_SLOTS; ++s) {
+                                for (int sub = 0; sub < MAX_SUBS; ++sub) {
+                                    MLFeatureValue* fv = [MLFeatureValue featureValueWithMultiArray:(MLMultiArray*)in_io_[s][sub].multi_array];
+                                    NSError* perr = nil;
+                                    MLDictionaryFeatureProvider* prov = fv
+                                        ? [[MLDictionaryFeatureProvider alloc] initWithDictionary:@{iname : fv} error:&perr]
+                                        : nil;
+                                    if (!fv || !prov) {
+                                        std::lock_guard<std::mutex> lk(err_mtx);
+                                        if (load_err.empty()) {
+                                            load_err = "Failed creating CoreML feature provider for " + path + ": " +
+                                                       (perr ? [[perr localizedDescription] UTF8String] : "nil provider");
+                                        }
+                                        return;
+                                    }
+                                    MLPredictionOptions* opts = [[MLPredictionOptions alloc] init];
+                                    opts.outputBackings = @{oname : (MLMultiArray*)out_io_[s][sub][k].multi_array};
+                                    ld.calls[s][sub].pieces[k] = PieceCall{m, prov, opts};
+                                }
+                            }
+                        }
+                    } catch (const std::exception& e) {
+                        std::lock_guard<std::mutex> lk(err_mtx);
+                        if (load_err.empty()) {
+                            load_err = "Failed loading ANE layer L" + std::to_string(L) + ": " + e.what();
+                        }
+                        return;
                     }
                 }
             }
@@ -316,12 +360,8 @@ AneMlpEngine::AneMlpEngine(MetalContext& ctx, const std::string& models_dir, int
     for (auto& th : threads) th.join();
 
     if (!load_err.empty()) {
-        for (int s = 0; s < MAX_SLOTS; ++s) {
-            for (int sub = 0; sub < MAX_SUBS; ++sub) {
-                destroy_iosurface_io(in_io_[s][sub]);
-                for (int k = 0; k < num_pieces_; ++k) destroy_iosurface_io(out_io_[s][sub][k]);
-            }
-        }
+        layers_.clear();
+        cleanup_iosurfaces();
         throw std::runtime_error(load_err);
     }
 
@@ -329,7 +369,13 @@ AneMlpEngine::AneMlpEngine(MetalContext& ctx, const std::string& models_dir, int
 
     if (!defer_warmup) {
         start_warmup_async();
-        wait_warmup();
+        try {
+            wait_warmup();
+        } catch (...) {
+            layers_.clear();
+            cleanup_iosurfaces();
+            throw;
+        }
     }
 
     auto t1 = std::chrono::steady_clock::now();
@@ -341,19 +387,12 @@ AneMlpEngine::~AneMlpEngine() {
         warmup_thread_.join();
     }
     warmup_started_ = false;
+    drain_all_slots();
     for (int s = 0; s < MAX_SLOTS; ++s) {
-        if (grp_[s] != nil) {
-            dispatch_group_wait((dispatch_group_t)grp_[s], DISPATCH_TIME_FOREVER);
-        }
         grp_[s] = nil;
     }
     layers_.clear();
-    for (int s = 0; s < MAX_SLOTS; ++s) {
-        for (int sub = 0; sub < MAX_SUBS; ++sub) {
-            destroy_iosurface_io(in_io_[s][sub]);
-            for (int k = 0; k < num_pieces_; ++k) destroy_iosurface_io(out_io_[s][sub][k]);
-        }
-    }
+    cleanup_iosurfaces();
 }
 
 void AneMlpEngine::run_warmup_4deep() {
@@ -416,6 +455,7 @@ void AneMlpEngine::wait_warmup() {
     }
     warmup_started_ = false;
     if (!warmup_err_.empty()) {
+        ready_ = false;
         std::string err = std::move(warmup_err_);
         warmup_err_.clear();
         throw std::runtime_error(err);
@@ -497,6 +537,21 @@ void AneMlpEngine::wait_slot(int slot) {
     }
     if (!err.empty()) {
         throw std::runtime_error("ANE MLP prediction failed: " + err);
+    }
+}
+
+void AneMlpEngine::drain_all_slots() noexcept {
+    for (int s = 0; s < MAX_SLOTS; ++s) {
+        if (grp_[s] != nil) {
+            dispatch_group_wait((dispatch_group_t)grp_[s], DISPATCH_TIME_FOREVER);
+        }
+        try {
+            std::lock_guard<std::mutex> lk(err_mtx_);
+            slot_err_[s].clear();
+        } catch (...) {
+        }
+        slot_rem_[s].store(0, std::memory_order_release);
+        slot_done_[s].store(true, std::memory_order_release);
     }
 }
 

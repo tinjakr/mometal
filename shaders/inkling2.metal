@@ -35,6 +35,7 @@ struct InkEmbedParams {
     uint  M;
     uint  D;
     float eps;
+    uint  V;
 };
 
 kernel void inkling_embed_bf16_norm(
@@ -48,7 +49,8 @@ kernel void inkling_embed_bf16_norm(
     uint tg_size                 [[threads_per_threadgroup]]
 ) {
     if (row >= p.M) return;
-    uint tok = uint(ids[row]);
+    uint raw_tok = uint(ids[row]);
+    uint tok = (raw_tok < p.V) ? raw_tok : 0u;
     const device ushort* src = embed_w + (ulong)tok * p.D;
     device float* dst = out + (ulong)row * p.D;
 

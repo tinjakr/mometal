@@ -63,8 +63,8 @@ static void print_usage() {
 static std::unique_ptr<Model> load_model(
     MetalContext& ctx, const std::string& dir, int max_seq, bool exact_nvfp4_act,
     const std::string& mtp_dir, int mtp_depth, bool enable_pld,
-    const std::string& ane_models_dir, const std::string& ane_tag, int kv_bits, int ane_share_layers,
-    int sparse_kv_budget = 0, const std::string& dflash_dir = ""
+    const std::string& ane_models_dir, const std::string& ane_tag, int kv_bits, bool kv_bits_explicit,
+    int ane_share_layers, int sparse_kv_budget = 0, const std::string& dflash_dir = ""
 ) {
     Json cfg = parse_json(read_file_to_string(dir + "/config.json"));
     std::string mtype = cfg["model_type"].as_string();
@@ -73,6 +73,17 @@ static std::unique_ptr<Model> load_model(
         return std::make_unique<Qwen38Model>(ctx, dir, max_seq, mtp_dir, q_depth, enable_pld, ane_models_dir, ane_tag, kv_bits, ane_share_layers, sparse_kv_budget, dflash_dir);
     }
     if (mtype == "inkling2_loop" || mtype == "inkling2_loop_text") {
+        std::vector<std::string> ignored;
+        if (kv_bits_explicit && kv_bits != 16) ignored.push_back("--kv-bits");
+        if (!dflash_dir.empty() && dflash_dir != "off" && dflash_dir != "none") ignored.push_back("--dflash");
+        if (ane_share_layers > 0) ignored.push_back("--ane-share");
+        if (ane_models_dir != "auto" && ane_models_dir != "off" && ane_models_dir != "none") ignored.push_back("--ane-models");
+        if (sparse_kv_budget > 0) ignored.push_back("--sparse-kv-budget");
+        if (!ignored.empty()) {
+            std::fprintf(stderr, "[mometal] Warning: Inkling2 ignores Qwen-only options:");
+            for (const auto& f : ignored) std::fprintf(stderr, " %s", f.c_str());
+            std::fprintf(stderr, "\n");
+        }
         int i_depth = (mtp_depth > 0) ? mtp_depth : 3;
         return std::make_unique<Inkling2Model>(ctx, dir, max_seq, exact_nvfp4_act, mtp_dir, i_depth);
     }
@@ -131,6 +142,7 @@ int main(int argc, char** argv) {
     int max_tokens = 256;
     int max_seq = 8192;
     int kv_bits = 8;
+    bool kv_bits_explicit = false;
     int ane_share_layers = 0;
     int sparse_kv_budget = 0;
     int prompt_tokens_bench = 128;
@@ -154,7 +166,7 @@ int main(int argc, char** argv) {
             else if (a == "--system") system_prompt = next();
             else if (a == "--max-tokens" || a == "-n") max_tokens = std::stoi(next());
             else if (a == "--max-seq") max_seq = std::stoi(next());
-            else if (a == "--kv-bits") kv_bits = std::stoi(next());
+            else if (a == "--kv-bits") { kv_bits = std::stoi(next()); kv_bits_explicit = true; }
             else if (a == "--temp") sc.temperature = std::stof(next());
             else if (a == "--top-k") sc.top_k = std::stoi(next());
             else if (a == "--top-p") sc.top_p = std::stof(next());
@@ -207,6 +219,42 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "Error: --model <dir> is required.\n");
         return 1;
     }
+    if (max_seq <= 0) {
+        std::fprintf(stderr, "Error: --max-seq must be > 0 (got %d).\n", max_seq);
+        return 1;
+    }
+    if (max_tokens < 0) {
+        std::fprintf(stderr, "Error: --max-tokens must be >= 0 (got %d).\n", max_tokens);
+        return 1;
+    }
+    if (kv_bits != 16 && kv_bits != 8 && kv_bits != 4) {
+        std::fprintf(stderr, "Error: --kv-bits must be 16, 8, or 4 (got %d).\n", kv_bits);
+        return 1;
+    }
+    if (port < 1 || port > 65535) {
+        std::fprintf(stderr, "Error: --port must be in 1..65535 (got %d).\n", port);
+        return 1;
+    }
+    if (top_verify <= 0) {
+        std::fprintf(stderr, "Error: --top must be > 0 (got %d).\n", top_verify);
+        return 1;
+    }
+    if (prompt_tokens_bench <= 0 || gen_tokens_bench <= 0) {
+        std::fprintf(stderr, "Error: --prompt-tokens and --gen-tokens must be > 0.\n");
+        return 1;
+    }
+    if (eval_prefix_len <= 0) {
+        std::fprintf(stderr, "Error: --prefix-len must be > 0 (got %d).\n", eval_prefix_len);
+        return 1;
+    }
+    if (ane_workers < 0) {
+        std::fprintf(stderr, "Error: --workers must be >= 0 (got %d).\n", ane_workers);
+        return 1;
+    }
+    if (sparse_kv_budget < 0) {
+        std::fprintf(stderr, "Error: --sparse-kv-budget must be >= 0 (got %d).\n", sparse_kv_budget);
+        return 1;
+    }
 
     if (cmd == "build-ane") {
         @autoreleasepool {
@@ -235,7 +283,7 @@ int main(int argc, char** argv) {
         @autoreleasepool {
             ctx_ptr = std::make_unique<MetalContext>();
             model = load_model(*ctx_ptr, model_dir, max_seq, exact_nvfp4_act, mtp_dir, mtp_depth, enable_pld,
-                               ane_models_dir, ane_tag, kv_bits, ane_share_layers, sparse_kv_budget, dflash_dir);
+                               ane_models_dir, ane_tag, kv_bits, kv_bits_explicit, ane_share_layers, sparse_kv_budget, dflash_dir);
         }
         MetalContext& ctx = *ctx_ptr;
         const ModelInfo& info = model->info();
@@ -260,6 +308,12 @@ int main(int argc, char** argv) {
                 if (ids.empty()) {
                     std::fprintf(stderr, "Error: --tokens 1,2,3 required for verify\n");
                     return 1;
+                }
+                for (int id : ids) {
+                    if (id < 0 || id >= info.vocab_size) {
+                        std::fprintf(stderr, "Error: token ID %d out of range [0, %d)\n", id, info.vocab_size);
+                        return 1;
+                    }
                 }
                 StepStats st{};
                 int gpu_argmax = -1;
@@ -296,6 +350,12 @@ int main(int argc, char** argv) {
                 std::string line;
                 while (std::getline(tf, line)) {
                     auto ids = parse_csv_ints(line);
+                    for (int id : ids) {
+                        if (id < 0 || id >= info.vocab_size) {
+                            throw std::runtime_error("Token ID " + std::to_string(id) +
+                                                     " out of range [0, " + std::to_string(info.vocab_size) + ") in " + tokens_file);
+                        }
+                    }
                     if (static_cast<int>(ids.size()) > eval_prefix_len + 1) passages.push_back(std::move(ids));
                 }
                 constexpr int TOPK = 256;
@@ -359,6 +419,16 @@ int main(int argc, char** argv) {
                         RefEntry r{};
                         if (!ref_in.read(reinterpret_cast<char*>(&r), sizeof(r))) {
                             throw std::runtime_error("Ref file ended early");
+                        }
+                        for (int i = 0; i < 5; ++i) {
+                            if (r.top5[i] < 0 || r.top5[i] >= V) {
+                                throw std::runtime_error("Ref file top5 token ID out of range for model vocab_size");
+                            }
+                        }
+                        for (int i = 0; i < TOPK; ++i) {
+                            if (r.ids[i] < 0 || r.ids[i] >= V) {
+                                throw std::runtime_error("Ref file candidate token ID out of range for model vocab_size");
+                            }
                         }
                         if (argmax_id == r.top5[0]) ++top1_match;
                         for (int i = 0; i < 5; ++i) {
@@ -598,14 +668,15 @@ int main(int argc, char** argv) {
 
         if (cmd == "run") {
             @autoreleasepool {
-                std::string full_prompt = prompt;
+                std::vector<int> ids;
                 if (!raw_prompt) {
                     std::vector<ChatMessage> msgs;
-                    if (!system_prompt.empty()) msgs.push_back(ChatMessage{"system", system_prompt, {}, {}, {}, {}});
-                    msgs.push_back(ChatMessage{"user", prompt, {}, {}, {}, {}});
-                    full_prompt = tok.apply_chat_template(msgs, true, effort);
+                    if (!system_prompt.empty()) msgs.push_back(ChatMessage{"system", system_prompt, {}, {}, {}, {}, {}});
+                    msgs.push_back(ChatMessage{"user", prompt, {}, {}, {}, {}, {}});
+                    ids = tok.encode_chat_template(msgs, true, effort);
+                } else {
+                    ids = tok.encode(prompt, true);
                 }
-                std::vector<int> ids = tok.encode(full_prompt, true);
                 if (ids.empty()) {
                     std::fprintf(stderr, "Empty prompt after tokenization.\n");
                     return 1;
@@ -657,7 +728,7 @@ int main(int argc, char** argv) {
                     return generated < max_tokens;
                 };
 
-                bool keep = emit_tok(next_tok);
+                bool keep = (max_tokens > 0) ? emit_tok(next_tok) : false;
                 std::vector<int> batch;
                 while (keep) {
                     sampler.observe(next_tok);
@@ -703,7 +774,7 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr,
                     "\n[stats] prefill: %zu tok (cached=%d, rest=%.1fms) in %.1f ms (%.1f tok/s) | decode: %d tok in %.1f ms (%.2f tok/s)",
                     ids.size(), start_idx, restore_ms, pf.gpu_ms,
-                    (ids.size() - start_idx) / (pf.gpu_ms / 1000.0),
+                    (pf.gpu_ms > 0.0) ? ((ids.size() - start_idx) / (pf.gpu_ms / 1000.0)) : 0.0,
                     generated, dec_s * 1000.0, (generated > 1 && dec_s > 0.0) ? ((generated - 1) / dec_s) : 0.0);
                 if (mtp_dft > 0) {
                     std::fprintf(stderr, " | mtp: %d/%d (%.1f%%, %.2f tok/rnd, pld=%d)",
@@ -717,7 +788,7 @@ int main(int argc, char** argv) {
 
         if (cmd == "chat") {
             std::vector<ChatMessage> history;
-            if (!system_prompt.empty()) history.push_back(ChatMessage{"system", system_prompt, {}, {}, {}, {}});
+            if (!system_prompt.empty()) history.push_back(ChatMessage{"system", system_prompt, {}, {}, {}, {}, {}});
             std::vector<int> cached_ids;
             PrefixCacheManager disk_cache(cache_dir);
             Sampler sampler(sc);
@@ -730,7 +801,7 @@ int main(int argc, char** argv) {
                 if (line == "/quit" || line == "/exit") break;
                 if (line == "/reset") {
                     history.clear();
-                    if (!system_prompt.empty()) history.push_back(ChatMessage{"system", system_prompt, {}, {}, {}, {}});
+                    if (!system_prompt.empty()) history.push_back(ChatMessage{"system", system_prompt, {}, {}, {}, {}, {}});
                     cached_ids.clear();
                     model->reset();
                     sampler.reset(sc.seed);
@@ -740,12 +811,13 @@ int main(int argc, char** argv) {
                 if (line.empty()) continue;
 
                 @autoreleasepool {
-                    history.push_back(ChatMessage{"user", line, {}, {}, {}, {}});
-                    std::string rendered = tok.apply_chat_template(history, true, effort);
-                    std::vector<int> ids = tok.encode(rendered, true);
+                    history.push_back(ChatMessage{"user", line, {}, {}, {}, {}, {}});
+                    std::vector<int> ids = tok.encode_chat_template(history, true, effort);
 
                     int start_idx = 0;
-                    if (!cached_ids.empty() && ids.size() > cached_ids.size() &&
+                    if (!cached_ids.empty() &&
+                        cached_ids.size() == static_cast<size_t>(model->position()) &&
+                        ids.size() > cached_ids.size() &&
                         std::equal(cached_ids.begin(), cached_ids.end(), ids.begin())) {
                         start_idx = static_cast<int>(cached_ids.size());
                     } else {
@@ -775,48 +847,71 @@ int main(int argc, char** argv) {
                     int mtp_acc = 0, mtp_dft = 0;
                     auto t0 = std::chrono::steady_clock::now();
 
-                    auto emit_chat = [&](int t) -> bool {
+                    auto emit_chat = [&](int t, bool& was_emitted) -> bool {
+                        was_emitted = false;
                         if (is_eos_token(t, info.eos_token_ids)) return false;
                         std::string piece = tok.decode_token(t, true);
                         reply += piece;
                         std::fwrite(piece.data(), 1, piece.size(), stdout);
                         std::fflush(stdout);
                         ++gen;
+                        was_emitted = true;
                         return gen < max_tokens;
                     };
 
-                    bool keep = emit_chat(next_tok);
+                    bool first_emitted = false;
+                    bool keep = (max_tokens > 0) ? emit_chat(next_tok, first_emitted) : false;
                     std::vector<int> batch;
                     while (keep) {
                         sampler.observe(next_tok);
-                        if (model->has_mtp()) {
+                        if (sampler.is_greedy() && model->has_mtp()) {
                             batch.clear();
                             StepStats ms{};
-                            if (sampler.is_greedy()) {
-                                model->forward_mtp_greedy(next_tok, batch, &ms);
-                            } else {
-                                model->forward_mtp_sampled(next_tok, sampler, batch, &ms);
-                            }
+                            model->forward_mtp_greedy(next_tok, batch, &ms);
                             mtp_acc += ms.mtp_accepted;
                             mtp_dft += ms.mtp_drafted;
                             cached_ids.push_back(next_tok);
-                            for (size_t j = 0; j + 1 < batch.size(); ++j) cached_ids.push_back(batch[j]);
                             for (size_t j = 0; j < batch.size(); ++j) {
-                                if (sampler.is_greedy() && j + 1 < batch.size()) sampler.observe(batch[j]);
-                                keep = emit_chat(batch[j]);
+                                if (j + 1 < batch.size()) sampler.observe(batch[j]);
+                                bool emitted_j = false;
+                                keep = emit_chat(batch[j], emitted_j);
+                                if (emitted_j && j + 1 < batch.size()) cached_ids.push_back(batch[j]);
+                                if (!keep) break;
+                            }
+                            next_tok = batch.back();
+                        } else if (!sampler.is_greedy() && model->supports_mtp_sampled()) {
+                            batch.clear();
+                            StepStats ms{};
+                            model->forward_mtp_sampled(next_tok, sampler, batch, &ms);
+                            mtp_acc += ms.mtp_accepted;
+                            mtp_dft += ms.mtp_drafted;
+                            cached_ids.push_back(next_tok);
+                            for (size_t j = 0; j < batch.size(); ++j) {
+                                bool emitted_j = false;
+                                keep = emit_chat(batch[j], emitted_j);
+                                if (emitted_j && j + 1 < batch.size()) cached_ids.push_back(batch[j]);
                                 if (!keep) break;
                             }
                             next_tok = batch.back();
                         } else if (sampler.is_greedy()) {
                             cached_ids.push_back(next_tok);
                             next_tok = model->forward_greedy(next_tok);
-                            keep = emit_chat(next_tok);
+                            bool emitted_n = false;
+                            keep = emit_chat(next_tok, emitted_n);
                         } else {
                             cached_ids.push_back(next_tok);
                             const float* lg = model->forward(&next_tok, 1);
                             next_tok = sampler.sample(lg, info.vocab_size);
-                            keep = emit_chat(next_tok);
+                            bool emitted_n = false;
+                            keep = emit_chat(next_tok, emitted_n);
                         }
+                    }
+                    if (static_cast<int>(cached_ids.size()) != model->position()) {
+                        cached_ids.clear();
+                    }
+                    if (disk_cache.enabled() && cached_ids.size() >= 64 &&
+                        static_cast<int>(cached_ids.size()) == model->position()) {
+                        disk_cache.save(*model, cached_ids);
                     }
                     auto t1 = std::chrono::steady_clock::now();
                     double dt = std::chrono::duration<double>(t1 - t0).count();
@@ -828,7 +923,7 @@ int main(int argc, char** argv) {
                         std::fprintf(stderr, " | mtp %d/%d", mtp_acc, mtp_dft);
                     }
                     std::fprintf(stderr, "]\n");
-                    history.push_back(ChatMessage{"assistant", reply, {}, {}, {}, {}});
+                    history.push_back(ChatMessage{"assistant", reply, {}, {}, {}, {}, {}});
                 }
             }
             return 0;

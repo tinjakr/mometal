@@ -61,6 +61,7 @@ public:
                             const std::vector<uint64_t>& image_hashes) override;
     bool load_state_from_file(const std::string& path, std::vector<int>& out_tokens,
                               std::vector<uint64_t>& out_image_hashes) override;
+    void wait_pending_save() override;
     void keep_warm() override;
     void add_suffix_corpus(const int* tokens, int n_tokens) override;
     void profile_ops() override;

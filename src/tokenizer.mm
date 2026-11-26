@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <climits>
 #include <cstdio>
+#include <cstring>
 #include <stdexcept>
 
 namespace mi {
@@ -117,19 +118,33 @@ void Tokenizer::load(const std::string& model_dir, const std::string& arch) {
         }
     }
 
+    added_to_id_.clear();
+    added_tokens_sorted_.clear();
+    std::memset(added_first_byte_, 0, sizeof(added_first_byte_));
+    special_ids_.clear();
+
     if (doc.contains("added_tokens") && doc["added_tokens"].is_array()) {
         for (const auto& at : doc["added_tokens"].as_array()) {
             int id = static_cast<int>(at["id"].as_int());
             std::string content = at["content"].as_string();
-            special_to_id_[content] = id;
-            special_tokens_sorted_.push_back(content);
-            token_to_id_[content] = id;
+            bool is_sp = at.contains("special") && at["special"].as_bool(false);
+            if (!content.empty()) {
+                if (added_to_id_.find(content) == added_to_id_.end()) {
+                    added_tokens_sorted_.push_back(content);
+                }
+                added_to_id_[content] = id;
+                added_first_byte_[static_cast<unsigned char>(content[0])] = true;
+                token_to_id_[content] = id;
+            }
+            if (is_sp) {
+                special_ids_.insert(id);
+            }
             if (id >= 0 && id < static_cast<int>(id_to_token_.size())) {
                 id_to_token_[id] = content;
             }
         }
     }
-    std::sort(special_tokens_sorted_.begin(), special_tokens_sorted_.end(),
+    std::sort(added_tokens_sorted_.begin(), added_tokens_sorted_.end(),
               [](const std::string& a, const std::string& b) { return a.size() > b.size(); });
 
     // Merges (supports both ["a", "b"] pair arrays and "a b" strings)
@@ -161,7 +176,7 @@ void Tokenizer::load(const std::string& model_dir, const std::string& arch) {
 
 bool Tokenizer::is_special(int id) const {
     if (id < 0 || id >= static_cast<int>(id_to_token_.size())) return false;
-    return special_to_id_.find(id_to_token_[id]) != special_to_id_.end();
+    return special_ids_.find(id) != special_ids_.end();
 }
 
 std::vector<int> Tokenizer::bpe_encode_piece(const std::string& raw_bytes) const {
@@ -213,24 +228,60 @@ std::vector<int> Tokenizer::bpe_encode_piece(const std::string& raw_bytes) const
     return ids;
 }
 
+static std::string nsstring_to_utf8(NSString* s) {
+    if (!s || s.length == 0) return {};
+    NSData* d = [s dataUsingEncoding:NSUTF8StringEncoding];
+    if (!d || d.length == 0) return {};
+    return std::string(static_cast<const char*>(d.bytes), d.length);
+}
+
+// Length of valid RFC 3629 UTF-8 sequence starting at ptr[0], or 0 if invalid.
+static size_t valid_utf8_seq_len(const unsigned char* p, size_t avail) {
+    if (avail == 0) return 0;
+    unsigned char b0 = p[0];
+    if (b0 < 0x80u) return 1;
+    size_t need = 0;
+    unsigned char b1_lo = 0x80u, b1_hi = 0xBFu;
+    if (b0 >= 0xC2u && b0 <= 0xDFu) {
+        need = 2;
+    } else if (b0 == 0xE0u) {
+        need = 3; b1_lo = 0xA0u; b1_hi = 0xBFu;
+    } else if ((b0 >= 0xE1u && b0 <= 0xECu) || (b0 >= 0xEEu && b0 <= 0xEFu)) {
+        need = 3;
+    } else if (b0 == 0xEDu) {
+        need = 3; b1_lo = 0x80u; b1_hi = 0x9Fu;
+    } else if (b0 == 0xF0u) {
+        need = 4; b1_lo = 0x90u; b1_hi = 0xBFu;
+    } else if (b0 >= 0xF1u && b0 <= 0xF3u) {
+        need = 4;
+    } else if (b0 == 0xF4u) {
+        need = 4; b1_lo = 0x80u; b1_hi = 0x8Fu;
+    } else {
+        return 0;
+    }
+    if (avail < need) return 0;
+    for (size_t k = 1; k < need; ++k) {
+        unsigned char bk = p[k];
+        unsigned char lo = (k == 1) ? b1_lo : 0x80u;
+        unsigned char hi = (k == 1) ? b1_hi : 0xBFu;
+        if (bk < lo || bk > hi) return 0;
+    }
+    return need;
+}
+
 void Tokenizer::encode_ordinary(const std::string& text, std::vector<int>& out) const {
     if (text.empty()) return;
-    @autoreleasepool {
-        NSString* ns = [[NSString alloc] initWithBytes:text.data()
-                                                length:text.size()
-                                              encoding:NSUTF8StringEncoding];
-        if (!ns) {
-            auto piece_ids = bpe_encode_piece(text);
-            out.insert(out.end(), piece_ids.begin(), piece_ids.end());
-            return;
-        }
+
+    auto encode_ns = [&](NSString* ns) {
         if (use_nfc_) {
             ns = [ns precomposedStringWithCanonicalMapping];
         }
         if (!regex_handle_) {
-            std::string norm([ns UTF8String]);
-            auto piece_ids = bpe_encode_piece(norm);
-            out.insert(out.end(), piece_ids.begin(), piece_ids.end());
+            std::string norm = nsstring_to_utf8(ns);
+            if (!norm.empty()) {
+                auto piece_ids = bpe_encode_piece(norm);
+                out.insert(out.end(), piece_ids.begin(), piece_ids.end());
+            }
             return;
         }
 
@@ -238,19 +289,80 @@ void Tokenizer::encode_ordinary(const std::string& text, std::vector<int>& out) 
         NSArray<NSTextCheckingResult*>* matches = [re matchesInString:ns
                                                               options:0
                                                                 range:NSMakeRange(0, ns.length)];
+        // Preserve Split(Isolated) unmatched gaps as well as matched pieces, with embedded NUL safety
+        NSUInteger cursor = 0;
         for (NSTextCheckingResult* m in matches) {
-            NSString* sub = [ns substringWithRange:m.range];
-            const char* u8 = [sub UTF8String];
-            if (!u8) continue;
-            auto piece_ids = bpe_encode_piece(std::string(u8));
-            out.insert(out.end(), piece_ids.begin(), piece_ids.end());
+            if (m.range.location > cursor) {
+                std::string gap_u8 = nsstring_to_utf8([ns substringWithRange:NSMakeRange(cursor, m.range.location - cursor)]);
+                if (!gap_u8.empty()) {
+                    auto piece_ids = bpe_encode_piece(gap_u8);
+                    out.insert(out.end(), piece_ids.begin(), piece_ids.end());
+                }
+            }
+            if (m.range.length > 0) {
+                std::string sub_u8 = nsstring_to_utf8([ns substringWithRange:m.range]);
+                if (!sub_u8.empty()) {
+                    auto piece_ids = bpe_encode_piece(sub_u8);
+                    out.insert(out.end(), piece_ids.begin(), piece_ids.end());
+                }
+            }
+            cursor = m.range.location + m.range.length;
+        }
+        if (cursor < ns.length) {
+            std::string tail_u8 = nsstring_to_utf8([ns substringWithRange:NSMakeRange(cursor, ns.length - cursor)]);
+            if (!tail_u8.empty()) {
+                auto piece_ids = bpe_encode_piece(tail_u8);
+                out.insert(out.end(), piece_ids.begin(), piece_ids.end());
+            }
+        }
+    };
+
+    @autoreleasepool {
+        NSString* ns = [[NSString alloc] initWithBytes:text.data()
+                                                length:text.size()
+                                              encoding:NSUTF8StringEncoding];
+        if (ns) {
+            encode_ns(ns);
+            return;
+        }
+
+        // Input contains invalid UTF-8 bytes: split into maximal valid UTF-8 runs (with full NFC+regex)
+        // and invalid raw byte runs (direct ByteLevel BPE) so surrounding valid text is never corrupted.
+        const unsigned char* raw = reinterpret_cast<const unsigned char*>(text.data());
+        size_t i = 0, n = text.size();
+        while (i < n) {
+            size_t run_start = i;
+            while (i < n) {
+                size_t sl = valid_utf8_seq_len(raw + i, n - i);
+                if (sl == 0) break;
+                i += sl;
+            }
+            if (i > run_start) {
+                NSString* sub_ns = [[NSString alloc] initWithBytes:text.data() + run_start
+                                                            length:i - run_start
+                                                          encoding:NSUTF8StringEncoding];
+                if (sub_ns) {
+                    encode_ns(sub_ns);
+                } else {
+                    auto piece_ids = bpe_encode_piece(text.substr(run_start, i - run_start));
+                    out.insert(out.end(), piece_ids.begin(), piece_ids.end());
+                }
+            }
+            size_t bad_start = i;
+            while (i < n && valid_utf8_seq_len(raw + i, n - i) == 0) {
+                ++i;
+            }
+            if (i > bad_start) {
+                auto piece_ids = bpe_encode_piece(text.substr(bad_start, i - bad_start));
+                out.insert(out.end(), piece_ids.begin(), piece_ids.end());
+            }
         }
     }
 }
 
 std::vector<int> Tokenizer::encode(const std::string& text, bool parse_special) const {
     std::vector<int> out;
-    if (!parse_special || special_tokens_sorted_.empty()) {
+    if (!parse_special || added_tokens_sorted_.empty()) {
         encode_ordinary(text, out);
         return out;
     }
@@ -259,14 +371,14 @@ std::vector<int> Tokenizer::encode(const std::string& text, bool parse_special) 
     size_t plain_start = 0;
     while (pos < text.size()) {
         bool matched = false;
-        if (text[pos] == '<') {
-            for (const auto& sp : special_tokens_sorted_) {
+        if (added_first_byte_[static_cast<unsigned char>(text[pos])]) {
+            for (const auto& sp : added_tokens_sorted_) {
                 if (pos + sp.size() <= text.size() &&
                     text.compare(pos, sp.size(), sp) == 0) {
                     if (pos > plain_start) {
                         encode_ordinary(text.substr(plain_start, pos - plain_start), out);
                     }
-                    out.push_back(special_to_id_.at(sp));
+                    out.push_back(added_to_id_.at(sp));
                     pos += sp.size();
                     plain_start = pos;
                     matched = true;
@@ -285,8 +397,12 @@ std::vector<int> Tokenizer::encode(const std::string& text, bool parse_special) 
 std::string Tokenizer::decode_token(int id, bool skip_special) const {
     if (id < 0 || id >= static_cast<int>(id_to_token_.size())) return "";
     const std::string& tok = id_to_token_[id];
-    if (special_to_id_.find(tok) != special_to_id_.end()) {
+    if (special_ids_.find(id) != special_ids_.end()) {
         return skip_special ? "" : tok;
+    }
+    if (added_to_id_.find(tok) != added_to_id_.end()) {
+        // Non-special added token (e.g. <think>, <tool_call>, <|fim_prefix|>): keep verbatim even when skip_special=true
+        return tok;
     }
 
     // Reverse ByteLevel UTF-8 chars back to raw bytes
@@ -324,6 +440,61 @@ static std::string trim_ws(const std::string& s) {
     size_t b = s.size();
     while (b > a && std::isspace(static_cast<unsigned char>(s[b - 1]))) --b;
     return s.substr(a, b - a);
+}
+
+static std::string trim_leading_ws(const std::string& s) {
+    size_t a = 0;
+    while (a < s.size() && std::isspace(static_cast<unsigned char>(s[a]))) ++a;
+    return s.substr(a);
+}
+
+static std::string trim_trailing_ws(const std::string& s) {
+    size_t b = s.size();
+    while (b > 0 && std::isspace(static_cast<unsigned char>(s[b - 1]))) --b;
+    return s.substr(0, b);
+}
+
+static std::vector<ContentPart> trimmed_message_parts(const ChatMessage& m) {
+    if (m.parts.empty()) {
+        std::string t = trim_ws(m.content);
+        if (t.empty()) return {};
+        return {ContentPart{false, std::move(t), 0}};
+    }
+    std::vector<ContentPart> out = m.parts;
+    // Trim leading whitespace up to the first image or non-empty text part
+    for (auto& p : out) {
+        if (p.is_image) break;
+        p.text = trim_leading_ws(p.text);
+        if (!p.text.empty()) break;
+    }
+    // Trim trailing whitespace back to the last image or non-empty text part
+    for (auto it = out.rbegin(); it != out.rend(); ++it) {
+        if (it->is_image) break;
+        it->text = trim_trailing_ws(it->text);
+        if (!it->text.empty()) break;
+    }
+    std::vector<ContentPart> filtered;
+    filtered.reserve(out.size());
+    for (auto& p : out) {
+        if (p.is_image || !p.text.empty()) filtered.push_back(std::move(p));
+    }
+    return filtered;
+}
+
+static std::string flatten_message_parts_str(const ChatMessage& m) {
+    if (m.parts.empty()) return trim_ws(m.content);
+    auto parts = trimmed_message_parts(m);
+    std::string s;
+    for (const auto& p : parts) {
+        if (p.is_image) {
+            s += "<|vision_start|>";
+            for (int k = 0; k < p.image_tokens; ++k) s += "<|image_pad|>";
+            s += "<|vision_end|>";
+        } else {
+            s += p.text;
+        }
+    }
+    return s;
 }
 
 std::string Tokenizer::apply_chat_template(
@@ -384,14 +555,17 @@ std::string Tokenizer::apply_chat_template(
                 if (!m.name.empty()) {
                     hdr += m.name;
                 } else if (!m.tool_call_id.empty()) {
+                    bool found_tc = false;
                     for (const auto& prev : messages) {
                         if (prev.role == "assistant") {
                             for (const auto& tc : prev.tool_calls) {
                                 if (tc.id == m.tool_call_id && !tc.name.empty()) {
                                     hdr += tc.name;
+                                    found_tc = true;
                                     break;
                                 }
                             }
+                            if (found_tc) break;
                         }
                     }
                 }
@@ -402,8 +576,9 @@ std::string Tokenizer::apply_chat_template(
             if (m.role == "assistant" && !m.reasoning_content.empty()) {
                 out += hdr + "<|content_thinking|>" + m.reasoning_content + "<|end_message|>";
             }
-            if (!m.content.empty() || !(m.role == "assistant" && (!m.tool_calls.empty() || !m.reasoning_content.empty()))) {
-                out += hdr + "<|content_text|>" + m.content + "<|end_message|>";
+            std::string content_str = m.parts.empty() ? m.content : flatten_message_parts_str(m);
+            if (!content_str.empty() || !(m.role == "assistant" && (!m.tool_calls.empty() || !m.reasoning_content.empty()))) {
+                out += hdr + "<|content_text|>" + content_str + "<|end_message|>";
             }
             if (m.role == "assistant" && !m.tool_calls.empty()) {
                 for (const auto& tc : m.tool_calls) {
@@ -447,8 +622,19 @@ std::string Tokenizer::apply_chat_template(
         // "medium": thinking enabled with no extra instruction
     }
 
-    bool has_sys0 = (!messages.empty() && messages[0].role == "system");
-    std::string sys0_content = has_sys0 ? trim_ws(messages[0].content) : "";
+    // Merge consecutive leading system/developer messages (e.g. [system, developer, user]) into the opening system block;
+    // preserve any mid-conversation system/developer messages in place instead of dropping them!
+    size_t lead_sys_end = 0;
+    std::string sys_lead;
+    while (lead_sys_end < messages.size() && messages[lead_sys_end].role == "system") {
+        std::string sc = flatten_message_parts_str(messages[lead_sys_end]);
+        if (!sc.empty()) {
+            if (!sys_lead.empty()) sys_lead += "\n\n";
+            sys_lead += sc;
+        }
+        ++lead_sys_end;
+    }
+    bool has_sys0 = (lead_sys_end > 0);
 
     if (!tools_json.empty()) {
         out += "<|im_start|>system\n";
@@ -466,13 +652,13 @@ std::string Tokenizer::apply_chat_template(
                "- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n"
                "- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n"
                "</IMPORTANT>";
-        if (!sys0_content.empty()) out += "\n\n" + sys0_content;
+        if (!sys_lead.empty()) out += "\n\n" + sys_lead;
         out += "<|im_end|>\n";
     } else if (has_sys0) {
-        if (!sys0_content.empty()) {
+        if (!sys_lead.empty()) {
             out += "<|im_start|>system\n";
             if (!reasoning_instr.empty()) out += reasoning_instr + "\n\n";
-            out += sys0_content + "<|im_end|>\n";
+            out += sys_lead + "<|im_end|>\n";
         } else if (!reasoning_instr.empty()) {
             out += "<|im_start|>system\n" + reasoning_instr + "<|im_end|>\n";
         }
@@ -480,11 +666,13 @@ std::string Tokenizer::apply_chat_template(
         out += "<|im_start|>system\n" + reasoning_instr + "<|im_end|>\n";
     }
 
-    for (size_t i = 0; i < messages.size(); ++i) {
+    for (size_t i = lead_sys_end; i < messages.size(); ++i) {
         const auto& m = messages[i];
-        std::string content = trim_ws(m.content);
+        std::string content = flatten_message_parts_str(m);
         if (m.role == "system") {
-            continue; // already emitted at position 0
+            if (!content.empty()) {
+                out += "<|im_start|>system\n" + content + "<|im_end|>\n";
+            }
         } else if (m.role == "user") {
             out += "<|im_start|>user\n" + content + "<|im_end|>\n";
         } else if (m.role == "assistant") {
@@ -504,7 +692,12 @@ std::string Tokenizer::apply_chat_template(
                         try {
                             Json args = parse_json(tc.arguments_json);
                             if (args.is_object()) {
-                                for (const auto& [k, v] : args.as_object()) {
+                                std::vector<std::string> keys;
+                                keys.reserve(args.as_object().size());
+                                for (const auto& [k, _] : args.as_object()) keys.push_back(k);
+                                std::sort(keys.begin(), keys.end());
+                                for (const auto& k : keys) {
+                                    const Json& v = args[k];
                                     out += "<parameter=" + k + ">\n";
                                     out += v.is_string() ? v.as_string() : v.dump();
                                     out += "\n</parameter>\n";
@@ -517,7 +710,7 @@ std::string Tokenizer::apply_chat_template(
             }
             out += "<|im_end|>\n";
         } else if (m.role == "tool") {
-            bool prev_is_tool = (i > 0 && messages[i - 1].role == "tool");
+            bool prev_is_tool = (i > lead_sys_end && messages[i - 1].role == "tool");
             bool next_is_tool = (i + 1 < messages.size() && messages[i + 1].role == "tool");
             if (!prev_is_tool) out += "<|im_start|>user";
             out += "\n<tool_response>\n" + content + "\n</tool_response>";
@@ -533,6 +726,402 @@ std::string Tokenizer::apply_chat_template(
             out += "<think>\n";
         }
     }
+    return out;
+}
+
+std::vector<int> Tokenizer::encode_chat_template(
+    const std::vector<ChatMessage>& messages,
+    bool add_generation_prompt,
+    const std::string& reasoning_effort,
+    const std::vector<std::string>& tools_json,
+    size_t* out_system_prefix_len
+) const {
+    if (out_system_prefix_len) *out_system_prefix_len = 0;
+
+    std::vector<int> out;
+    std::string ord_buf;
+
+    auto flush_ord = [&]() {
+        if (!ord_buf.empty()) {
+            encode_ordinary(ord_buf, out);
+            ord_buf.clear();
+        }
+    };
+    auto push_ord = [&](std::string_view sv) {
+        if (!sv.empty()) ord_buf.append(sv.data(), sv.size());
+    };
+    auto push_added = [&](const std::string& tag) {
+        flush_ord();
+        auto it = added_to_id_.find(tag);
+        if (it != added_to_id_.end()) {
+            out.push_back(it->second);
+        } else {
+            auto ids = encode(tag, true);
+            out.insert(out.end(), ids.begin(), ids.end());
+        }
+    };
+    auto push_image = [&](int n_tokens) {
+        flush_ord();
+        push_added("<|vision_start|>");
+        auto pit = added_to_id_.find("<|image_pad|>");
+        if (pit != added_to_id_.end()) {
+            out.insert(out.end(), static_cast<size_t>(std::max(0, n_tokens)), pit->second);
+        } else {
+            for (int k = 0; k < n_tokens; ++k) push_added("<|image_pad|>");
+        }
+        push_added("<|vision_end|>");
+    };
+    auto push_parts = [&](const std::vector<ContentPart>& parts) {
+        for (const auto& p : parts) {
+            if (p.is_image) push_image(p.image_tokens);
+            else push_ord(p.text);
+        }
+    };
+
+    if (arch_ == "inkling2") {
+        static const std::unordered_map<std::string, std::string> eff_map = {
+            {"none", "0"}, {"off", "0"}, {"minimal", "0.1"}, {"low", "0.2"},
+            {"medium", "0.7"}, {"high", "0.9"}, {"xhigh", "0.99"}, {"max", "0.99"}
+        };
+        std::string eff_val = "0";
+        auto eit = eff_map.find(reasoning_effort);
+        if (eit != eff_map.end()) eff_val = eit->second;
+        else if (!reasoning_effort.empty()) eff_val = reasoning_effort;
+
+        bool has_leading_sys = (!tools_json.empty() || (!messages.empty() && messages[0].role == "system"));
+        bool sys_has_img = false;
+
+        if (!tools_json.empty()) {
+            Json::Array specs;
+            for (const auto& tj : tools_json) {
+                try {
+                    Json t = parse_json(tj);
+                    const Json& fn = t.contains("function") ? t["function"] : t;
+                    Json::Object spec;
+                    spec["description"] = fn.contains("description") && fn["description"].is_string()
+                        ? fn["description"].as_string() : "";
+                    spec["name"] = fn.contains("name") ? fn["name"].as_string() : "";
+                    spec["parameters"] = fn.contains("parameters") ? fn["parameters"] : Json(Json::Object{});
+                    spec["type"] = t.contains("type") && t["type"].is_string() ? t["type"].as_string() : "function";
+                    specs.push_back(Json(std::move(spec)));
+                } catch (...) {}
+            }
+            push_added("<|message_system|>");
+            push_ord("tool_declare");
+            push_added("<|content_xml|>");
+            push_ord(Json(std::move(specs)).dump());
+            push_added("<|end_message|>");
+        }
+
+        auto emit_effort = [&]() {
+            push_added("<|message_system|>");
+            push_added("<|content_text|>");
+            push_ord("Thinking effort level: ");
+            push_ord(eff_val);
+            push_added("<|end_message|>");
+        };
+
+        bool effort_emitted = false;
+        for (size_t idx = 0; idx < messages.size(); ++idx) {
+            const auto& m = messages[idx];
+            if (!effort_emitted && m.role != "system") {
+                emit_effort();
+                effort_emitted = true;
+                if (out_system_prefix_len && has_leading_sys && !sys_has_img) {
+                    flush_ord();
+                    *out_system_prefix_len = out.size();
+                }
+            }
+            const char* role_tok = "<|message_user|>";
+            if (m.role == "system") role_tok = "<|message_system|>";
+            else if (m.role == "assistant") role_tok = "<|message_model|>";
+            else if (m.role == "tool") role_tok = "<|message_tool|>";
+
+            std::string role_suffix;
+            if (m.role == "tool") {
+                if (!m.name.empty()) {
+                    role_suffix = m.name;
+                } else if (!m.tool_call_id.empty()) {
+                    bool found_tc = false;
+                    for (const auto& prev : messages) {
+                        if (prev.role == "assistant") {
+                            for (const auto& tc : prev.tool_calls) {
+                                if (tc.id == m.tool_call_id && !tc.name.empty()) {
+                                    role_suffix = tc.name;
+                                    found_tc = true;
+                                    break;
+                                }
+                            }
+                            if (found_tc) break;
+                        }
+                    }
+                }
+            } else if (m.role == "assistant" && !m.name.empty()) {
+                role_suffix = m.name;
+            }
+
+            if (m.role == "assistant" && !m.reasoning_content.empty()) {
+                push_added(role_tok);
+                push_ord(role_suffix);
+                push_added("<|content_thinking|>");
+                push_ord(m.reasoning_content);
+                push_added("<|end_message|>");
+            }
+
+            bool has_content = !m.parts.empty() || !m.content.empty();
+            if (has_content || !(m.role == "assistant" && (!m.tool_calls.empty() || !m.reasoning_content.empty()))) {
+                push_added(role_tok);
+                push_ord(role_suffix);
+                push_added("<|content_text|>");
+                if (!m.parts.empty()) {
+                    for (const auto& p : m.parts) {
+                        if (p.is_image) {
+                            if (!effort_emitted) sys_has_img = true;
+                            push_image(p.image_tokens);
+                        } else {
+                            push_ord(p.text);
+                        }
+                    }
+                } else {
+                    push_ord(m.content);
+                }
+                push_added("<|end_message|>");
+            }
+
+            if (m.role == "assistant" && !m.tool_calls.empty()) {
+                for (const auto& tc : m.tool_calls) {
+                    Json::Object invoke;
+                    invoke["name"] = tc.name;
+                    try {
+                        invoke["args"] = tc.arguments_json.empty() ? Json(Json::Object{}) : parse_json(tc.arguments_json);
+                    } catch (...) {
+                        invoke["args"] = Json(Json::Object{});
+                    }
+                    push_added("<|message_model|>");
+                    push_ord(tc.name);
+                    push_added("<|content_invoke_tool_json|>");
+                    push_ord(Json(std::move(invoke)).dump());
+                    push_added("<|end_message|>");
+                }
+            }
+            if (m.role == "assistant") {
+                push_added("<|content_model_end_sampling|>");
+            }
+        }
+        if (!effort_emitted) {
+            emit_effort();
+            if (out_system_prefix_len && has_leading_sys && !sys_has_img) {
+                flush_ord();
+                *out_system_prefix_len = out.size();
+            }
+        }
+        if (add_generation_prompt) {
+            push_added("<|message_model|>");
+            push_added(eff_val == "0" ? "<|content_text|>" : "<|content_thinking|>");
+        }
+        flush_ord();
+        return out;
+    }
+
+    // Qwen 3.5 / 3.8 ChatML piecewise tokenization
+    bool enable_thinking = !(reasoning_effort == "none" || reasoning_effort == "off");
+    std::string reasoning_instr;
+    if (enable_thinking) {
+        if (reasoning_effort == "xhigh" || reasoning_effort == "high" || reasoning_effort == "max" || reasoning_effort.empty()) {
+            reasoning_instr = "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.";
+        } else if (reasoning_effort == "low" || reasoning_effort == "minimal") {
+            reasoning_instr = "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.";
+        }
+    }
+
+    size_t lead_sys_end = 0;
+    std::vector<ContentPart> sys_lead_parts;
+    bool sys_has_img = false;
+    while (lead_sys_end < messages.size() && messages[lead_sys_end].role == "system") {
+        auto mp = trimmed_message_parts(messages[lead_sys_end]);
+        if (!mp.empty()) {
+            if (!sys_lead_parts.empty()) sys_lead_parts.push_back(ContentPart{false, "\n\n", 0});
+            for (auto& p : mp) {
+                if (p.is_image) sys_has_img = true;
+                sys_lead_parts.push_back(std::move(p));
+            }
+        }
+        ++lead_sys_end;
+    }
+    bool has_sys0 = (lead_sys_end > 0);
+    bool emitted_lead_sys = false;
+
+    if (!tools_json.empty()) {
+        emitted_lead_sys = true;
+        push_added("<|im_start|>");
+        push_ord("system\n");
+        if (!reasoning_instr.empty()) {
+            push_ord(reasoning_instr);
+            push_ord("\n\n");
+        }
+        push_ord("# Tools\n\nYou have access to the following functions:\n\n<tools>");
+        for (const auto& tj : tools_json) {
+            push_ord("\n");
+            push_ord(tj);
+        }
+        push_ord("\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n");
+        push_added("<tool_call>");
+        push_ord("\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n"
+                 "<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n"
+                 "</parameter>\n</function>\n");
+        push_added("</tool_call>");
+        push_ord("\n\n<IMPORTANT>\nReminder:\n"
+                 "- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within ");
+        push_added("<tool_call>");
+        push_added("</tool_call>");
+        push_ord(" XML tags\n"
+                 "- Required parameters MUST be specified\n"
+                 "- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n"
+                 "- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n"
+                 "</IMPORTANT>");
+        if (!sys_lead_parts.empty()) {
+            push_ord("\n\n");
+            push_parts(sys_lead_parts);
+        }
+        push_added("<|im_end|>");
+        push_ord("\n");
+    } else if (has_sys0) {
+        if (!sys_lead_parts.empty()) {
+            emitted_lead_sys = true;
+            push_added("<|im_start|>");
+            push_ord("system\n");
+            if (!reasoning_instr.empty()) {
+                push_ord(reasoning_instr);
+                push_ord("\n\n");
+            }
+            push_parts(sys_lead_parts);
+            push_added("<|im_end|>");
+            push_ord("\n");
+        } else if (!reasoning_instr.empty()) {
+            emitted_lead_sys = true;
+            push_added("<|im_start|>");
+            push_ord("system\n");
+            push_ord(reasoning_instr);
+            push_added("<|im_end|>");
+            push_ord("\n");
+        }
+    } else if (!reasoning_instr.empty()) {
+        emitted_lead_sys = true;
+        push_added("<|im_start|>");
+        push_ord("system\n");
+        push_ord(reasoning_instr);
+        push_added("<|im_end|>");
+        push_ord("\n");
+    }
+
+    if (out_system_prefix_len && emitted_lead_sys && !sys_has_img) {
+        flush_ord();
+        *out_system_prefix_len = out.size();
+    }
+
+    for (size_t i = lead_sys_end; i < messages.size(); ++i) {
+        const auto& m = messages[i];
+        auto parts = trimmed_message_parts(m);
+        if (m.role == "system") {
+            if (!parts.empty()) {
+                push_added("<|im_start|>");
+                push_ord("system\n");
+                push_parts(parts);
+                push_added("<|im_end|>");
+                push_ord("\n");
+            }
+        } else if (m.role == "user") {
+            push_added("<|im_start|>");
+            push_ord("user\n");
+            push_parts(parts);
+            push_added("<|im_end|>");
+            push_ord("\n");
+        } else if (m.role == "assistant") {
+            std::string rc = trim_ws(m.reasoning_content);
+            push_added("<|im_start|>");
+            push_ord("assistant\n");
+            push_added("<think>");
+            if (rc.empty()) {
+                push_ord("\n\n");
+            } else {
+                push_ord("\n");
+                push_ord(rc);
+                push_ord("\n");
+            }
+            push_added("</think>");
+            push_ord("\n\n");
+            push_parts(parts);
+            if (!m.tool_calls.empty()) {
+                for (size_t j = 0; j < m.tool_calls.size(); ++j) {
+                    const auto& tc = m.tool_calls[j];
+                    if (j == 0) {
+                        if (!parts.empty()) push_ord("\n\n");
+                    } else {
+                        push_ord("\n");
+                    }
+                    push_added("<tool_call>");
+                    push_ord("\n<function=");
+                    push_ord(tc.name);
+                    push_ord(">\n");
+                    if (!tc.arguments_json.empty()) {
+                        try {
+                            Json args = parse_json(tc.arguments_json);
+                            if (args.is_object()) {
+                                std::vector<std::string> keys;
+                                keys.reserve(args.as_object().size());
+                                for (const auto& [k, _] : args.as_object()) keys.push_back(k);
+                                std::sort(keys.begin(), keys.end());
+                                for (const auto& k : keys) {
+                                    const Json& v = args[k];
+                                    push_ord("<parameter=");
+                                    push_ord(k);
+                                    push_ord(">\n");
+                                    push_ord(v.is_string() ? v.as_string() : v.dump());
+                                    push_ord("\n</parameter>\n");
+                                }
+                            }
+                        } catch (...) {}
+                    }
+                    push_ord("</function>\n");
+                    push_added("</tool_call>");
+                }
+            }
+            push_added("<|im_end|>");
+            push_ord("\n");
+        } else if (m.role == "tool") {
+            bool prev_is_tool = (i > lead_sys_end && messages[i - 1].role == "tool");
+            bool next_is_tool = (i + 1 < messages.size() && messages[i + 1].role == "tool");
+            if (!prev_is_tool) {
+                push_added("<|im_start|>");
+                push_ord("user");
+            }
+            push_ord("\n");
+            push_added("<tool_response>");
+            push_ord("\n");
+            push_parts(parts);
+            push_ord("\n");
+            push_added("</tool_response>");
+            if (!next_is_tool) {
+                push_added("<|im_end|>");
+                push_ord("\n");
+            }
+        }
+    }
+
+    if (add_generation_prompt) {
+        push_added("<|im_start|>");
+        push_ord("assistant\n");
+        push_added("<think>");
+        if (!enable_thinking) {
+            push_ord("\n\n");
+            push_added("</think>");
+            push_ord("\n\n");
+        } else {
+            push_ord("\n");
+        }
+    }
+
+    flush_ord();
     return out;
 }
 

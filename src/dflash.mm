@@ -12,6 +12,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <filesystem>
+#include <limits>
 #include <random>
 #include <stdexcept>
 #include <sys/mman.h>
@@ -65,6 +66,32 @@ inline float f16_bits_to_f32(uint16_t bits) {
     return static_cast<float>(h);
 }
 
+inline uint16_t load_u16_unaligned(const uint8_t* p) {
+    uint16_t v = 0;
+    std::memcpy(&v, p, sizeof(v));
+    return v;
+}
+
+inline float load_f32_unaligned(const uint8_t* p) {
+    float v = 0.0f;
+    std::memcpy(&v, p, sizeof(v));
+    return v;
+}
+
+#if defined(__aarch64__) || defined(__ARM_NEON)
+inline uint16x4_t load_u16x4_unaligned(const uint8_t* p) {
+    uint16_t tmp[4];
+    std::memcpy(tmp, p, sizeof(tmp));
+    return vld1_u16(tmp);
+}
+
+inline float32x4_t load_f32x4_unaligned(const uint8_t* p) {
+    float tmp[4];
+    std::memcpy(tmp, p, sizeof(tmp));
+    return vld1q_f32(tmp);
+}
+#endif
+
 struct RawTensorMeta {
     DType dtype = DType::UNKNOWN;
     std::vector<int64_t> shape;
@@ -74,7 +101,7 @@ struct RawTensorMeta {
 
 // Fast ARM64 NEON quantization of one BF16 row [K] -> MLX Q4_AFFINE_G64 (w [K/8] u32, s [K/64] bf16, b [K/64] bf16).
 // Quantizes against exact rounded BF16 scale & bias so dequantization matches common.metal bit-for-bit!
-void quantize_bf16_row_q4_g64(const uint16_t* src_bf16, uint32_t K,
+void quantize_bf16_row_q4_g64(const uint8_t* src_bf16_bytes, uint32_t K,
                               uint32_t* dst_w, uint16_t* dst_s, uint16_t* dst_b) {
     const uint32_t num_groups = K >> 6; // K / 64
 #if defined(__aarch64__) || defined(__ARM_NEON)
@@ -84,13 +111,13 @@ void quantize_bf16_row_q4_g64(const uint16_t* src_bf16, uint32_t K,
     const int32x4_t sh_hi   = {16, 20, 24, 28};
 
     for (uint32_t g = 0; g < num_groups; ++g) {
-        const uint16_t* gs = src_bf16 + (static_cast<size_t>(g) << 6);
+        const uint8_t* gs = src_bf16_bytes + (static_cast<size_t>(g) << 7);
         float32x4_t v[16];
-        v[0] = vreinterpretq_f32_u32(vshll_n_u16(vld1_u16(gs + 0), 16));
+        v[0] = vreinterpretq_f32_u32(vshll_n_u16(load_u16x4_unaligned(gs + 0), 16));
         float32x4_t vmin = v[0];
         float32x4_t vmax = v[0];
         for (int i = 1; i < 16; ++i) {
-            v[i] = vreinterpretq_f32_u32(vshll_n_u16(vld1_u16(gs + i * 4), 16));
+            v[i] = vreinterpretq_f32_u32(vshll_n_u16(load_u16x4_unaligned(gs + static_cast<size_t>(i) * 8u), 16));
             vmin = vminq_f32(vmin, v[i]);
             vmax = vmaxq_f32(vmax, v[i]);
         }
@@ -125,12 +152,12 @@ void quantize_bf16_row_q4_g64(const uint16_t* src_bf16, uint32_t K,
     }
 #else
     for (uint32_t g = 0; g < num_groups; ++g) {
-        const uint16_t* gs = src_bf16 + (static_cast<size_t>(g) << 6);
+        const uint8_t* gs = src_bf16_bytes + (static_cast<size_t>(g) << 7);
         float vals[64];
-        float w_min = bf16_bits_to_f32(gs[0]);
+        float w_min = bf16_bits_to_f32(load_u16_unaligned(gs));
         float w_max = w_min;
         for (int i = 0; i < 64; ++i) {
-            float x = bf16_bits_to_f32(gs[i]);
+            float x = bf16_bits_to_f32(load_u16_unaligned(gs + static_cast<size_t>(i) * 2u));
             vals[i] = x;
             if (x < w_min) w_min = x;
             if (x > w_max) w_max = x;
@@ -164,7 +191,7 @@ void quantize_bf16_row_q4_g64(const uint16_t* src_bf16, uint32_t K,
 void quantize_generic_row_q4_g64(const uint8_t* src_row, DType dtype, uint32_t K,
                                  uint32_t* dst_w, uint16_t* dst_s, uint16_t* dst_b) {
     if (dtype == DType::BF16) {
-        quantize_bf16_row_q4_g64(reinterpret_cast<const uint16_t*>(src_row), K, dst_w, dst_s, dst_b);
+        quantize_bf16_row_q4_g64(src_row, K, dst_w, dst_s, dst_b);
         return;
     }
     const uint32_t num_groups = K >> 6;
@@ -175,11 +202,9 @@ void quantize_generic_row_q4_g64(const uint8_t* src_row, DType dtype, uint32_t K
         for (int i = 0; i < 64; ++i) {
             float x = 0.0f;
             if (dtype == DType::F16) {
-                uint16_t bits;
-                std::memcpy(&bits, src_row + (base + i) * 2u, 2);
-                x = f16_bits_to_f32(bits);
+                x = f16_bits_to_f32(load_u16_unaligned(src_row + (base + i) * 2u));
             } else {
-                std::memcpy(&x, src_row + (base + i) * 4u, 4);
+                x = load_f32_unaligned(src_row + (base + i) * 4u);
             }
             vals[i] = x;
             if (x < w_min) w_min = x;
@@ -215,31 +240,29 @@ void convert_tensor_to_f16(const uint8_t* src, DType dtype, size_t numel, uint16
         return;
     }
     if (dtype == DType::BF16) {
-        const uint16_t* s = reinterpret_cast<const uint16_t*>(src);
         size_t i = 0;
 #if defined(__aarch64__) || defined(__ARM_NEON)
         __fp16* d = reinterpret_cast<__fp16*>(dst_f16);
         for (; i + 4 <= numel; i += 4) {
-            float32x4_t fv = vreinterpretq_f32_u32(vshll_n_u16(vld1_u16(s + i), 16));
+            float32x4_t fv = vreinterpretq_f32_u32(vshll_n_u16(load_u16x4_unaligned(src + i * 2u), 16));
             vst1_f16(d + i, vcvt_f16_f32(fv));
         }
 #endif
         for (; i < numel; ++i) {
-            dst_f16[i] = f32_to_f16_bits(bf16_bits_to_f32(s[i]));
+            dst_f16[i] = f32_to_f16_bits(bf16_bits_to_f32(load_u16_unaligned(src + i * 2u)));
         }
         return;
     }
     if (dtype == DType::F32) {
-        const float* s = reinterpret_cast<const float*>(src);
         size_t i = 0;
 #if defined(__aarch64__) || defined(__ARM_NEON)
         __fp16* d = reinterpret_cast<__fp16*>(dst_f16);
         for (; i + 4 <= numel; i += 4) {
-            vst1_f16(d + i, vcvt_f16_f32(vld1q_f32(s + i)));
+            vst1_f16(d + i, vcvt_f16_f32(load_f32x4_unaligned(src + i * 4u)));
         }
 #endif
         for (; i < numel; ++i) {
-            dst_f16[i] = f32_to_f16_bits(s[i]);
+            dst_f16[i] = f32_to_f16_bits(load_f32_unaligned(src + i * 4u));
         }
         return;
     }
@@ -249,8 +272,8 @@ void convert_tensor_to_f16(const uint8_t* src, DType dtype, size_t numel, uint16
 // Fast ARM64 NEON CandidateSelector helper (shared by FP16/FP32 sel_h and greedy/sampled paths)
 void run_candidate_selector(
     const DFlashConfig& cfg,
-    const uint16_t* pred_cb_bf16,
-    const uint16_t* succ_cb_bf16,
+    const uint8_t* pred_cb_bytes,
+    const uint8_t* succ_cb_bytes,
     int anchor_token,
     const LogitCand* topk_cands,
     const uint16_t* sel_h_f16,
@@ -265,7 +288,7 @@ void run_candidate_selector(
     const int K = cfg.selector_top_k;
     const int R = cfg.selector_rank;
     const uint32_t V = static_cast<uint32_t>(cfg.vocab_size);
-    if (n_pos <= 0 || K <= 0 || R <= 0) return;
+    if (n_pos <= 0 || K <= 0 || R <= 0 || !pred_cb_bytes || !succ_cb_bytes) return;
 
     alignas(16) float v_stack[512];
     std::vector<float> v_heap;
@@ -278,6 +301,7 @@ void run_candidate_selector(
     float scores[256];
     float probs[256];
     const int K_clamped = std::min(K, 256);
+    const size_t row_bytes = static_cast<size_t>(R) * sizeof(uint16_t);
 
     std::mt19937_64 rng(seed);
     std::uniform_real_distribution<float> udist(0.0f, 1.0f);
@@ -286,7 +310,7 @@ void run_candidate_selector(
     for (int p = 0; p < n_pos; ++p) {
         const uint32_t pred_u = (pred >= 0 && static_cast<uint32_t>(pred) < V)
             ? static_cast<uint32_t>(pred) : 0u;
-        const uint16_t* pred_row = pred_cb_bf16 + static_cast<size_t>(pred_u) * static_cast<size_t>(R);
+        const uint8_t* pred_row = pred_cb_bytes + static_cast<size_t>(pred_u) * row_bytes;
 
         // 1. v[r] = pred_cb[pred, r] * sel_h[p, r]
         int r = 0;
@@ -294,8 +318,8 @@ void run_candidate_selector(
         if (sel_h_f16 != nullptr) {
             const __fp16* sh = reinterpret_cast<const __fp16*>(sel_h_f16 + static_cast<size_t>(p) * static_cast<size_t>(R));
             for (; r + 8 <= R; r += 8) {
-                float32x4_t p0 = vreinterpretq_f32_u32(vshll_n_u16(vld1_u16(pred_row + r + 0), 16));
-                float32x4_t p1 = vreinterpretq_f32_u32(vshll_n_u16(vld1_u16(pred_row + r + 4), 16));
+                float32x4_t p0 = vreinterpretq_f32_u32(vshll_n_u16(load_u16x4_unaligned(pred_row + static_cast<size_t>(r + 0) * 2u), 16));
+                float32x4_t p1 = vreinterpretq_f32_u32(vshll_n_u16(load_u16x4_unaligned(pred_row + static_cast<size_t>(r + 4) * 2u), 16));
                 float32x4_t h0 = vcvt_f32_f16(vld1_f16(sh + r + 0));
                 float32x4_t h1 = vcvt_f32_f16(vld1_f16(sh + r + 4));
                 vst1q_f32(v_buf + r + 0, vmulq_f32(p0, h0));
@@ -304,8 +328,8 @@ void run_candidate_selector(
         } else {
             const float* sh = sel_h_f32 + static_cast<size_t>(p) * static_cast<size_t>(R);
             for (; r + 8 <= R; r += 8) {
-                float32x4_t p0 = vreinterpretq_f32_u32(vshll_n_u16(vld1_u16(pred_row + r + 0), 16));
-                float32x4_t p1 = vreinterpretq_f32_u32(vshll_n_u16(vld1_u16(pred_row + r + 4), 16));
+                float32x4_t p0 = vreinterpretq_f32_u32(vshll_n_u16(load_u16x4_unaligned(pred_row + static_cast<size_t>(r + 0) * 2u), 16));
+                float32x4_t p1 = vreinterpretq_f32_u32(vshll_n_u16(load_u16x4_unaligned(pred_row + static_cast<size_t>(r + 4) * 2u), 16));
                 vst1q_f32(v_buf + r + 0, vmulq_f32(p0, vld1q_f32(sh + r + 0)));
                 vst1q_f32(v_buf + r + 4, vmulq_f32(p1, vld1q_f32(sh + r + 4)));
             }
@@ -315,18 +339,17 @@ void run_candidate_selector(
             float sh_val = (sel_h_f16 != nullptr)
                 ? f16_bits_to_f32(sel_h_f16[static_cast<size_t>(p) * static_cast<size_t>(R) + r])
                 : sel_h_f32[static_cast<size_t>(p) * static_cast<size_t>(R) + r];
-            v_buf[r] = bf16_bits_to_f32(pred_row[r]) * sh_val;
+            v_buf[r] = bf16_bits_to_f32(load_u16_unaligned(pred_row + static_cast<size_t>(r) * 2u)) * sh_val;
         }
 
         // 2. score[k] = unary[p][k] + dot(v, succ_cb[cand[p][k]])
         const LogitCand* row_cands = topk_cands + static_cast<size_t>(p) * static_cast<size_t>(K);
         for (int k = 0; k < K_clamped; ++k) {
             const uint32_t cid = (row_cands[k].id < V) ? row_cands[k].id : 0u;
-            const uint16_t* succ_row = succ_cb_bf16 + static_cast<size_t>(cid) * static_cast<size_t>(R);
+            const uint8_t* succ_row = succ_cb_bytes + static_cast<size_t>(cid) * row_bytes;
             if (k + 1 < K_clamped) {
                 const uint32_t next_cid = (row_cands[k + 1].id < V) ? row_cands[k + 1].id : 0u;
-                const char* pf = reinterpret_cast<const char*>(succ_cb_bf16 + static_cast<size_t>(next_cid) * static_cast<size_t>(R));
-                const size_t row_bytes = static_cast<size_t>(R) * sizeof(uint16_t);
+                const char* pf = reinterpret_cast<const char*>(succ_cb_bytes + static_cast<size_t>(next_cid) * row_bytes);
                 for (size_t off = 0; off < row_bytes; off += 128u) {
                     __builtin_prefetch(pf + off, 0, 1);
                 }
@@ -339,10 +362,10 @@ void run_candidate_selector(
             float32x4_t acc2 = vdupq_n_f32(0.0f);
             float32x4_t acc3 = vdupq_n_f32(0.0f);
             for (; j + 16 <= R; j += 16) {
-                float32x4_t s0 = vreinterpretq_f32_u32(vshll_n_u16(vld1_u16(succ_row + j + 0), 16));
-                float32x4_t s1 = vreinterpretq_f32_u32(vshll_n_u16(vld1_u16(succ_row + j + 4), 16));
-                float32x4_t s2 = vreinterpretq_f32_u32(vshll_n_u16(vld1_u16(succ_row + j + 8), 16));
-                float32x4_t s3 = vreinterpretq_f32_u32(vshll_n_u16(vld1_u16(succ_row + j + 12), 16));
+                float32x4_t s0 = vreinterpretq_f32_u32(vshll_n_u16(load_u16x4_unaligned(succ_row + static_cast<size_t>(j + 0) * 2u), 16));
+                float32x4_t s1 = vreinterpretq_f32_u32(vshll_n_u16(load_u16x4_unaligned(succ_row + static_cast<size_t>(j + 4) * 2u), 16));
+                float32x4_t s2 = vreinterpretq_f32_u32(vshll_n_u16(load_u16x4_unaligned(succ_row + static_cast<size_t>(j + 8) * 2u), 16));
+                float32x4_t s3 = vreinterpretq_f32_u32(vshll_n_u16(load_u16x4_unaligned(succ_row + static_cast<size_t>(j + 12) * 2u), 16));
                 acc0 = vfmaq_f32(acc0, vld1q_f32(v_buf + j + 0),  s0);
                 acc1 = vfmaq_f32(acc1, vld1q_f32(v_buf + j + 4),  s1);
                 acc2 = vfmaq_f32(acc2, vld1q_f32(v_buf + j + 8),  s2);
@@ -351,18 +374,22 @@ void run_candidate_selector(
             dot = vaddvq_f32(vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3)));
 #endif
             for (; j < R; ++j) {
-                dot += v_buf[j] * bf16_bits_to_f32(succ_row[j]);
+                dot += v_buf[j] * bf16_bits_to_f32(load_u16_unaligned(succ_row + static_cast<size_t>(j) * 2u));
             }
             scores[k] = row_cands[k].val + dot;
         }
 
-        // 3. Select greedy or sampled token & optionally populate exact DraftDist q(x)
+        // 3. NaN/Inf-safe selection of greedy or sampled token & optional exact DraftDist q(x)
         int best = 0;
-        float max_s = scores[0];
-        for (int k = 1; k < K_clamped; ++k) {
-            if (scores[k] > max_s) {
-                max_s = scores[k];
+        float max_s = -std::numeric_limits<float>::infinity();
+        bool has_valid = false;
+        for (int k = 0; k < K_clamped; ++k) {
+            float sc = scores[k];
+            if (!std::isfinite(sc)) continue;
+            if (!has_valid || sc > max_s) {
+                max_s = sc;
                 best = k;
+                has_valid = true;
             }
         }
 
@@ -384,15 +411,24 @@ void run_candidate_selector(
         } else {
             const float inv_t = 1.0f / std::max(temperature, 1e-4f);
             float sum_q = 0.0f;
-            for (int k = 0; k < K_clamped; ++k) {
-                probs[k] = std::exp((scores[k] - max_s) * inv_t);
-                sum_q += probs[k];
+            if (has_valid) {
+                for (int k = 0; k < K_clamped; ++k) {
+                    float w = std::isfinite(scores[k]) ? std::exp((scores[k] - max_s) * inv_t) : 0.0f;
+                    if (!std::isfinite(w)) w = 0.0f;
+                    probs[k] = w;
+                    sum_q += w;
+                }
             }
-            const float inv_sum = (sum_q > 0.0f) ? (1.0f / sum_q) : 1.0f;
             float max_q = 0.0f;
-            for (int k = 0; k < K_clamped; ++k) {
-                probs[k] *= inv_sum;
-                if (probs[k] > max_q) max_q = probs[k];
+            if (!(sum_q > 0.0f) || !std::isfinite(sum_q)) {
+                for (int k = 0; k < K_clamped; ++k) probs[k] = (k == best) ? 1.0f : 0.0f;
+                max_q = 1.0f;
+            } else {
+                const float inv_sum = 1.0f / sum_q;
+                for (int k = 0; k < K_clamped; ++k) {
+                    probs[k] *= inv_sum;
+                    if (probs[k] > max_q) max_q = probs[k];
+                }
             }
 
             const float u = udist(rng);
@@ -422,6 +458,15 @@ void run_candidate_selector(
             }
         }
     }
+}
+
+uint64_t fnv1a_update(uint64_t h, const void* data, size_t n) {
+    const uint8_t* p = reinterpret_cast<const uint8_t*>(data);
+    for (size_t i = 0; i < n; ++i) {
+        h ^= static_cast<uint64_t>(p[i]);
+        h *= 1099511628211ull;
+    }
+    return h;
 }
 
 } // namespace
@@ -469,14 +514,26 @@ DFlashEngine::DFlashEngine(MetalContext& ctx, const std::string& dflash_dir) {
             cfg_.target_layer_ids = {5, 19, 33, 47, 61};
         }
 
+        if (cfg_.num_layers <= 0 || cfg_.hidden_size <= 0 || cfg_.intermediate_size <= 0 ||
+            cfg_.num_heads <= 0 || cfg_.num_kv_heads <= 0 || cfg_.head_dim <= 0 ||
+            cfg_.vocab_size <= 0 || cfg_.sliding_window <= 0 || cfg_.block_size < 2 ||
+            cfg_.conv_group_size <= 0 || cfg_.conv_kernel_size <= 0 ||
+            cfg_.selector_rank <= 0 || cfg_.selector_top_k <= 0 ||
+            (cfg_.hidden_size % cfg_.conv_group_size) != 0) {
+            throw std::runtime_error("Invalid DFlash config dimensions in: " + cfg_path);
+        }
+
         int max_tid = 0;
         for (int tid : cfg_.target_layer_ids) {
+            if (tid < 0 || tid > 4096) {
+                throw std::runtime_error("Invalid DFlash target_layer_id in: " + cfg_path);
+            }
             if (tid > max_tid) max_tid = tid;
         }
         target_slot_lut_.assign(static_cast<size_t>(max_tid + 1), -1);
         for (size_t s = 0; s < cfg_.target_layer_ids.size(); ++s) {
             int tid = cfg_.target_layer_ids[s];
-            if (tid >= 0) target_slot_lut_[static_cast<size_t>(tid)] = static_cast<int>(s);
+            target_slot_lut_[static_cast<size_t>(tid)] = static_cast<int>(s);
         }
 
         // 2. Read-only mmap of model.safetensors
@@ -505,25 +562,62 @@ DFlashEngine::DFlashEngine(MetalContext& ctx, const std::string& dflash_dir) {
         const uint8_t* base = reinterpret_cast<const uint8_t*>(mmap_ptr_);
         uint64_t header_len = 0;
         std::memcpy(&header_len, base, sizeof(uint64_t));
-        if (8u + header_len > mmap_size_) {
+        if (mmap_size_ < 8u || header_len > mmap_size_ - 8u || header_len > (128ull << 20)) {
             throw std::runtime_error("Corrupt DFlash safetensors header: " + st_path);
         }
         const size_t data_base = 8u + static_cast<size_t>(header_len);
+        const size_t data_avail = mmap_size_ - data_base;
         Json hdr = parse_json(std::string_view(reinterpret_cast<const char*>(base + 8), static_cast<size_t>(header_len)));
+        if (!hdr.is_object()) {
+            throw std::runtime_error("Corrupt DFlash safetensors header JSON (not an object): " + st_path);
+        }
 
         std::unordered_map<std::string, RawTensorMeta> meta;
         meta.reserve(hdr.as_object().size());
         for (const auto& [k, info] : hdr.as_object()) {
             if (k == "__metadata__") continue;
+            if (!info.is_object() || !info.contains("dtype") || !info.contains("shape") || !info.contains("data_offsets") ||
+                !info["dtype"].is_string() || !info["shape"].is_array() || !info["data_offsets"].is_array()) {
+                throw std::runtime_error("Corrupt DFlash safetensors tensor entry: " + k);
+            }
             RawTensorMeta rm;
             rm.dtype = parse_dtype(info["dtype"].as_string());
-            for (const auto& d : info["shape"].as_array()) rm.shape.push_back(d.as_int());
+            for (const auto& d : info["shape"].as_array()) {
+                int64_t dv = d.as_int();
+                if (dv < 0) throw std::runtime_error("Negative shape dimension in DFlash tensor: " + k);
+                rm.shape.push_back(dv);
+            }
             const auto& offs = info["data_offsets"].as_array();
-            size_t s = static_cast<size_t>(offs[0].as_int());
-            size_t e = static_cast<size_t>(offs[1].as_int());
+            if (offs.size() != 2) {
+                throw std::runtime_error("Invalid data_offsets length in DFlash tensor: " + k);
+            }
+            int64_t s_i64 = offs[0].as_int();
+            int64_t e_i64 = offs[1].as_int();
+            if (s_i64 < 0 || e_i64 < s_i64) {
+                throw std::runtime_error("Invalid data_offsets range in DFlash tensor: " + k);
+            }
+            size_t s = static_cast<size_t>(s_i64);
+            size_t e = static_cast<size_t>(e_i64);
+            if (s > data_avail || e > data_avail) {
+                throw std::runtime_error("DFlash safetensors data_offsets out of bounds for tensor: " + k);
+            }
             rm.byte_offset = data_base + s;
             rm.nbytes = e - s;
             meta.emplace(k, std::move(rm));
+        }
+
+        auto has_meta = [&](const std::string& key) -> bool {
+            return meta.count(key) > 0 || meta.count("model." + key) > 0;
+        };
+        if (!has_meta("candidate_selector.predecessor_codebook") ||
+            !has_meta("candidate_selector.successor_codebook") ||
+            !has_meta("candidate_selector.hidden_projection.weight") ||
+            !has_meta("layers.0.attention_conv.base_kernel") ||
+            !has_meta("layers.0.attention_conv.kernel_projection.weight")) {
+            throw std::runtime_error(
+                "Unsupported DFlash checkpoint in " + dflash_dir +
+                ": missing DFlash 2 candidate_selector / attention_conv tensors "
+                "(z-lab/dflash v1 checkpoints are not supported; expected a DFlash 2 checkpoint)");
         }
 
         auto find_meta = [&](const std::string& key) -> const RawTensorMeta& {
@@ -540,8 +634,45 @@ DFlashEngine::DFlashEngine(MetalContext& ctx, const std::string& dflash_dir) {
         if (m_pred.dtype != DType::BF16 || m_succ.dtype != DType::BF16) {
             throw std::runtime_error("DFlash codebooks expected BF16 dtype");
         }
-        pred_cb_bf16_ = reinterpret_cast<const uint16_t*>(base + m_pred.byte_offset);
-        succ_cb_bf16_ = reinterpret_cast<const uint16_t*>(base + m_succ.byte_offset);
+        const size_t cb_v = static_cast<size_t>(cfg_.vocab_size);
+        const size_t cb_r = static_cast<size_t>(cfg_.selector_rank);
+        if (cb_r > 0 && cb_v > (std::numeric_limits<size_t>::max() / 2u) / cb_r) {
+            throw std::runtime_error("DFlash codebook dimensions overflow size_t");
+        }
+        const size_t expected_cb_bytes = cb_v * cb_r * sizeof(uint16_t);
+        auto check_cb = [&](const RawTensorMeta& m, const char* name) {
+            if (m.shape.size() != 2 ||
+                m.shape[0] != static_cast<int64_t>(cfg_.vocab_size) ||
+                m.shape[1] != static_cast<int64_t>(cfg_.selector_rank) ||
+                m.nbytes != expected_cb_bytes) {
+                throw std::runtime_error(std::string("DFlash ") + name + " shape/nbytes mismatch with [vocab_size, selector_rank]");
+            }
+        };
+        check_cb(m_pred, "predecessor_codebook");
+        check_cb(m_succ, "successor_codebook");
+        pred_cb_bytes_ = base + m_pred.byte_offset;
+        succ_cb_bytes_ = base + m_succ.byte_offset;
+
+        // Deterministic 64-bit checkpoint identity fingerprint (for MICACHE2 prefix cache disambiguation)
+        {
+            uint64_t fp = 14695981039346656037ull;
+            std::error_code ec;
+            std::string canon = fs::weakly_canonical(dflash_dir, ec).string();
+            if (canon.empty()) canon = dflash_dir;
+            fp = fnv1a_update(fp, canon.data(), canon.size());
+            fp = fnv1a_update(fp, &mmap_size_, sizeof(mmap_size_));
+            fp = fnv1a_update(fp, &header_len, sizeof(header_len));
+            fp = fnv1a_update(fp, base + 8, std::min<size_t>(static_cast<size_t>(header_len), 4096u));
+            fp = fnv1a_update(fp, &cfg_.num_layers, sizeof(cfg_.num_layers));
+            fp = fnv1a_update(fp, &cfg_.hidden_size, sizeof(cfg_.hidden_size));
+            fp = fnv1a_update(fp, &cfg_.sliding_window, sizeof(cfg_.sliding_window));
+            fp = fnv1a_update(fp, &cfg_.block_size, sizeof(cfg_.block_size));
+            fp = fnv1a_update(fp, &cfg_.mask_token_id, sizeof(cfg_.mask_token_id));
+            if (!cfg_.target_layer_ids.empty()) {
+                fp = fnv1a_update(fp, cfg_.target_layer_ids.data(), cfg_.target_layer_ids.size() * sizeof(int));
+            }
+            fingerprint_ = fp;
+        }
 
         // Kick off kernel sequential read-ahead on both BF16 codebooks (~242.5 MiB) IMMEDIATELY
         // so SSD -> OS page-cache I/O overlaps 100% with the 12-thread Q4 quantization pass below!
@@ -587,13 +718,24 @@ DFlashEngine::DFlashEngine(MetalContext& ctx, const std::string& dflash_dir) {
 
         auto add_q4 = [&](const std::string& key, DFlashQ4Weight& dst) {
             const RawTensorMeta& rm = find_meta(key);
-            if (rm.shape.size() != 2) {
-                throw std::runtime_error("DFlash Q4 tensor must be 2D: " + key);
+            if (rm.shape.size() != 2 || rm.shape[0] <= 0 || rm.shape[1] <= 0) {
+                throw std::runtime_error("DFlash Q4 tensor must be non-empty 2D: " + key);
+            }
+            if (rm.dtype != DType::BF16 && rm.dtype != DType::F16 && rm.dtype != DType::F32) {
+                throw std::runtime_error("DFlash Q4 tensor unsupported source dtype: " + key);
+            }
+            if (rm.shape[0] > UINT32_MAX || rm.shape[1] > UINT32_MAX) {
+                throw std::runtime_error("DFlash Q4 tensor dimensions overflow uint32: " + key);
             }
             uint32_t N = static_cast<uint32_t>(rm.shape[0]);
             uint32_t K = static_cast<uint32_t>(rm.shape[1]);
             if ((K % 64u) != 0u) {
                 throw std::runtime_error("DFlash Q4 tensor K not divisible by 64: " + key);
+            }
+            const size_t elem_sz = dtype_size(rm.dtype);
+            if (static_cast<size_t>(N) > (std::numeric_limits<size_t>::max() / elem_sz) / static_cast<size_t>(K) ||
+                rm.nbytes != static_cast<size_t>(N) * static_cast<size_t>(K) * elem_sz) {
+                throw std::runtime_error("DFlash Q4 tensor nbytes mismatch with shape: " + key);
             }
             size_t w_bytes  = static_cast<size_t>(N) * (K / 8u) * sizeof(uint32_t);
             size_t sb_bytes = static_cast<size_t>(N) * (K / 64u) * sizeof(uint16_t);
@@ -613,8 +755,22 @@ DFlashEngine::DFlashEngine(MetalContext& ctx, const std::string& dflash_dir) {
 
         auto add_f16 = [&](const std::string& key, TensorView& dst) {
             const RawTensorMeta& rm = find_meta(key);
+            if (rm.dtype != DType::BF16 && rm.dtype != DType::F16 && rm.dtype != DType::F32) {
+                throw std::runtime_error("DFlash F16 tensor unsupported source dtype: " + key);
+            }
+            const size_t elem_sz = dtype_size(rm.dtype);
             size_t numel = 1;
-            for (int64_t d : rm.shape) numel *= static_cast<size_t>(d);
+            for (int64_t d : rm.shape) {
+                if (d <= 0) throw std::runtime_error("DFlash F16 tensor has non-positive dim: " + key);
+                size_t du = static_cast<size_t>(d);
+                if (du > (std::numeric_limits<size_t>::max() / std::max<size_t>(elem_sz, 2u)) / numel) {
+                    throw std::runtime_error("DFlash F16 tensor shape overflows size_t: " + key);
+                }
+                numel *= du;
+            }
+            if (rm.nbytes != numel * elem_sz) {
+                throw std::runtime_error("DFlash F16 tensor nbytes mismatch with shape: " + key);
+            }
             size_t bytes = numel * sizeof(uint16_t);
             F16Job j{};
             j.src = &rm;
@@ -817,8 +973,8 @@ DFlashEngine::DFlashEngine(MetalContext& ctx, const std::string& dflash_dir) {
         }
         mmap_ptr_ = nullptr;
         mmap_size_ = 0;
-        pred_cb_bf16_ = nullptr;
-        succ_cb_bf16_ = nullptr;
+        pred_cb_bytes_ = nullptr;
+        succ_cb_bytes_ = nullptr;
         ready_ = false;
         throw;
     }
@@ -832,8 +988,8 @@ DFlashEngine::~DFlashEngine() {
     }
     mmap_ptr_ = nullptr;
     mmap_size_ = 0;
-    pred_cb_bf16_ = nullptr;
-    succ_cb_bf16_ = nullptr;
+    pred_cb_bytes_ = nullptr;
+    succ_cb_bytes_ = nullptr;
 }
 
 int DFlashEngine::target_capture_slot(int target_layer_idx) const {
@@ -847,7 +1003,7 @@ void DFlashEngine::select_greedy(int anchor_token,
                                  const LogitCand* topk_cands,
                                  const uint16_t* sel_h_f16,
                                  int* out_draft_ids) const {
-    run_candidate_selector(cfg_, pred_cb_bf16_, succ_cb_bf16_, anchor_token,
+    run_candidate_selector(cfg_, pred_cb_bytes_, succ_cb_bytes_, anchor_token,
                            topk_cands, sel_h_f16, nullptr, false, 0.0f, 0ull,
                            out_draft_ids, nullptr);
 }
@@ -859,7 +1015,7 @@ void DFlashEngine::select_sampled(int anchor_token,
                                   uint64_t seed,
                                   int* out_draft_ids,
                                   DraftDist* out_draft_dists) const {
-    run_candidate_selector(cfg_, pred_cb_bf16_, succ_cb_bf16_, anchor_token,
+    run_candidate_selector(cfg_, pred_cb_bytes_, succ_cb_bytes_, anchor_token,
                            topk_cands, sel_h_f16, nullptr, true, temperature, seed,
                            out_draft_ids, out_draft_dists);
 }
@@ -868,7 +1024,7 @@ void DFlashEngine::select_greedy_f32(int anchor_token,
                                      const LogitCand* topk_cands,
                                      const float* sel_h_f32,
                                      int* out_draft_ids) const {
-    run_candidate_selector(cfg_, pred_cb_bf16_, succ_cb_bf16_, anchor_token,
+    run_candidate_selector(cfg_, pred_cb_bytes_, succ_cb_bytes_, anchor_token,
                            topk_cands, nullptr, sel_h_f32, false, 0.0f, 0ull,
                            out_draft_ids, nullptr);
 }
@@ -880,7 +1036,7 @@ void DFlashEngine::select_sampled_f32(int anchor_token,
                                       uint64_t seed,
                                       int* out_draft_ids,
                                       DraftDist* out_draft_dists) const {
-    run_candidate_selector(cfg_, pred_cb_bf16_, succ_cb_bf16_, anchor_token,
+    run_candidate_selector(cfg_, pred_cb_bytes_, succ_cb_bytes_, anchor_token,
                            topk_cands, nullptr, sel_h_f32, true, temperature, seed,
                            out_draft_ids, out_draft_dists);
 }

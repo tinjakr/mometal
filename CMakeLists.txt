@@ -35,7 +35,6 @@ target_compile_definitions(mometal PRIVATE
 
 target_compile_options(mometal PRIVATE
     -O3
-    -ffast-math
     -fno-math-errno
     -Wall
     -Wextra

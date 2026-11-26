@@ -341,9 +341,10 @@ Qwen38Model::Qwen38Model(MetalContext& ctx, const std::string& model_dir, int ma
         }
         resolved_ane.clear();
     } else if (resolved_ane == "auto") {
+        std::string want_fmt = (ane_tag == "lut4" || ane_tag == "hf4" || ane_tag == "nf4") ? ane_tag : auto_fmt;
         std::string c1 = model_dir + "/ane-models";
         std::string c2 = model_dir + "-ane";
-        std::string c3 = default_ane_cache_dir(model_dir, auto_fmt);
+        std::string c3 = default_ane_cache_dir(model_dir, want_fmt);
         if (std::filesystem::is_directory(c1)) resolved_ane = c1;
         else if (std::filesystem::is_directory(c2)) resolved_ane = c2;
         else if (std::filesystem::is_directory(c3)) resolved_ane = c3;
@@ -352,7 +353,7 @@ Qwen38Model::Qwen38Model(MetalContext& ctx, const std::string& model_dir, int ma
             AneBuildOptions bopt;
             bopt.model_dir = model_dir;
             bopt.out_dir = c3;
-            bopt.format = (ane_tag == "lut4" || ane_tag == "hf4" || ane_tag == "nf4") ? ane_tag : "auto";
+            bopt.format = want_fmt;
             bopt.tag = (ane_tag == "auto" || ane_tag.empty()) ? "auto" : ane_tag;
             auto bres = build_ane_mlps_native(bopt);
             if (bres.ok) {
@@ -624,69 +625,112 @@ Qwen38Model::Qwen38Model(MetalContext& ctx, const std::string& model_dir, int ma
 
     // Optional DFlash 2 block-diffusion drafter (replaces 1-layer MTP & BitScreen -> saves ~288 MiB!)
     if (want_dflash) {
-        dflash_ = std::make_unique<DFlashEngine>(ctx_, dflash_dir);
-        const DFlashConfig& dcfg = dflash_->config();
-        if (!dflash_->ready()) {
-            throw std::runtime_error("Failed to initialize DFlash 2 engine from " + dflash_dir);
-        }
-        if (dcfg.hidden_size != hidden_size_ || dcfg.vocab_size != vocab_size_) {
-            throw std::runtime_error("DFlash 2 hidden_size/vocab_size mismatch with target Qwen3.8 model");
-        }
-        if (dcfg.block_size < 2 || dcfg.block_size > MAX_VERIFY) {
-            throw std::runtime_error("Unsupported DFlash 2 block_size (expected 2.." + std::to_string(MAX_VERIFY) + ")");
-        }
+        try {
+            dflash_ = std::make_unique<DFlashEngine>(ctx_, dflash_dir);
+            const DFlashConfig& dcfg = dflash_->config();
+            if (!dflash_->ready()) {
+                throw std::runtime_error("Failed to initialize DFlash 2 engine from " + dflash_dir);
+            }
+            if (dcfg.hidden_size != hidden_size_ || dcfg.vocab_size != vocab_size_) {
+                throw std::runtime_error("DFlash 2 hidden_size/vocab_size mismatch with target Qwen3.8 model");
+            }
+            const int max_df_block = std::min(MAX_VERIFY, 8);
+            if (dcfg.block_size < 2 || dcfg.block_size > max_df_block) {
+                throw std::runtime_error("Unsupported DFlash 2 block_size (expected 2.." + std::to_string(max_df_block) + ")");
+            }
+            if (dcfg.head_dim != 128) {
+                throw std::runtime_error("Unsupported DFlash 2 head_dim=" + std::to_string(dcfg.head_dim) + " (expected 128)");
+            }
+            if (dcfg.num_heads <= 0 || dcfg.num_kv_heads <= 0 || (dcfg.num_heads % dcfg.num_kv_heads) != 0) {
+                throw std::runtime_error("Invalid DFlash 2 head counts (num_heads must be divisible by num_kv_heads)");
+            }
+            if (dcfg.conv_kernel_size != 2) {
+                throw std::runtime_error("Unsupported DFlash 2 conv_kernel_size=" + std::to_string(dcfg.conv_kernel_size) + " (expected 2)");
+            }
+            const size_t target_kv_dim = static_cast<size_t>(num_kv_heads_) * static_cast<size_t>(head_dim_);
+            const size_t target_q_cap = std::max<size_t>(
+                static_cast<size_t>(lin_num_k_heads_) * static_cast<size_t>(lin_head_k_dim_),
+                static_cast<size_t>(num_heads_) * static_cast<size_t>(head_dim_));
+            if (static_cast<size_t>(dcfg.num_kv_heads) * static_cast<size_t>(dcfg.head_dim) > target_kv_dim) {
+                throw std::runtime_error("DFlash 2 KV dim exceeds target scratch capacity");
+            }
+            if (static_cast<size_t>(dcfg.num_heads) * static_cast<size_t>(dcfg.head_dim) > target_q_cap) {
+                throw std::runtime_error("DFlash 2 Q dim exceeds target scratch capacity");
+            }
+            const size_t num_chunks_check = ceil_div(static_cast<uint32_t>(vocab_size_), 2048u);
+            if (dcfg.selector_top_k <= 0 || dcfg.selector_top_k > 256 ||
+                num_chunks_check * static_cast<size_t>(dcfg.selector_top_k) > 4096u) {
+                throw std::runtime_error("DFlash 2 selector_top_k exceeds LM-head top-k shader scratch (<= 4096)");
+            }
+            for (int tid : dcfg.target_layer_ids) {
+                if (tid < 0 || tid >= num_layers_) {
+                    throw std::runtime_error("DFlash 2 target_layer_id=" + std::to_string(tid) +
+                                             " out of range for target num_layers=" + std::to_string(num_layers_));
+                }
+            }
+            if (dflash_->fc().out_dim != static_cast<uint32_t>(hidden_size_) ||
+                dflash_->fc().in_dim != static_cast<uint32_t>(dcfg.target_layer_ids.size()) * static_cast<uint32_t>(hidden_size_)) {
+                throw std::runtime_error("DFlash 2 fc.weight shape mismatch with target_layer_ids x hidden_size");
+            }
 
-        ctx_.load_shader_file("dflash", shader_dir + "/dflash.metal");
-        pso_df_rmsnorm_f16_     = ctx_.pipeline("dflash", "dflash_rmsnorm_f16");
-        pso_df_conv_prep_f16_   = ctx_.pipeline("dflash", "dflash_conv_prepare_f16");
-        pso_df_conv_finish_f32_ = ctx_.pipeline("dflash", "dflash_conv_finish_add_f32");
-        pso_df_kv_write_        = ctx_.pipeline("dflash", "dflash_context_kv_write");
-        pso_df_qkv_prep_        = ctx_.pipeline("dflash", "dflash_qkv_prep");
-        pso_df_attn_p1_         = ctx_.pipeline("dflash", "dflash_attn_bidir_window_p1");
-        pso_df_attn_p2_         = ctx_.pipeline("dflash", "dflash_attn_bidir_window_p2");
-        pso_df_topk16_p1_       = ctx_.pipeline("dflash", "dflash_lmhead_topk16_p1");
-        pso_df_topk16_p2_       = ctx_.pipeline("dflash", "dflash_lmhead_topk16_p2");
-        pso_df_capture_hidden_  = ctx_.pipeline("dflash", "dflash_capture_hidden");
-        pso_df_hidden_proj_f16_ = ctx_.pipeline("dflash", "dflash_hidden_proj_f16");
+            ctx_.load_shader_file("dflash", shader_dir + "/dflash.metal");
+            pso_df_rmsnorm_f16_     = ctx_.pipeline("dflash", "dflash_rmsnorm_f16");
+            pso_df_conv_prep_f16_   = ctx_.pipeline("dflash", "dflash_conv_prepare_f16");
+            pso_df_conv_finish_f32_ = ctx_.pipeline("dflash", "dflash_conv_finish_add_f32");
+            pso_df_kv_write_        = ctx_.pipeline("dflash", "dflash_context_kv_write");
+            pso_df_qkv_prep_        = ctx_.pipeline("dflash", "dflash_qkv_prep");
+            pso_df_attn_p1_         = ctx_.pipeline("dflash", "dflash_attn_bidir_window_p1");
+            pso_df_attn_p2_         = ctx_.pipeline("dflash", "dflash_attn_bidir_window_p2");
+            pso_df_topk16_p1_       = ctx_.pipeline("dflash", "dflash_lmhead_topk16_p1");
+            pso_df_topk16_p2_       = ctx_.pipeline("dflash", "dflash_lmhead_topk16_p2");
+            pso_df_capture_hidden_  = ctx_.pipeline("dflash", "dflash_capture_hidden");
+            pso_df_hidden_proj_f16_ = ctx_.pipeline("dflash", "dflash_hidden_proj_f16");
 
-        // 5-layer FP16 sliding-window ring KV cache ([Hkv, window, D] per layer, ~40 MiB total!)
-        df_k_cache_.resize(static_cast<size_t>(dcfg.num_layers), nil);
-        df_v_cache_.resize(static_cast<size_t>(dcfg.num_layers), nil);
-        const size_t ring_sz = static_cast<size_t>(dcfg.num_kv_heads) * dcfg.sliding_window * dcfg.head_dim * sizeof(uint16_t);
-        for (int l = 0; l < dcfg.num_layers; ++l) {
-            df_k_cache_[l] = ctx_.alloc_private(ring_sz);
-            df_v_cache_[l] = ctx_.alloc_private(ring_sz);
-            kv_bytes += 2 * ring_sz;
+            // 5-layer FP16 sliding-window ring KV cache ([Hkv, window, D] per layer, ~40 MiB total!)
+            df_k_cache_.resize(static_cast<size_t>(dcfg.num_layers), nil);
+            df_v_cache_.resize(static_cast<size_t>(dcfg.num_layers), nil);
+            const size_t ring_sz = static_cast<size_t>(dcfg.num_kv_heads) * dcfg.sliding_window * dcfg.head_dim * sizeof(uint16_t);
+            for (int l = 0; l < dcfg.num_layers; ++l) {
+                df_k_cache_[l] = ctx_.alloc_private(ring_sz);
+                df_v_cache_[l] = ctx_.alloc_private(ring_sz);
+                kv_bytes += 2 * ring_sz;
+            }
+
+            // Compact target-hidden capture buffer (per-chunk, NOT 2048 rows!) + block-8 draft scratch (~0.75 MiB)
+            const size_t n_tgt = dcfg.target_layer_ids.size();
+            const size_t B = static_cast<size_t>(dcfg.block_size);
+            const size_t P = B - 1u;
+            const size_t H = static_cast<size_t>(dcfg.hidden_size);
+            const size_t G_dyn = 2u * static_cast<size_t>(dcfg.conv_kernel_size) * (H / static_cast<size_t>(dcfg.conv_group_size));
+            const size_t num_chunks = ceil_div(static_cast<uint32_t>(vocab_size_), 2048u);
+
+            df_cap_rows_      = (ane_ && ane_->ready()) ? (2 * C_attn) : C_attn;
+            buf_df_capture_   = ctx_.alloc_private(df_cap_rows_ * n_tgt * H * sizeof(uint16_t));
+            buf_df_ids_       = ctx_.alloc_shared(B * sizeof(int));
+            buf_df_h_         = ctx_.alloc_private(B * H * sizeof(float));
+            buf_df_x_         = ctx_.alloc_private(B * H * sizeof(uint16_t));
+            buf_df_x2_        = ctx_.alloc_private(B * H * sizeof(uint16_t));
+            buf_df_dyn_       = ctx_.alloc_private(B * G_dyn * sizeof(float));
+            buf_df_o_         = ctx_.alloc_private(B * H * sizeof(float));
+            buf_df_q_h_       = ctx_.alloc_private(static_cast<size_t>(dcfg.num_heads) * 8u * dcfg.head_dim * sizeof(uint16_t));
+            buf_df_kn_        = ctx_.alloc_private(static_cast<size_t>(dcfg.num_kv_heads) * B * dcfg.head_dim * sizeof(uint16_t));
+            buf_df_vn_        = ctx_.alloc_private(static_cast<size_t>(dcfg.num_kv_heads) * B * dcfg.head_dim * sizeof(uint16_t));
+            buf_df_attn_out_  = ctx_.alloc_private(B * static_cast<size_t>(dcfg.num_heads) * dcfg.head_dim * sizeof(uint16_t));
+            buf_df_topk_part_ = ctx_.alloc_private(P * num_chunks * static_cast<size_t>(dcfg.selector_top_k) * sizeof(LogitCand));
+            buf_df_topk_out_  = ctx_.alloc_shared(P * static_cast<size_t>(dcfg.selector_top_k) * sizeof(LogitCand));
+            buf_df_sel_h_     = ctx_.alloc_shared(P * static_cast<size_t>(dcfg.selector_rank) * sizeof(uint16_t));
+            dflash_loaded_ = true;
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "[dflash] Disabling DFlash drafter (%s)\n", e.what());
+            df_k_cache_.clear();
+            df_v_cache_.clear();
+            dflash_.reset();
+            dflash_loaded_ = false;
         }
-
-        // Compact target-hidden capture buffer (per-chunk, NOT 2048 rows!) + block-8 draft scratch (~0.75 MiB)
-        const size_t n_tgt = dcfg.target_layer_ids.size();
-        const size_t B = static_cast<size_t>(dcfg.block_size);
-        const size_t P = B - 1u;
-        const size_t H = static_cast<size_t>(dcfg.hidden_size);
-        const size_t G_dyn = 2u * static_cast<size_t>(dcfg.conv_kernel_size) * (H / static_cast<size_t>(dcfg.conv_group_size));
-        const size_t num_chunks = ceil_div(static_cast<uint32_t>(vocab_size_), 2048u);
-
-        df_cap_rows_      = (ane_ && ane_->ready()) ? (2 * C_attn) : C_attn;
-        buf_df_capture_   = ctx_.alloc_private(df_cap_rows_ * n_tgt * H * sizeof(uint16_t));
-        buf_df_ids_       = ctx_.alloc_shared(B * sizeof(int));
-        buf_df_h_         = ctx_.alloc_private(B * H * sizeof(float));
-        buf_df_x_         = ctx_.alloc_private(B * H * sizeof(uint16_t));
-        buf_df_x2_        = ctx_.alloc_private(B * H * sizeof(uint16_t));
-        buf_df_dyn_       = ctx_.alloc_private(B * G_dyn * sizeof(float));
-        buf_df_o_         = ctx_.alloc_private(B * H * sizeof(float));
-        buf_df_q_h_       = ctx_.alloc_private(static_cast<size_t>(dcfg.num_heads) * 8u * dcfg.head_dim * sizeof(uint16_t));
-        buf_df_kn_        = ctx_.alloc_private(static_cast<size_t>(dcfg.num_kv_heads) * B * dcfg.head_dim * sizeof(uint16_t));
-        buf_df_vn_        = ctx_.alloc_private(static_cast<size_t>(dcfg.num_kv_heads) * B * dcfg.head_dim * sizeof(uint16_t));
-        buf_df_attn_out_  = ctx_.alloc_private(B * static_cast<size_t>(dcfg.num_heads) * dcfg.head_dim * sizeof(uint16_t));
-        buf_df_topk_part_ = ctx_.alloc_private(P * num_chunks * static_cast<size_t>(dcfg.selector_top_k) * sizeof(LogitCand));
-        buf_df_topk_out_  = ctx_.alloc_shared(P * static_cast<size_t>(dcfg.selector_top_k) * sizeof(LogitCand));
-        buf_df_sel_h_     = ctx_.alloc_shared(P * static_cast<size_t>(dcfg.selector_rank) * sizeof(uint16_t));
-        dflash_loaded_ = true;
     }
 
     // Optional MTP drafter loading (skipped when DFlash 2 is active; check bundled store_ FIRST!)
-    std::string resolved_mtp = want_dflash ? std::string() : mtp_dir;
+    std::string resolved_mtp = dflash_loaded_ ? std::string() : mtp_dir;
     if (resolved_mtp == "off" || resolved_mtp == "none") {
         resolved_mtp.clear();
     } else if (resolved_mtp == "auto") {
@@ -992,13 +1036,16 @@ Qwen38Model::Qwen38Model(MetalContext& ctx, const std::string& model_dir, int ma
     buf_argmax_out_   = ctx_.alloc_shared(static_cast<size_t>(MAX_VERIFY) * sizeof(uint32_t));
     buf_draft_row_map_ = ctx_.alloc_shared(static_cast<size_t>(MAX_DRAFT_ROW_MAP) * sizeof(uint32_t));
     // Build BitScreen 1-bit sign(W) x 3-bitplane(X) pre-filter for MTP draft lm_head (general hidden_size via FC_BS_D!)
-    bool want_bs = mtp_loaded_ && (hidden_size_ > 0 && (hidden_size_ % 64) == 0 && hidden_size_ <= 8192) &&
+    bool want_bs = mtp_loaded_ && (vocab_size_ >= 2048) &&
+                   (hidden_size_ > 0 && (hidden_size_ % 64) == 0 && hidden_size_ <= 8192) &&
                    (!std::getenv("MI_BITSCREEN") || std::atoi(std::getenv("MI_BITSCREEN")) != 0);
     if (want_bs) {
         uint32_t bsv = std::getenv("MI_BITSCREEN_V")
-            ? static_cast<uint32_t>(std::atoi(std::getenv("MI_BITSCREEN_V")))
+            ? static_cast<uint32_t>(std::max(0, std::atoi(std::getenv("MI_BITSCREEN_V"))))
             : 98304u;
-        bs_vocab_ = std::clamp(bsv, 32768u, static_cast<uint32_t>(vocab_size_));
+        const uint32_t max_v = static_cast<uint32_t>(vocab_size_);
+        const uint32_t min_v = std::min<uint32_t>(32768u, max_v);
+        bs_vocab_ = std::clamp(bsv, min_v, max_v);
         bs_vocab_ = (bs_vocab_ / 2048u) * 2048u; // exact multiple of 2,048 strided buckets
         const size_t bs_kw = static_cast<size_t>(hidden_size_) / 32ull;
         buf_bs_w_        = ctx_.alloc_private(static_cast<size_t>(bs_vocab_) * bs_kw * sizeof(uint32_t));
@@ -1122,7 +1169,11 @@ Qwen38Model::Qwen38Model(MetalContext& ctx, const std::string& model_dir, int ma
     }
     if (dflash_loaded_) {
         const DFlashConfig& dcfg = dflash_->config();
-        info_.quant_desc += " + DFlash2(b" + std::to_string(dcfg.block_size) + ", " + std::to_string(dcfg.num_layers) + "L)";
+        char fp_buf[24];
+        std::snprintf(fp_buf, sizeof(fp_buf), "%016llx",
+                      static_cast<unsigned long long>(dflash_->fingerprint()));
+        info_.quant_desc += " + DFlash2(b" + std::to_string(dcfg.block_size) + ", " +
+                            std::to_string(dcfg.num_layers) + "L, " + fp_buf + ")";
     }
     info_.vocab_size = vocab_size_;
     info_.hidden_size = hidden_size_;
@@ -1145,6 +1196,10 @@ Qwen38Model::Qwen38Model(MetalContext& ctx, const std::string& model_dir, int ma
 }
 
 Qwen38Model::~Qwen38Model() {
+    wait_pending_save();
+}
+
+void Qwen38Model::wait_pending_save() {
     if (save_thread_.joinable()) save_thread_.join();
 }
 
@@ -1178,17 +1233,10 @@ void Qwen38Model::ensure_kv_capacity(int needed) {
     const size_t page_kb_bytes = static_cast<size_t>(num_kv_heads_) * head_dim_ * 4ull;
 
     // Layer-by-layer alloc -> blit -> swap/release inside @autoreleasepool:
-    // eliminates the 2x all-layers KV RAM peak spike (+3.2 GiB -> <= 1 single layer +0.19 GiB, or 0 B when pos_ == 0)!
+    // allocates replacements BEFORE releasing old buffers so allocation/blit errors never leave nil state!
     for (int i = 0; i < num_layers_; ++i) {
         if (layers_[i].is_linear) continue;
         @autoreleasepool {
-            if (copy_kv == 0) {
-                states_[i].k_cache = nil;
-                states_[i].v_cache = nil;
-                states_[i].k_sb = nil;
-                states_[i].v_sb = nil;
-                states_[i].k_bounds = nil;
-            }
             id nk = ctx_.alloc_private(new_kv_sz);
             id nv = ctx_.alloc_private(new_kv_sz);
             id nksb = (row_sb_bytes > 0) ? ctx_.alloc_private(new_sb_sz) : nil;
@@ -1211,6 +1259,10 @@ void Qwen38Model::ensure_kv_capacity(int needed) {
                 [blit endEncoding];
                 [cb commit];
                 [cb waitUntilCompleted];
+                if (cb.error) {
+                    throw std::runtime_error(std::string("Metal KV grow blit error: ") +
+                                             [[cb.error localizedDescription] UTF8String]);
+                }
             }
 
             states_[i].k_cache = nk;
@@ -1234,13 +1286,6 @@ void Qwen38Model::ensure_kv_capacity(int needed) {
         const size_t mtp_new_kv_sz = static_cast<size_t>(new_cap) * mtp_row_kv_bytes;
         const size_t mtp_new_sb_sz = static_cast<size_t>(new_cap) * mtp_row_sb_bytes;
         @autoreleasepool {
-            if (mtp_pos_ <= 0) {
-                mtp_k_cache_ = nil;
-                mtp_v_cache_ = nil;
-                mtp_k_sb_ = nil;
-                mtp_v_sb_ = nil;
-                mtp_k_bounds_ = nil;
-            }
             id nk = ctx_.alloc_private(mtp_new_kv_sz);
             id nv = ctx_.alloc_private(mtp_new_kv_sz);
             id nksb = (mtp_row_sb_bytes > 0) ? ctx_.alloc_private(mtp_new_sb_sz) : nil;
@@ -1260,6 +1305,10 @@ void Qwen38Model::ensure_kv_capacity(int needed) {
                 [blit endEncoding];
                 [cb commit];
                 [cb waitUntilCompleted];
+                if (cb.error) {
+                    throw std::runtime_error(std::string("Metal MTP KV grow blit error: ") +
+                                             [[cb.error localizedDescription] UTF8String]);
+                }
             }
 
             mtp_k_cache_ = nk;
@@ -1336,6 +1385,9 @@ void Qwen38Model::shrink_kv_capacity(int target_cap) {
 }
 
 void Qwen38Model::reset() {
+    if (ane_ && ane_->ready()) {
+        ane_->drain_all_slots();
+    }
     @autoreleasepool {
         id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)ctx_.queue() commandBuffer];
         id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
@@ -1353,6 +1405,10 @@ void Qwen38Model::reset() {
         [blit endEncoding];
         [cb commit];
         [cb waitUntilCompleted];
+        if (cb.error) {
+            throw std::runtime_error(std::string("Metal reset blit error: ") +
+                                     [[cb.error localizedDescription] UTF8String]);
+        }
     }
     pos_ = 0;
     rope_delta_ = 0;
@@ -1393,8 +1449,12 @@ void Qwen38Model::add_suffix_corpus(const int* tokens, int n_tokens) {
 }
 
 void Qwen38Model::init_draft_row_map() {
-    uint32_t vb = std::getenv("DRAFT_VBASE") ? static_cast<uint32_t>(std::atoi(std::getenv("DRAFT_VBASE"))) : 32768u;
-    vb = std::clamp(vb, 1024u, std::min<uint32_t>(MAX_DRAFT_ROW_MAP - 512u, static_cast<uint32_t>(vocab_size_)));
+    uint32_t vb = std::getenv("DRAFT_VBASE")
+        ? static_cast<uint32_t>(std::max(0, std::atoi(std::getenv("DRAFT_VBASE"))))
+        : 32768u;
+    const uint32_t hi = std::min<uint32_t>(MAX_DRAFT_ROW_MAP - 512u, static_cast<uint32_t>(vocab_size_));
+    const uint32_t lo = std::min<uint32_t>(1024u, hi);
+    vb = std::clamp(vb, lo, hi);
     draft_vbase_ = vb;
     draft_in_map_.assign(static_cast<size_t>(vocab_size_), 0u);
     uint32_t* rm = reinterpret_cast<uint32_t*>([(id<MTLBuffer>)buf_draft_row_map_ contents]);
@@ -3234,6 +3294,19 @@ void Qwen38Model::forward_ane_chunk(const int* tokens, int n_chunk, bool is_last
     //   - Encode next CB on CPU while GPU executes cur_cb (hides 100% of CPU encoding latency)
     //   - When ANE-bound, submit slot s BEFORE waiting on slot (1-s) so ANE hardware ring never drains!
     //   - When GPU-bound (slot 1-s already done), commit next GPU CB BEFORE submitting slot s!
+    struct AneSlotDrainGuard {
+        AneMlpEngine* ane;
+        bool* inflight;
+        bool active = true;
+        ~AneSlotDrainGuard() {
+            if (active && ane && (inflight[0] || inflight[1])) {
+                ane->drain_all_slots();
+                inflight[0] = false;
+                inflight[1] = false;
+            }
+        }
+    } ane_drain_guard{ane_.get(), slot_inflight};
+
     @autoreleasepool {
         const int total_steps = num_layers_ * 2;
         id<MTLCommandBuffer> cur_cb = encode_step_cb(0, 0);
@@ -3253,8 +3326,9 @@ void Qwen38Model::forward_ane_chunk(const int* tokens, int n_chunk, bool is_last
 
             [cur_cb waitUntilCompleted];
             if (cur_cb.error) {
-                if (slot_inflight[0]) { ane_->wait_slot(0); slot_inflight[0] = false; }
-                if (slot_inflight[1]) { ane_->wait_slot(1); slot_inflight[1] = false; }
+                ane_->drain_all_slots();
+                slot_inflight[0] = false;
+                slot_inflight[1] = false;
                 throw std::runtime_error(std::string("Metal ANE-pipeline GPU error: ") +
                                          [[cur_cb.error localizedDescription] UTF8String]);
             }
@@ -3307,8 +3381,12 @@ void Qwen38Model::forward_ane_chunk(const int* tokens, int n_chunk, bool is_last
         }
         if (mtp_loaded_) {
             if (qs[0] > 0) barrier();
+            cur_mrope_buf_ = (pos3d != nullptr && pos_ == 0) ? buf_mrope_pos_ : nil;
+            cur_mrope_off_ = 0;
             encode_final_norm_and_mtp(enc, buf_hidden_, buf_token_ids_, 0,
                                       static_cast<uint32_t>(mA), pos_, false, false);
+            cur_mrope_buf_ = nil;
+            cur_mrope_off_ = 0;
         }
         if (dflash_loaded_ && df_cap_n[0] > 0) {
             int slot_last = dflash_->target_capture_slot(num_layers_ - 1);
@@ -3323,7 +3401,9 @@ void Qwen38Model::forward_ane_chunk(const int* tokens, int n_chunk, bool is_last
         [cb commit];
         [cb waitUntilCompleted];
         if (cb.error) {
-            if (slot_inflight[1]) { ane_->wait_slot(1); slot_inflight[1] = false; }
+            ane_->drain_all_slots();
+            slot_inflight[0] = false;
+            slot_inflight[1] = false;
             throw std::runtime_error(std::string("Metal ANE finalize half0 error: ") +
                                      [[cb.error localizedDescription] UTF8String]);
         }
@@ -3335,6 +3415,7 @@ void Qwen38Model::forward_ane_chunk(const int* tokens, int n_chunk, bool is_last
         slot_inflight[1] = false;
         if (prof) ane_wait_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ta0).count();
     }
+    ane_drain_guard.active = false;
     if (prof) {
         std::fprintf(stderr, "[ane_prof] chunk=%d (mA=%d[a%d,g%d],mB=%d[a%d,g%d]): gpu_cb=%.1f ms | ane_extra_wait=%.1f ms\n",
                      n_chunk, mA, ane_m[0], gpu_m[0], mB, ane_m[1], gpu_m[1], gpu_wait_ms, ane_wait_ms);
@@ -4522,8 +4603,9 @@ void Qwen38Model::encode_mtp_kv_prime(
         1.0f / std::sqrt(static_cast<float>(head_dim_)), 1u, rope_delta_
     };
     const bool qkv = (mtp_k_sb_ != nil);
+    const bool use_mrope = (start_pos == 0 && cur_mrope_buf_ != nil && (!qkv || mtp_kv_bits_ == kv_bits_));
     if (qkv) {
-        [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_mtp_kv_prep_];
+        [enc setComputePipelineState:(id<MTLComputePipelineState>)(use_mrope ? pso_fa_kv_prep_mrope_q_ : pso_mtp_kv_prep_)];
         [enc setBuffer:(id<MTLBuffer>)buf_k_ offset:0 atIndex:0];
         [enc setBuffer:(id<MTLBuffer>)buf_v_ offset:0 atIndex:1];
         [enc setBuffer:(id<MTLBuffer>)lw.k_norm.buffer offset:lw.k_norm.offset atIndex:2];
@@ -4532,14 +4614,16 @@ void Qwen38Model::encode_mtp_kv_prime(
         [enc setBuffer:(id<MTLBuffer>)mtp_k_sb_ offset:0 atIndex:5];
         [enc setBuffer:(id<MTLBuffer>)mtp_v_sb_ offset:0 atIndex:6];
         [enc setBytes:&fp length:sizeof(fp) atIndex:7];
+        if (use_mrope) [enc setBuffer:(id<MTLBuffer>)cur_mrope_buf_ offset:cur_mrope_off_ atIndex:8];
     } else {
-        [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_fa_kv_prep_];
+        [enc setComputePipelineState:(id<MTLComputePipelineState>)(use_mrope ? pso_fa_kv_prep_mrope_ : pso_fa_kv_prep_)];
         [enc setBuffer:(id<MTLBuffer>)buf_k_ offset:0 atIndex:0];
         [enc setBuffer:(id<MTLBuffer>)buf_v_ offset:0 atIndex:1];
         [enc setBuffer:(id<MTLBuffer>)lw.k_norm.buffer offset:lw.k_norm.offset atIndex:2];
         [enc setBuffer:(id<MTLBuffer>)mtp_k_cache_ offset:0 atIndex:3];
         [enc setBuffer:(id<MTLBuffer>)mtp_v_cache_ offset:0 atIndex:4];
         [enc setBytes:&fp length:sizeof(fp) atIndex:5];
+        if (use_mrope) [enc setBuffer:(id<MTLBuffer>)cur_mrope_buf_ offset:cur_mrope_off_ atIndex:6];
     }
     [enc dispatchThreadgroups:MTLSizeMake(num_kv_heads_, M, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
     barrier();
@@ -5400,6 +5484,9 @@ const float* Qwen38Model::forward_multimodal(
                               all_pos3d.data() + static_cast<size_t>(offset) * 3,
                               all_vis_ptrs.data() + offset, df_cap_from);
             offset += m;
+            rope_delta_ = (offset < n_tokens)
+                ? (all_pos3d[static_cast<size_t>(offset) * 3 + 0] - pos_)
+                : (cur_rope - pos_);
             continue;
         }
 
@@ -5464,6 +5551,9 @@ const float* Qwen38Model::forward_multimodal(
         pos_ += m;
         if (dflash_loaded_) df_kv_len_ = pos_;
         offset += m;
+        rope_delta_ = (offset < n_tokens)
+            ? (all_pos3d[static_cast<size_t>(offset) * 3 + 0] - pos_)
+            : (cur_rope - pos_);
     }
 
     // Subsequent scalar decode steps use RoPE position (pos + rope_delta_)!
@@ -5491,7 +5581,7 @@ int Qwen38Model::forward_greedy(int token, StepStats* stats) {
 }
 
 void Qwen38Model::flush_pending_mtp() {
-    if (!pending_sync_) return;
+    if (!pending_sync_ && !(dflash_loaded_ && df_pending_commit_ > 0)) return;
     if (dflash_loaded_) {
         @autoreleasepool {
             id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)ctx_.queue() commandBuffer];
@@ -5799,7 +5889,7 @@ void Qwen38Model::forward_mtp_tree_impl(int anchor_token, Sampler* sampler, std:
     const int tree_mode = std::getenv("MTP_TREE") ? std::atoi(std::getenv("MTP_TREE")) : 7;
     const bool is_greedy = (sampler == nullptr || sampler->is_greedy());
     const int pre_pos = pos_;
-    ensure_kv_capacity(pre_pos + 16);
+    ensure_kv_capacity(pre_pos + MAX_VERIFY);
 
     auto t0 = std::chrono::steady_clock::now();
     int* tid_ptr = reinterpret_cast<int*>([(id<MTLBuffer>)buf_token_ids_ contents]);
@@ -6570,6 +6660,13 @@ void Qwen38Model::forward_mtp_tree_impl(int anchor_token, Sampler* sampler, std:
     const uint32_t* cand_cnts = reinterpret_cast<const uint32_t*>([(id<MTLBuffer>)buf_verify_cnt_ contents]);
     const DraftDist* draft_dists = reinterpret_cast<const DraftDist*>([(id<MTLBuffer>)buf_draft_dists_ contents]);
 
+    auto is_eos_token = [&](int tok) -> bool {
+        for (int e : info_.eos_token_ids) {
+            if (tok == e) return true;
+        }
+        return false;
+    };
+
     uint32_t win_path[16];
     int win_len = 0;
     win_path[win_len++] = 0u;
@@ -6584,7 +6681,7 @@ void Qwen38Model::forward_mtp_tree_impl(int anchor_token, Sampler* sampler, std:
                 bonus_tok = static_cast<int>(preds[cur]);
             } else {
                 const float* row_lg = all_logits + static_cast<size_t>(cur) * vocab_size_;
-                const LogitCand* row_cands = all_cands + static_cast<size_t>(cur) * MAX_VERIFY_CANDS;
+                const LogitCand* row_cands = (v_margin > 0.0f) ? (all_cands + static_cast<size_t>(cur) * MAX_VERIFY_CANDS) : nullptr;
                 bonus_tok = sampler->sample_from_cands(row_cands, cand_cnts[cur], MAX_VERIFY_CANDS, row_lg, vocab_size_);
             }
             out_tokens.push_back(bonus_tok);
@@ -6601,6 +6698,12 @@ void Qwen38Model::forward_mtp_tree_impl(int anchor_token, Sampler* sampler, std:
                 if (ch_toks[b] == target_tok) { hit = b; break; }
             }
             if (hit >= 0) {
+                if (is_eos_token(target_tok)) {
+                    // Stop cleanly at mid-batch EOS: emit EOS as final uncommitted token (zero post-EOS state!)
+                    bonus_tok = target_tok;
+                    out_tokens.push_back(bonus_tok);
+                    break;
+                }
                 int nxt = children[cur][hit];
                 out_tokens.push_back(target_tok);
                 win_path[win_len++] = static_cast<uint32_t>(nxt);
@@ -6613,7 +6716,7 @@ void Qwen38Model::forward_mtp_tree_impl(int anchor_token, Sampler* sampler, std:
             }
         } else {
             const float* row_lg = all_logits + static_cast<size_t>(cur) * vocab_size_;
-            const LogitCand* row_cands = all_cands + static_cast<size_t>(cur) * MAX_VERIFY_CANDS;
+            const LogitCand* row_cands = (v_margin > 0.0f) ? (all_cands + static_cast<size_t>(cur) * MAX_VERIFY_CANDS) : nullptr;
             const DraftDist* dd0 = (prefilled[children[cur][0]] == 0) ? &draft_dists[cur] : nullptr;
             int chosen_b = -1;
             int tok = sampler->verify_tree_node_dist(
@@ -6621,6 +6724,12 @@ void Qwen38Model::forward_mtp_tree_impl(int anchor_token, Sampler* sampler, std:
                 ch_toks, nc, dd0, chosen_b
             );
             if (chosen_b >= 0) {
+                if (is_eos_token(ch_toks[chosen_b])) {
+                    bonus_tok = ch_toks[chosen_b];
+                    out_tokens.push_back(bonus_tok);
+                    sampler->observe(bonus_tok);
+                    break;
+                }
                 int nxt = children[cur][chosen_b];
                 out_tokens.push_back(ch_toks[chosen_b]);
                 sampler->observe(ch_toks[chosen_b]);
@@ -7021,6 +7130,28 @@ void Qwen38Model::forward_dflash_impl(int anchor_token, Sampler* sampler, std::v
     }
 
     @autoreleasepool {
+        const int saved_rec_slot = rec_slot_;
+        const int saved_pending_replay_m = pending_replay_m_;
+        const int saved_df_pending_commit = df_pending_commit_;
+        const int saved_df_kv_len = df_kv_len_;
+        std::vector<int> saved_quest_pages;
+        if (sparse_kv_budget_ > 0) {
+            saved_quest_pages.resize(static_cast<size_t>(num_layers_));
+            for (int i = 0; i < num_layers_; ++i) saved_quest_pages[static_cast<size_t>(i)] = states_[i].quest_built_pages;
+        }
+        auto restore_verify_state = [&]() {
+            rec_slot_ = saved_rec_slot;
+            pending_replay_m_ = saved_pending_replay_m;
+            if (!saved_quest_pages.empty()) {
+                for (int i = 0; i < num_layers_; ++i) states_[i].quest_built_pages = saved_quest_pages[static_cast<size_t>(i)];
+            }
+        };
+        auto restore_all_state = [&]() {
+            restore_verify_state();
+            df_pending_commit_ = saved_df_pending_commit;
+            df_kv_len_ = saved_df_kv_len;
+        };
+
         if (used_pld) {
             // Single-CB PLD Verify: [anchor_token, draft[0..K-1]] verified linearly (100% greedy-exact!).
             int* tid_ptr = reinterpret_cast<int*>([(id<MTLBuffer>)buf_token_ids_ contents]);
@@ -7040,6 +7171,7 @@ void Qwen38Model::forward_dflash_impl(int anchor_token, Sampler* sampler, std::v
             [cb commit];
             [cb waitUntilCompleted];
             if (cb.error) {
+                restore_all_state();
                 throw std::runtime_error(std::string("Metal DFlash-PLD verify CB error: ") +
                                          [[cb.error localizedDescription] UTF8String]);
             }
@@ -7057,19 +7189,21 @@ void Qwen38Model::forward_dflash_impl(int anchor_token, Sampler* sampler, std::v
             [enc1 endEncoding];
             [cb1 commit];
 
-            // 100%-hit speculative CB #2 pre-encoding on CPU WHILE GPU executes CB #1 (hides ~0.65 ms CPU encode for free!)
-            const int saved_rec_slot = rec_slot_;
-            const int saved_pending_replay_m = pending_replay_m_;
-            id<MTLCommandBuffer> cb2 = [(id<MTLCommandQueue>)ctx_.queue() commandBuffer];
-            id<MTLComputeCommandEncoder> enc2 = [cb2 computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
-            encode_chunk(enc2, B, pre_pos, true, is_greedy, true, true, v_margin, /*use_tree_buf=*/false,
-                         /*df_cap_src_row=*/0, /*df_cap_n_rows=*/B);
-            [enc2 endEncoding];
+            // 100%-hit speculative CB #2 pre-encoding on CPU WHILE GPU executes CB #1 (disabled when Quest
+            // sparse KV is active so quest_built_pages state is only mutated once CB #1 completes cleanly).
+            const bool allow_pre_cb2 = (sparse_kv_budget_ == 0);
+            id<MTLCommandBuffer> cb2 = nil;
+            if (allow_pre_cb2) {
+                cb2 = [(id<MTLCommandQueue>)ctx_.queue() commandBuffer];
+                id<MTLComputeCommandEncoder> enc2 = [cb2 computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+                encode_chunk(enc2, B, pre_pos, true, is_greedy, true, true, v_margin, /*use_tree_buf=*/false,
+                             /*df_cap_src_row=*/0, /*df_cap_n_rows=*/B);
+                [enc2 endEncoding];
+            }
 
             [cb1 waitUntilCompleted];
             if (cb1.error) {
-                rec_slot_ = saved_rec_slot;
-                pending_replay_m_ = saved_pending_replay_m;
+                restore_all_state();
                 throw std::runtime_error(std::string("Metal DFlash draft CB error: ") +
                                          [[cb1.error localizedDescription] UTF8String]);
             }
@@ -7089,14 +7223,23 @@ void Qwen38Model::forward_dflash_impl(int anchor_token, Sampler* sampler, std::v
             }
             sel_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - ts0).count();
 
-            // Write [anchor_token, draft[0..K-1]] into shared buf_token_ids_ BEFORE committing pre-encoded CB #2!
+            // Write [anchor_token, draft[0..K-1]] into shared buf_token_ids_ BEFORE committing CB #2!
             int* tid_ptr = reinterpret_cast<int*>([(id<MTLBuffer>)buf_token_ids_ contents]);
             tid_ptr[0] = anchor_token;
             for (int d = 0; d < K; ++d) tid_ptr[d + 1] = draft[d];
 
+            if (!allow_pre_cb2) {
+                cb2 = [(id<MTLCommandQueue>)ctx_.queue() commandBuffer];
+                id<MTLComputeCommandEncoder> enc2 = [cb2 computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+                encode_chunk(enc2, B, pre_pos, true, is_greedy, true, true, v_margin, /*use_tree_buf=*/false,
+                             /*df_cap_src_row=*/0, /*df_cap_n_rows=*/B);
+                [enc2 endEncoding];
+            }
+
             [cb2 commit];
             [cb2 waitUntilCompleted];
             if (cb2.error) {
+                restore_verify_state();
                 throw std::runtime_error(std::string("Metal DFlash verify CB error: ") +
                                          [[cb2.error localizedDescription] UTF8String]);
             }
@@ -7104,48 +7247,72 @@ void Qwen38Model::forward_dflash_impl(int anchor_token, Sampler* sampler, std::v
         }
     }
 
+    auto is_eos_token = [&](int tok) -> bool {
+        for (int e : info_.eos_token_ids) {
+            if (tok == e) return true;
+        }
+        return false;
+    };
+
     // Exact Verification (Greedy = 100% token-for-token exact AR; Sampled = exact Leviathan rejection sampling!)
     int accepted = 0;
     int bonus_tok = 0;
     if (is_greedy) {
         const uint32_t* preds = reinterpret_cast<const uint32_t*>([(id<MTLBuffer>)buf_mtp_argmax_ contents]);
+        bool hit_eos = false;
         for (int d = 0; d < K; ++d) {
             if (static_cast<int>(preds[d]) == draft[d]) {
+                if (is_eos_token(draft[d])) {
+                    // Stop cleanly at mid-batch EOS without committing post-EOS tokens into KV/GDN/DFlash!
+                    bonus_tok = draft[d];
+                    out_tokens.push_back(bonus_tok);
+                    hit_eos = true;
+                    break;
+                }
                 out_tokens.push_back(draft[d]);
                 ++accepted;
             } else {
                 break;
             }
         }
-        bonus_tok = static_cast<int>(preds[accepted]);
-        out_tokens.push_back(bonus_tok);
+        if (!hit_eos) {
+            bonus_tok = static_cast<int>(preds[accepted]);
+            out_tokens.push_back(bonus_tok);
+        }
     } else {
         const float* all_logits    = reinterpret_cast<const float*>([(id<MTLBuffer>)buf_mtp_logits_ contents]);
         const LogitCand* all_cands = reinterpret_cast<const LogitCand*>([(id<MTLBuffer>)buf_verify_cands_ contents]);
         const uint32_t* cand_cnts  = reinterpret_cast<const uint32_t*>([(id<MTLBuffer>)buf_verify_cnt_ contents]);
-        bool rejected = false;
+        bool stopped = false;
         for (int d = 0; d < K; ++d) {
             const float* row_lg        = all_logits + static_cast<size_t>(d) * vocab_size_;
-            const LogitCand* row_cands = all_cands + static_cast<size_t>(d) * MAX_VERIFY_CANDS;
+            const LogitCand* row_cands = (v_margin > 0.0f) ? (all_cands + static_cast<size_t>(d) * MAX_VERIFY_CANDS) : nullptr;
             const DraftDist* dd        = use_sampled_q ? &df_dists[d] : nullptr;
             bool ok = false;
             int tok = sampler->sample_or_accept_draft_dist(
                 row_cands, cand_cnts[d], MAX_VERIFY_CANDS, row_lg, vocab_size_, draft[d], dd, ok
             );
             if (ok) {
+                if (is_eos_token(draft[d])) {
+                    bonus_tok = draft[d];
+                    out_tokens.push_back(bonus_tok);
+                    sampler->observe(bonus_tok);
+                    stopped = true;
+                    break;
+                }
                 out_tokens.push_back(draft[d]);
                 sampler->observe(draft[d]);
                 ++accepted;
             } else {
                 bonus_tok = tok;
                 out_tokens.push_back(bonus_tok);
-                rejected = true;
+                stopped = true;
                 break;
             }
         }
-        if (!rejected) {
+        if (!stopped) {
             const float* last_lg        = all_logits + static_cast<size_t>(K) * vocab_size_;
-            const LogitCand* last_cands = all_cands + static_cast<size_t>(K) * MAX_VERIFY_CANDS;
+            const LogitCand* last_cands = (v_margin > 0.0f) ? (all_cands + static_cast<size_t>(K) * MAX_VERIFY_CANDS) : nullptr;
             bonus_tok = sampler->sample_from_cands(last_cands, cand_cnts[K], MAX_VERIFY_CANDS, last_lg, vocab_size_);
             out_tokens.push_back(bonus_tok);
         }
@@ -7289,17 +7456,34 @@ void Qwen38Model::forward_mtp_greedy(int anchor_token, std::vector<int>& out_tok
     for (int d = 0; d < K; ++d) draft[d] = tid_ptr[d + 1];
     const uint32_t* preds = reinterpret_cast<const uint32_t*>([(id<MTLBuffer>)buf_mtp_argmax_ contents]);
 
+    auto is_eos_token = [&](int tok) -> bool {
+        for (int e : info_.eos_token_ids) {
+            if (tok == e) return true;
+        }
+        return false;
+    };
+
     int accepted = 0;
+    int bonus_tok = 0;
+    bool hit_eos = false;
     for (int d = 0; d < K; ++d) {
         if (static_cast<int>(preds[d]) == draft[d]) {
+            if (is_eos_token(draft[d])) {
+                bonus_tok = draft[d];
+                out_tokens.push_back(bonus_tok);
+                hit_eos = true;
+                break;
+            }
             out_tokens.push_back(draft[d]);
             ++accepted;
         } else {
             break;
         }
     }
-    int bonus_tok = static_cast<int>(preds[accepted]);
-    out_tokens.push_back(bonus_tok);
+    if (!hit_eos) {
+        bonus_tok = static_cast<int>(preds[accepted]);
+        out_tokens.push_back(bonus_tok);
+    }
 
     // Frequency-aware adaptive widening (32k -> 64k -> 152k -> 248k) on sustained out-of-tier bonus tokens
     add_draft_token(bonus_tok);
@@ -7464,31 +7648,45 @@ void Qwen38Model::forward_mtp_sampled(int anchor_token, Sampler& sampler, std::v
     const uint32_t* cand_cnts = reinterpret_cast<const uint32_t*>([(id<MTLBuffer>)buf_verify_cnt_ contents]);
     const DraftDist* draft_dists = reinterpret_cast<const DraftDist*>([(id<MTLBuffer>)buf_draft_dists_ contents]);
 
+    auto is_eos_token = [&](int tok) -> bool {
+        for (int e : info_.eos_token_ids) {
+            if (tok == e) return true;
+        }
+        return false;
+    };
+
     int accepted = 0;
     int bonus_tok = 0;
-    bool rejected = false;
+    bool stopped = false;
     for (int d = 0; d < K; ++d) {
         const float* row_lg = all_logits + static_cast<size_t>(d) * vocab_size_;
-        const LogitCand* row_cands = all_cands + static_cast<size_t>(d) * MAX_VERIFY_CANDS;
+        const LogitCand* row_cands = (v_margin > 0.0f) ? (all_cands + static_cast<size_t>(d) * MAX_VERIFY_CANDS) : nullptr;
         const DraftDist* dd = draft_has_q[d] ? &draft_dists[d] : nullptr;
         bool ok = false;
         int tok = sampler.sample_or_accept_draft_dist(
             row_cands, cand_cnts[d], MAX_VERIFY_CANDS, row_lg, vocab_size_, draft[d], dd, ok
         );
         if (ok) {
+            if (is_eos_token(draft[d])) {
+                bonus_tok = draft[d];
+                out_tokens.push_back(bonus_tok);
+                sampler.observe(bonus_tok);
+                stopped = true;
+                break;
+            }
             out_tokens.push_back(draft[d]);
             sampler.observe(draft[d]);
             ++accepted;
         } else {
             bonus_tok = tok;
             out_tokens.push_back(bonus_tok);
-            rejected = true;
+            stopped = true;
             break;
         }
     }
-    if (!rejected) {
+    if (!stopped) {
         const float* last_lg = all_logits + static_cast<size_t>(K) * vocab_size_;
-        const LogitCand* last_cands = all_cands + static_cast<size_t>(K) * MAX_VERIFY_CANDS;
+        const LogitCand* last_cands = (v_margin > 0.0f) ? (all_cands + static_cast<size_t>(K) * MAX_VERIFY_CANDS) : nullptr;
         bonus_tok = sampler.sample_from_cands(last_cands, cand_cnts[K], MAX_VERIFY_CANDS, last_lg, vocab_size_);
         out_tokens.push_back(bonus_tok);
     }
@@ -7529,9 +7727,9 @@ void Qwen38Model::forward_mtp_sampled(int anchor_token, Sampler& sampler, std::v
 
 bool Qwen38Model::save_state_to_file(const std::string& path, const std::vector<int>& tokens,
                                      const std::vector<uint64_t>& image_hashes) {
-    if (pending_sync_) flush_pending_mtp();
+    if (pending_sync_ || (dflash_loaded_ && df_pending_commit_ > 0)) flush_pending_mtp();
     if (pos_ <= 0 || static_cast<int>(tokens.size()) != pos_) return false;
-    if (save_thread_.joinable()) save_thread_.join();
+    wait_pending_save();
 
     size_t cs_bytes = 3ull * lin_conv_dim_ * sizeof(float);
     size_t ss_bytes = static_cast<size_t>(lin_num_v_heads_) * lin_head_v_dim_ * lin_head_k_dim_ * sizeof(uint16_t);
@@ -7610,8 +7808,9 @@ bool Qwen38Model::save_state_to_file(const std::string& path, const std::vector<
         [blit endEncoding];
         [cb commit];
         [cb waitUntilCompleted];
-
-        // Round 11 + 32: Async background disk serialization (MICACHE2 when multimodal, MICACHE1 for pure text!)
+        if (cb.error) {
+            return false;
+        }
         const bool is_v2 = (!image_hashes.empty() || rope_delta_ != 0);
         PrefixCacheHeader hdr{};
         std::memcpy(hdr.magic, is_v2 ? "MICACHE2" : "MICACHE1", 8);
@@ -7683,12 +7882,11 @@ void Qwen38Model::keep_warm() {
 
 bool Qwen38Model::load_state_from_file(const std::string& path, std::vector<int>& out_tokens,
                                        std::vector<uint64_t>& out_image_hashes) {
-    out_image_hashes.clear();
-    if (save_thread_.joinable()) save_thread_.join();
+    wait_pending_save();
     int fd = ::open(path.c_str(), O_RDONLY);
     if (fd < 0) return false;
     struct stat st{};
-    if (::fstat(fd, &st) != 0 || static_cast<size_t>(st.st_size) < sizeof(PrefixCacheHeader)) {
+    if (::fstat(fd, &st) != 0 || st.st_size < static_cast<off_t>(sizeof(PrefixCacheHeader))) {
         ::close(fd);
         return false;
     }
@@ -7699,91 +7897,88 @@ bool Qwen38Model::load_state_from_file(const std::string& path, std::vector<int>
     ::close(fd);
     if (mapped == MAP_FAILED) return false;
 
-    auto unmap_guard = [&]() { ::munmap(mapped, file_size); };
+    struct MmapGuard {
+        void* ptr = nullptr;
+        size_t len = 0;
+        ~MmapGuard() {
+            if (ptr && ptr != MAP_FAILED) ::munmap(ptr, len);
+        }
+    } map_guard{mapped, file_size};
 
     const uint8_t* base = reinterpret_cast<const uint8_t*>(mapped);
     PrefixCacheHeader hdr{};
     std::memcpy(&hdr, base, sizeof(hdr));
-    bool is_v1 = (std::memcmp(hdr.magic, "MICACHE1", 8) == 0);
-    bool is_v2 = (std::memcmp(hdr.magic, "MICACHE2", 8) == 0);
+    const bool is_v1 = (std::memcmp(hdr.magic, "MICACHE1", 8) == 0);
+    const bool is_v2 = (std::memcmp(hdr.magic, "MICACHE2", 8) == 0);
     if ((!is_v1 && !is_v2) ||
         hdr.model_hash != compute_model_hash(info_) ||
-        static_cast<int>(hdr.pos) > max_seq_len_) {
-        unmap_guard();
+        hdr.pos < 1u ||
+        hdr.pos > static_cast<uint32_t>(max_seq_len_)) {
         return false;
     }
 
     const size_t tok_bytes = static_cast<size_t>(hdr.pos) * sizeof(int);
-    size_t cursor = sizeof(PrefixCacheHeader) + tok_bytes;
-    if (cursor > file_size) {
-        unmap_guard();
+    if (tok_bytes > file_size - sizeof(PrefixCacheHeader)) {
         return false;
     }
+    size_t cursor = sizeof(PrefixCacheHeader) + tok_bytes;
 
     int loaded_rope_delta = 0;
+    size_t img_off = 0;
+    size_t img_count = 0;
     if (is_v2) {
-        if (cursor + sizeof(MultimodalCacheMeta) > file_size) {
-            unmap_guard();
+        if (sizeof(MultimodalCacheMeta) > file_size - cursor) {
             return false;
         }
         MultimodalCacheMeta meta{};
         std::memcpy(&meta, base + cursor, sizeof(meta));
         cursor += sizeof(meta);
-        size_t img_bytes = static_cast<size_t>(meta.num_images) * sizeof(uint64_t);
-        if (cursor + img_bytes > file_size) {
-            unmap_guard();
+        if (static_cast<size_t>(meta.num_images) > (file_size - cursor) / sizeof(uint64_t)) {
             return false;
         }
-        out_image_hashes.resize(meta.num_images);
-        if (img_bytes > 0) {
-            std::memcpy(out_image_hashes.data(), base + cursor, img_bytes);
-        }
-        cursor += img_bytes;
+        img_off = cursor;
+        img_count = static_cast<size_t>(meta.num_images);
+        cursor += img_count * sizeof(uint64_t);
         loaded_rope_delta = meta.rope_delta;
     }
 
     const size_t data_off = cursor;
-    if (data_off + hdr.state_bytes > file_size) {
-        unmap_guard();
+    if (hdr.state_bytes > file_size - data_off) {
         return false;
     }
 
-    out_tokens.resize(hdr.pos);
-    std::memcpy(out_tokens.data(), base + sizeof(PrefixCacheHeader), tok_bytes);
-
-    // Round 33: Ensure lazy KV buffers can hold restored hdr.pos!
-    ensure_kv_capacity(static_cast<int>(hdr.pos));
-
-    size_t cs_bytes = 3ull * lin_conv_dim_ * sizeof(float);
-    size_t ss_bytes = static_cast<size_t>(lin_num_v_heads_) * lin_head_v_dim_ * lin_head_k_dim_ * sizeof(uint16_t);
-    size_t elem_div = (kv_bits_ == 16) ? 1ull : ((kv_bits_ == 8) ? 2ull : 4ull);
-    size_t kv_active = (static_cast<size_t>(hdr.pos) * num_kv_heads_ * head_dim_ * sizeof(uint16_t)) / elem_div;
-    size_t sb_active = (kv_bits_ < 16)
+    // Validate full payload layout & sizes BEFORE mutating out_tokens / out_image_hashes / GPU KV capacity!
+    const size_t cs_bytes = 3ull * lin_conv_dim_ * sizeof(float);
+    const size_t ss_bytes = static_cast<size_t>(lin_num_v_heads_) * lin_head_v_dim_ * lin_head_k_dim_ * sizeof(uint16_t);
+    const size_t elem_div = (kv_bits_ == 16) ? 1ull : ((kv_bits_ == 8) ? 2ull : 4ull);
+    const size_t kv_active = (static_cast<size_t>(hdr.pos) * num_kv_heads_ * head_dim_ * sizeof(uint16_t)) / elem_div;
+    const size_t sb_active = (kv_bits_ < 16)
         ? (static_cast<size_t>(hdr.pos) * num_kv_heads_ * (head_dim_ / 64) * 2 * sizeof(uint16_t))
         : 0;
-    bool has_mtp_payload = (hdr.reserved & 0x80000000u) != 0u;
-    bool has_df_payload  = (!has_mtp_payload) && ((hdr.reserved & 0x40000000u) != 0u);
-    bool mtp_is_q        = (hdr.reserved & 0x40000000u) != 0u;
-    bool mtp_is_q4       = (hdr.reserved & 0x20000000u) != 0u;
-    uint32_t saved_mtp_pos = hdr.reserved & 0x1FFFFFFFu;
-    int saved_mtp_bits   = mtp_is_q ? (mtp_is_q4 ? 4 : 8) : 16;
+    const bool has_mtp_payload = (hdr.reserved & 0x80000000u) != 0u;
+    const bool has_df_payload  = (!has_mtp_payload) && ((hdr.reserved & 0x40000000u) != 0u);
+    const bool mtp_is_q        = (hdr.reserved & 0x40000000u) != 0u;
+    const bool mtp_is_q4       = (hdr.reserved & 0x20000000u) != 0u;
+    const uint32_t saved_mtp_pos = hdr.reserved & 0x1FFFFFFFu;
+    const int saved_mtp_bits   = mtp_is_q ? (mtp_is_q4 ? 4 : 8) : 16;
+    if ((has_mtp_payload || has_df_payload) && saved_mtp_pos > static_cast<uint32_t>(max_seq_len_)) {
+        return false;
+    }
     if (has_mtp_payload && mtp_loaded_ && (saved_mtp_bits != mtp_kv_bits_)) {
-        unmap_guard();
         return false;
     }
-    if (dflash_loaded_ && !has_df_payload) {
-        unmap_guard();
+    if (dflash_loaded_ != has_df_payload) {
         return false;
     }
-    size_t mtp_elem_div = (saved_mtp_bits == 16) ? 1ull : ((saved_mtp_bits == 8) ? 2ull : 4ull);
-    size_t mtp_kv_active = has_mtp_payload
+    const size_t mtp_elem_div = (saved_mtp_bits == 16) ? 1ull : ((saved_mtp_bits == 8) ? 2ull : 4ull);
+    const size_t mtp_kv_active = has_mtp_payload
         ? ((static_cast<size_t>(saved_mtp_pos) * num_kv_heads_ * head_dim_ * sizeof(uint16_t)) / mtp_elem_div)
         : 0;
-    size_t mtp_sb_active = (has_mtp_payload && mtp_is_q)
+    const size_t mtp_sb_active = (has_mtp_payload && mtp_is_q)
         ? (static_cast<size_t>(saved_mtp_pos) * num_kv_heads_ * (head_dim_ / 64) * 2 * sizeof(uint16_t))
         : 0;
-    size_t mtp_hid_bytes = has_mtp_payload ? (static_cast<size_t>(hidden_size_) * sizeof(float)) : 0;
-    size_t df_ring_sz = (has_df_payload && dflash_loaded_)
+    const size_t mtp_hid_bytes = has_mtp_payload ? (static_cast<size_t>(hidden_size_) * sizeof(float)) : 0;
+    const size_t df_ring_sz = (has_df_payload && dflash_loaded_)
         ? (static_cast<size_t>(dflash_->config().num_kv_heads) * dflash_->config().sliding_window * dflash_->config().head_dim * sizeof(uint16_t))
         : 0;
     size_t expected_state = 0;
@@ -7793,9 +7988,15 @@ bool Qwen38Model::load_state_from_file(const std::string& path, std::vector<int>
     if (has_mtp_payload) expected_state += 2 * mtp_kv_active + 2 * mtp_sb_active + mtp_hid_bytes;
     if (has_df_payload && dflash_loaded_) expected_state += static_cast<size_t>(dflash_->config().num_layers) * 2 * df_ring_sz;
     if (expected_state != hdr.state_bytes) {
-        unmap_guard();
         return false;
     }
+
+    // Round 33: Ensure lazy KV buffers can hold restored hdr.pos (and saved_mtp_pos if MTP loaded)!
+    const int need_cap = std::max<int>(
+        static_cast<int>(hdr.pos),
+        (has_mtp_payload && mtp_loaded_) ? static_cast<int>(saved_mtp_pos) : 0
+    );
+    ensure_kv_capacity(need_cap);
 
     @autoreleasepool {
         // Zero-copy mmap -> MTLBuffer (eliminates 750 MB CPU memcpy on prefix cache restore!)
@@ -7859,8 +8060,17 @@ bool Qwen38Model::load_state_from_file(const std::string& path, std::vector<int>
         [blit endEncoding];
         [cb commit];
         [cb waitUntilCompleted];
+        if (cb.error) {
+            return false;
+        }
     }
-    unmap_guard();
+
+    out_tokens.resize(hdr.pos);
+    std::memcpy(out_tokens.data(), base + sizeof(PrefixCacheHeader), tok_bytes);
+    out_image_hashes.resize(img_count);
+    if (img_count > 0) {
+        std::memcpy(out_image_hashes.data(), base + img_off, img_count * sizeof(uint64_t));
+    }
 
     pos_ = static_cast<int>(hdr.pos);
     rope_delta_ = loaded_rope_delta;
@@ -7874,6 +8084,13 @@ bool Qwen38Model::load_state_from_file(const std::string& path, std::vector<int>
     df_pending_commit_ = 0;
     df_pending_pos_ = 0;
     pending_sync_ = false;
+    pending_replay_m_ = 0;
+    pending_path_noncontig_ = false;
+    pending_path_len_ = 0;
+    rec_slot_ = 0;
+    cur_tree_ = TreeParams{};
+    last_t7_m_ = 0;
+    last_t7_tree_ = false;
     token_history_.clear();
     suffix_cache_.begin_turn();
     reset_draft_row_map();

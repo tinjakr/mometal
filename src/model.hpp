@@ -112,6 +112,9 @@ public:
         return load_state_from_file(path, out_tokens);
     }
 
+    // Wait for any asynchronous background state save to finish before scanning/reusing cache_dir
+    virtual void wait_pending_save() {}
+
     // Lightweight non-mutating GPU + ANE keep-warm ping (prevents macOS idle clock/power sleep between turns)
     virtual void keep_warm() {}
 

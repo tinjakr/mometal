@@ -68,16 +68,18 @@ public:
     // Load a model directory (reads model.safetensors.index.json if present, else all *.safetensors).
     // Parallelizes multi-shard mmap + Metal mapping; skips tensors matching any skip_prefix.
     void load_dir(id device, const std::string& dir, const std::vector<std::string>& skip_prefixes = {},
-                  bool prefetch_now = true, bool allow_unaligned_q4 = false);
+                  bool prefetch_now = true, bool allow_unaligned_q4 = false,
+                  bool allow_unaligned_bf16 = false);
 
     // Load ONLY tensors matching at least one include_prefix (zero mmap/wiring of non-matching shards/tensors).
     void load_dir_only(id device, const std::string& dir, const std::vector<std::string>& include_prefixes,
-                       bool prefetch_now = true, bool allow_unaligned_q4 = false);
+                       bool prefetch_now = true, bool allow_unaligned_q4 = false,
+                       bool allow_unaligned_bf16 = false);
 
     // Load a single .safetensors file (e.g., mtp.safetensors)
     void load_file(id device, const std::string& path, const std::string& key_prefix = "",
                    bool prefetch_now = true, const std::vector<std::string>& skip_prefixes = {},
-                   bool allow_unaligned_q4 = false);
+                   bool allow_unaligned_q4 = false, bool allow_unaligned_bf16 = false);
 
     bool has(const std::string& name) const;
     const TensorView& get(const std::string& name) const;
@@ -128,7 +130,7 @@ private:
         size_t size = 0;
     };
     std::vector<RawMap> maps_;
-    const uint32_t* w_ptr_ = nullptr;
+    const uint8_t*  w_ptr_ = nullptr;
     const uint8_t*  s_ptr_ = nullptr;
     const uint8_t*  b_ptr_ = nullptr;
     DType s_dtype_ = DType::BF16;

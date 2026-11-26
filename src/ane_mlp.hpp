@@ -59,6 +59,7 @@ public:
     void submit_slot(int layer, int slot, int n_subs);
     bool is_slot_done(int slot) const;
     void wait_slot(int slot);
+    void drain_all_slots() noexcept;
 
     // Convenience wrappers operating on the most recently submitted slot
     void submit(int layer, int slot, int n_subs);
@@ -118,6 +119,7 @@ private:
 
     IoSurfaceBinding create_iosurface_io(int rows, int cols);
     void destroy_iosurface_io(IoSurfaceBinding& b);
+    void cleanup_iosurfaces() noexcept;
     void run_warmup_4deep();
 };
 

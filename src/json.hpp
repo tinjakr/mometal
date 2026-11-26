@@ -1,6 +1,9 @@
 #pragma once
 
+#include <algorithm>
 #include <cctype>
+#include <cerrno>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -48,7 +51,10 @@ struct Json {
     }
     int64_t as_int(int64_t def = 0) const {
         if (auto* p = std::get_if<int64_t>(&val)) return *p;
-        if (auto* p = std::get_if<double>(&val)) return static_cast<int64_t>(*p);
+        if (auto* p = std::get_if<double>(&val)) {
+            if (!std::isfinite(*p) || *p < -9223372036854775808.0 || *p >= 9223372036854775808.0) return def;
+            return static_cast<int64_t>(*p);
+        }
         return def;
     }
     double as_double(double def = 0.0) const {
@@ -124,8 +130,10 @@ struct Json {
         if (is_bool()) return as_bool() ? "true" : "false";
         if (is_int()) return std::to_string(as_int());
         if (is_double()) {
+            double d = as_double();
+            if (!std::isfinite(d)) return "null";
             char buf[64];
-            std::snprintf(buf, sizeof(buf), "%.17g", as_double());
+            std::snprintf(buf, sizeof(buf), "%.17g", d);
             return buf;
         }
         if (is_string()) return escape_string(as_string());
@@ -141,13 +149,15 @@ struct Json {
         }
         std::string out = "{";
         const auto& o = as_object();
-        bool first = true;
-        for (const auto& [k, v] : o) {
-            if (!first) out.push_back(',');
-            first = false;
-            out += escape_string(k);
+        std::vector<const std::string*> keys;
+        keys.reserve(o.size());
+        for (const auto& [k, _] : o) keys.push_back(&k);
+        std::sort(keys.begin(), keys.end(), [](const std::string* a, const std::string* b) { return *a < *b; });
+        for (size_t i = 0; i < keys.size(); ++i) {
+            if (i) out.push_back(',');
+            out += escape_string(*keys[i]);
             out.push_back(':');
-            out += v.dump();
+            out += o.at(*keys[i]).dump();
         }
         out.push_back('}');
         return out;
@@ -156,11 +166,15 @@ struct Json {
 
 class JsonParser {
 public:
+    static constexpr int MAX_DEPTH = 128;
+
     explicit JsonParser(std::string_view src) : data_(src.data()), end_(src.data() + src.size()), p_(src.data()) {}
 
     Json parse() {
         skip_ws();
         Json r = parse_value();
+        skip_ws();
+        if (p_ != end_) throw std::runtime_error("JSON: trailing characters after value");
         return r;
     }
 
@@ -168,6 +182,15 @@ private:
     const char* data_;
     const char* end_;
     const char* p_;
+    int depth_ = 0;
+
+    struct DepthGuard {
+        int& depth;
+        explicit DepthGuard(int& d) : depth(d) {
+            if (++depth > MAX_DEPTH) throw std::runtime_error("JSON: maximum nesting depth exceeded");
+        }
+        ~DepthGuard() { --depth; }
+    };
 
     void skip_ws() {
         while (p_ < end_ && (*p_ == ' ' || *p_ == '\t' || *p_ == '\n' || *p_ == '\r')) ++p_;
@@ -233,12 +256,23 @@ private:
                     case 't': out.push_back('\t'); break;
                     case 'u': {
                         uint32_t cp = parse_hex4();
-                        if (cp >= 0xD800 && cp <= 0xDBFF && end_ - p_ >= 6 && p_[0] == '\\' && p_[1] == 'u') {
-                            p_ += 2;
-                            uint32_t low = parse_hex4();
-                            if (low >= 0xDC00 && low <= 0xDFFF) {
-                                cp = 0x10000 + (((cp - 0xD800) << 10) | (low - 0xDC00));
+                        if (cp >= 0xD800 && cp <= 0xDBFF) {
+                            if (end_ - p_ >= 6 && p_[0] == '\\' && p_[1] == 'u') {
+                                const char* saved_p = p_;
+                                p_ += 2;
+                                uint32_t low = parse_hex4();
+                                if (low >= 0xDC00 && low <= 0xDFFF) {
+                                    cp = 0x10000 + (((cp - 0xD800) << 10) | (low - 0xDC00));
+                                } else {
+                                    // Lone high surrogate followed by non-low \uXXXX: rewind so next escape isn't dropped
+                                    p_ = saved_p;
+                                    cp = 0xFFFD;
+                                }
+                            } else {
+                                cp = 0xFFFD;
                             }
+                        } else if (cp >= 0xDC00 && cp <= 0xDFFF) {
+                            cp = 0xFFFD;
                         }
                         append_utf8(out, cp);
                         break;
@@ -259,24 +293,47 @@ private:
         const char* start = p_;
         bool is_float = false;
         if (p_ < end_ && *p_ == '-') ++p_;
-        while (p_ < end_ && *p_ >= '0' && *p_ <= '9') ++p_;
+        if (p_ >= end_ || *p_ < '0' || *p_ > '9') {
+            throw std::runtime_error("JSON: invalid number");
+        }
+        if (*p_ == '0') {
+            ++p_;
+            if (p_ < end_ && *p_ >= '0' && *p_ <= '9') {
+                throw std::runtime_error("JSON: leading zero in number");
+            }
+        } else {
+            while (p_ < end_ && *p_ >= '0' && *p_ <= '9') ++p_;
+        }
         if (p_ < end_ && *p_ == '.') {
             is_float = true;
             ++p_;
+            if (p_ >= end_ || *p_ < '0' || *p_ > '9') {
+                throw std::runtime_error("JSON: invalid fractional number");
+            }
             while (p_ < end_ && *p_ >= '0' && *p_ <= '9') ++p_;
         }
         if (p_ < end_ && (*p_ == 'e' || *p_ == 'E')) {
             is_float = true;
             ++p_;
             if (p_ < end_ && (*p_ == '+' || *p_ == '-')) ++p_;
+            if (p_ >= end_ || *p_ < '0' || *p_ > '9') {
+                throw std::runtime_error("JSON: invalid exponent in number");
+            }
             while (p_ < end_ && *p_ >= '0' && *p_ <= '9') ++p_;
         }
-        std::string tmp(start, p_ - start);
+        std::string tmp(start, static_cast<size_t>(p_ - start));
         if (is_float) return Json(std::strtod(tmp.c_str(), nullptr));
-        return Json(static_cast<int64_t>(std::strtoll(tmp.c_str(), nullptr, 10)));
+        errno = 0;
+        char* ep = nullptr;
+        long long v = std::strtoll(tmp.c_str(), &ep, 10);
+        if (errno == ERANGE || ep != tmp.c_str() + tmp.size()) {
+            return Json(std::strtod(tmp.c_str(), nullptr));
+        }
+        return Json(static_cast<int64_t>(v));
     }
 
     Json parse_array() {
+        DepthGuard guard(depth_);
         ++p_; // '['
         Json::Array arr;
         skip_ws();
@@ -293,6 +350,7 @@ private:
     }
 
     Json parse_object() {
+        DepthGuard guard(depth_);
         ++p_; // '{'
         Json::Object obj;
         skip_ws();
@@ -304,7 +362,7 @@ private:
             if (p_ >= end_ || *p_ != ':') throw std::runtime_error("JSON: expected ':'");
             ++p_;
             skip_ws();
-            obj.emplace(std::move(key), parse_value());
+            obj.insert_or_assign(std::move(key), parse_value());
             skip_ws();
             if (p_ < end_ && *p_ == ',') { ++p_; continue; }
             if (p_ < end_ && *p_ == '}') { ++p_; return Json(std::move(obj)); }

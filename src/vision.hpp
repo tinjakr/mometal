@@ -4,6 +4,7 @@
 #include "model.hpp"
 #include "safetensors.hpp"
 
+#include <atomic>
 #include <cstdint>
 #include <list>
 #include <memory>
@@ -33,7 +34,7 @@ public:
     QwenVisionTower& operator=(const QwenVisionTower&) = delete;
 
     bool ready() const { return ready_; }
-    bool loaded() const { return loaded_; }
+    bool loaded() const { return loaded_.load(std::memory_order_acquire); }
     int out_hidden_size() const { return out_hidden_size_; }
     int spatial_merge_size() const { return spatial_merge_size_; }
 
@@ -57,11 +58,12 @@ private:
 
     MetalContext& ctx_;
     bool ready_ = false;
-    bool loaded_ = false;
+    std::atomic<bool> loaded_{false};
     std::string model_dir_;
     std::string pfx_;
     SafetensorsStore own_store_;
     std::mutex load_mtx_;
+    std::mutex run_mtx_;
 
     int depth_ = 27;
     int hidden_size_ = 1152;
