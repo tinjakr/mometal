@@ -6,6 +6,22 @@ inline float bf16_to_f32(ushort bits) {
     return as_type<float>(uint(bits) << 16);
 }
 
+inline uint q4_load_u32(const device uchar* base, ulong word_idx) {
+    ulong b = ulong(base);
+    uint sh = uint(b & 3ul);
+    const device uint* p = (const device uint*)(b & ~3ul) + word_idx;
+    if (sh == 0u) return p[0];
+    uint s8 = sh << 3;
+    return (p[0] >> s8) | (p[1] << (32u - s8));
+}
+
+inline ushort q4_load_u16(const device uchar* base, ulong elem_idx) {
+    ulong b = ulong(base);
+    if ((b & 1ul) == 0ul) return ((const device ushort*)base)[elem_idx];
+    const device uchar* p = base + (elem_idx << 1);
+    return ushort(p[0]) | (ushort(p[1]) << 8);
+}
+
 inline float silu_f32(float x) {
     return x / (1.0f + exp(-x));
 }
@@ -2043,9 +2059,9 @@ kernel void qwen_mtp_concat_norm(
 
 // Round 19: Fused Q4 Embed + Dual Pre-FC RMSNorm -> FP16 [M, 2*D] for FP16-X mtp.fc!
 kernel void qwen_mtp_embed_concat_f16(
-    const device uint*   emb_W [[buffer(0)]],
-    const device ushort* emb_S [[buffer(1)]],
-    const device ushort* emb_B [[buffer(2)]],
+    const device uchar*  emb_W [[buffer(0)]],
+    const device uchar*  emb_S [[buffer(1)]],
+    const device uchar*  emb_B [[buffer(2)]],
     const device int*    ids   [[buffer(3)]],
     const device float*  hid   [[buffer(4)]],
     const device ushort* w_emb [[buffer(5)]],
@@ -2060,9 +2076,8 @@ kernel void qwen_mtp_embed_concat_f16(
     const uint tok = uint(ids[row]);
     const uint KW = p.D >> 3;
     const uint KG = p.D >> 6;
-    const device uint*   wr = emb_W + (ulong)tok * KW;
-    const device ushort* sr = emb_S + (ulong)tok * KG;
-    const device ushort* br = emb_B + (ulong)tok * KG;
+    const ulong w_base = (ulong)tok * KW;
+    const ulong s_base = (ulong)tok * KG;
     const device float*  hp = hid + (ulong)row * p.D;
     device half*         op = out + (ulong)row * (2u * p.D);
 
@@ -2075,10 +2090,10 @@ kernel void qwen_mtp_embed_concat_f16(
         #pragma clang loop unroll(full)
         for (uint k = 0; k < 20u; k++) {
             uint i = k * 256u + tid;
-            uint word = wr[i >> 3];
+            uint word = q4_load_u32(emb_W, w_base + (i >> 3));
             float q = float((word >> ((i & 7u) * 4u)) & 15u);
             uint g = i >> 6;
-            float ve = fma(q, bf16_to_f32(sr[g]), bf16_to_f32(br[g]));
+            float ve = fma(q, bf16_to_f32(q4_load_u16(emb_S, s_base + g)), bf16_to_f32(q4_load_u16(emb_B, s_base + g)));
             float vh = hp[i];
             ve_reg[k] = ve;
             vh_reg[k] = vh;
@@ -2108,10 +2123,10 @@ kernel void qwen_mtp_embed_concat_f16(
     } else {
         float sq_e = 0.0f, sq_h = 0.0f;
         for (uint i = tid; i < p.D; i += tg_size) {
-            uint word = wr[i >> 3];
+            uint word = q4_load_u32(emb_W, w_base + (i >> 3));
             float q = float((word >> ((i & 7u) * 4u)) & 15u);
             uint g = i >> 6;
-            float ve = fma(q, bf16_to_f32(sr[g]), bf16_to_f32(br[g]));
+            float ve = fma(q, bf16_to_f32(q4_load_u16(emb_S, s_base + g)), bf16_to_f32(q4_load_u16(emb_B, s_base + g)));
             float vh = hp[i];
             sq_e = fma(ve, ve, sq_e);
             sq_h = fma(vh, vh, sq_h);
@@ -2131,10 +2146,10 @@ kernel void qwen_mtp_embed_concat_f16(
         threadgroup_barrier(mem_flags::mem_threadgroup);
         float ire = se[0], irh = sh[0];
         for (uint i = tid; i < p.D; i += tg_size) {
-            uint word = wr[i >> 3];
+            uint word = q4_load_u32(emb_W, w_base + (i >> 3));
             float q = float((word >> ((i & 7u) * 4u)) & 15u);
             uint g = i >> 6;
-            float ve = fma(q, bf16_to_f32(sr[g]), bf16_to_f32(br[g]));
+            float ve = fma(q, bf16_to_f32(q4_load_u16(emb_S, s_base + g)), bf16_to_f32(q4_load_u16(emb_B, s_base + g)));
             op[i]       = half(ve * ire * bf16_to_f32(w_emb[i]));
             op[p.D + i] = half(hp[i] * irh * bf16_to_f32(w_hid[i]));
         }
@@ -5387,9 +5402,9 @@ struct MtpGatherParams {
 
 // Stage 3: Batched Q4 Embed + Dual Pre-FC RMSNorm gathering arbitrary tree parent hidden rows & token IDs -> FP16 [B, 2*D]
 kernel void qwen_mtp_embed_concat_gather_f16(
-    const device uint*   emb_W [[buffer(0)]],
-    const device ushort* emb_S [[buffer(1)]],
-    const device ushort* emb_B [[buffer(2)]],
+    const device uchar*  emb_W [[buffer(0)]],
+    const device uchar*  emb_S [[buffer(1)]],
+    const device uchar*  emb_B [[buffer(2)]],
     const device int*    ids   [[buffer(3)]],
     const device float*  hid   [[buffer(4)]],
     const device ushort* w_emb [[buffer(5)]],
@@ -5404,9 +5419,8 @@ kernel void qwen_mtp_embed_concat_gather_f16(
     const uint tok = uint(ids[p.in_tok_idx[row]]);
     const uint KW = p.D >> 3;
     const uint KG = p.D >> 6;
-    const device uint*   wr = emb_W + (ulong)tok * KW;
-    const device ushort* sr = emb_S + (ulong)tok * KG;
-    const device ushort* br = emb_B + (ulong)tok * KG;
+    const ulong w_base = (ulong)tok * KW;
+    const ulong s_base = (ulong)tok * KG;
     const device float*  hp = hid + (ulong)p.in_hid_idx[row] * p.D;
     device half*         op = out + (ulong)row * (2u * p.D);
 
@@ -5419,10 +5433,10 @@ kernel void qwen_mtp_embed_concat_gather_f16(
         #pragma clang loop unroll(full)
         for (uint k = 0; k < 20u; k++) {
             uint i = k * 256u + tid;
-            uint word = wr[i >> 3];
+            uint word = q4_load_u32(emb_W, w_base + (i >> 3));
             float q = float((word >> ((i & 7u) * 4u)) & 15u);
             uint g = i >> 6;
-            float ve = fma(q, bf16_to_f32(sr[g]), bf16_to_f32(br[g]));
+            float ve = fma(q, bf16_to_f32(q4_load_u16(emb_S, s_base + g)), bf16_to_f32(q4_load_u16(emb_B, s_base + g)));
             float vh = hp[i];
             ve_reg[k] = ve;
             vh_reg[k] = vh;
@@ -5452,10 +5466,10 @@ kernel void qwen_mtp_embed_concat_gather_f16(
     } else {
         float sq_e = 0.0f, sq_h = 0.0f;
         for (uint i = tid; i < p.D; i += tg_size) {
-            uint word = wr[i >> 3];
+            uint word = q4_load_u32(emb_W, w_base + (i >> 3));
             float q = float((word >> ((i & 7u) * 4u)) & 15u);
             uint g = i >> 6;
-            float ve = fma(q, bf16_to_f32(sr[g]), bf16_to_f32(br[g]));
+            float ve = fma(q, bf16_to_f32(q4_load_u16(emb_S, s_base + g)), bf16_to_f32(q4_load_u16(emb_B, s_base + g)));
             float vh = hp[i];
             sq_e = fma(ve, ve, sq_e);
             sq_h = fma(vh, vh, sq_h);
@@ -5475,10 +5489,10 @@ kernel void qwen_mtp_embed_concat_gather_f16(
         threadgroup_barrier(mem_flags::mem_threadgroup);
         float ire = se[0], irh = sh[0];
         for (uint i = tid; i < p.D; i += tg_size) {
-            uint word = wr[i >> 3];
+            uint word = q4_load_u32(emb_W, w_base + (i >> 3));
             float q = float((word >> ((i & 7u) * 4u)) & 15u);
             uint g = i >> 6;
-            float ve = fma(q, bf16_to_f32(sr[g]), bf16_to_f32(br[g]));
+            float ve = fma(q, bf16_to_f32(q4_load_u16(emb_S, s_base + g)), bf16_to_f32(q4_load_u16(emb_B, s_base + g)));
             op[i]       = half(ve * ire * bf16_to_f32(w_emb[i]));
             op[p.D + i] = half(hp[i] * irh * bf16_to_f32(w_hid[i]));
         }

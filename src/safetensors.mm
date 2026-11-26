@@ -46,10 +46,22 @@ bool matches_any_prefix(const std::string& key, const std::vector<std::string>& 
     return false;
 }
 
+bool is_unaligned_q4_key(const std::string& key, DType dt) {
+    auto ends_with = [](const std::string& s, const char* suf) {
+        size_t n = std::strlen(suf);
+        return s.size() >= n && s.compare(s.size() - n, n, suf) == 0;
+    };
+    if (ends_with(key, ".weight") && dt == DType::U32) return true;
+    if (ends_with(key, ".scales") && (dt == DType::BF16 || dt == DType::F16)) return true;
+    if (ends_with(key, ".biases") && (dt == DType::BF16 || dt == DType::F16)) return true;
+    return false;
+}
+
 ShardLoadResult load_shard_isolated(id device_id, const std::string& path, const std::string& key_prefix,
                                     bool prefetch_now,
                                     const std::vector<std::string>& skip_prefixes,
-                                    const std::vector<std::string>& include_prefixes) {
+                                    const std::vector<std::string>& include_prefixes,
+                                    bool allow_unaligned_q4) {
     ShardLoadResult out;
     id<MTLDevice> device = device_id;
     int fd = open(path.c_str(), O_RDONLY);
@@ -64,7 +76,8 @@ ShardLoadResult load_shard_isolated(id device_id, const std::string& path, const
     size_t page_size = static_cast<size_t>(getpagesize());
     size_t aligned_size = ((file_size + page_size - 1) / page_size) * page_size;
 
-    void* ptr = mmap(nullptr, aligned_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    void* ptr = mmap(nullptr, aligned_size, PROT_READ, MAP_SHARED, fd, 0);
+    if (ptr == MAP_FAILED) ptr = mmap(nullptr, aligned_size, PROT_READ, MAP_PRIVATE, fd, 0);
     close(fd);
     if (ptr == MAP_FAILED) {
         throw std::runtime_error("mmap failed for " + path);
@@ -177,7 +190,8 @@ ShardLoadResult load_shard_isolated(id device_id, const std::string& path, const
             tv.buffer = sr.mtl_buffer;
 
             size_t req_align = std::max<size_t>(4, dtype_size(tv.dtype));
-            if (tv.offset % req_align != 0) {
+            bool skip_copy = allow_unaligned_q4 && is_unaligned_q4_key(pt.full_key, tv.dtype);
+            if (!skip_copy && (tv.offset % req_align != 0)) {
                 id<MTLBuffer> copy_buf = [device newBufferWithBytes:tv.host_ptr
                                                              length:std::max<size_t>(tv.nbytes, 16)
                                                             options:MTLResourceStorageModeShared];
@@ -230,7 +244,8 @@ ShardLoadResult load_shard_isolated(id device_id, const std::string& path, const
         tv.buffer = mtl_buf;
 
         size_t req_align = std::max<size_t>(4, dtype_size(tv.dtype));
-        if (tv.offset % req_align != 0) {
+        bool skip_copy = allow_unaligned_q4 && is_unaligned_q4_key(full_key, tv.dtype);
+        if (!skip_copy && (tv.offset % req_align != 0)) {
             id<MTLBuffer> copy_buf = [device newBufferWithBytes:tv.host_ptr
                                                          length:std::max<size_t>(tv.nbytes, 16)
                                                         options:MTLResourceStorageModeShared];
@@ -314,8 +329,9 @@ SafetensorsStore::~SafetensorsStore() {
 }
 
 void SafetensorsStore::load_file(id device_id, const std::string& path, const std::string& key_prefix,
-                                 bool prefetch_now, const std::vector<std::string>& skip_prefixes) {
-    ShardLoadResult r = load_shard_isolated(device_id, path, key_prefix, prefetch_now, skip_prefixes, {});
+                                 bool prefetch_now, const std::vector<std::string>& skip_prefixes,
+                                 bool allow_unaligned_q4) {
+    ShardLoadResult r = load_shard_isolated(device_id, path, key_prefix, prefetch_now, skip_prefixes, {}, allow_unaligned_q4);
     if (!r.has_shard) return;
     shards_.push_back(std::move(r.shard));
     for (auto& c : r.aligned_copies) aligned_copies_.push_back(c);
@@ -324,7 +340,7 @@ void SafetensorsStore::load_file(id device_id, const std::string& path, const st
 }
 
 void SafetensorsStore::load_dir(id device_id, const std::string& dir, const std::vector<std::string>& skip_prefixes,
-                                bool prefetch_now) {
+                                bool prefetch_now, bool allow_unaligned_q4) {
     std::string index_path = dir + "/model.safetensors.index.json";
     std::set<std::string> shard_files;
     if (fs::exists(index_path)) {
@@ -350,7 +366,7 @@ void SafetensorsStore::load_dir(id device_id, const std::string& dir, const std:
 
     std::vector<std::string> files(shard_files.begin(), shard_files.end());
     if (files.size() == 1u) {
-        load_file(device_id, files[0], "", prefetch_now, skip_prefixes);
+        load_file(device_id, files[0], "", prefetch_now, skip_prefixes, allow_unaligned_q4);
         return;
     }
 
@@ -370,7 +386,7 @@ void SafetensorsStore::load_dir(id device_id, const std::string& dir, const std:
                     size_t idx = next_i.fetch_add(1);
                     if (idx >= files.size()) break;
                     try {
-                        results[idx] = load_shard_isolated(device_id, files[idx], "", prefetch_now, skip_prefixes, {});
+                        results[idx] = load_shard_isolated(device_id, files[idx], "", prefetch_now, skip_prefixes, {}, allow_unaligned_q4);
                     } catch (...) {
                         std::lock_guard<std::mutex> lk(exc_mtx);
                         if (!first_exc) first_exc = std::current_exception();
@@ -406,7 +422,7 @@ void SafetensorsStore::load_dir(id device_id, const std::string& dir, const std:
 
 void SafetensorsStore::load_dir_only(id device_id, const std::string& dir,
                                      const std::vector<std::string>& include_prefixes,
-                                     bool prefetch_now) {
+                                     bool prefetch_now, bool allow_unaligned_q4) {
     if (include_prefixes.empty()) return;
     std::string index_path = dir + "/model.safetensors.index.json";
     std::set<std::string> shard_files;
@@ -426,7 +442,7 @@ void SafetensorsStore::load_dir_only(id device_id, const std::string& dir,
     }
 
     for (const auto& sf : shard_files) {
-        ShardLoadResult r = load_shard_isolated(device_id, sf, "", prefetch_now, {}, include_prefixes);
+        ShardLoadResult r = load_shard_isolated(device_id, sf, "", prefetch_now, {}, include_prefixes, allow_unaligned_q4);
         if (!r.has_shard) continue;
         shards_.push_back(std::move(r.shard));
         for (auto& c : r.aligned_copies) aligned_copies_.push_back(c);

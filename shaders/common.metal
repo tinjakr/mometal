@@ -6,6 +6,47 @@ inline float bf16_to_f32(ushort bits) {
     return as_type<float>(uint(bits) << 16);
 }
 
+// Zero-copy unaligned safetensors Q4 weight/scale/bias loaders (handles arbitrary 1/2/3-byte JSON header offsets
+// without copying weights into anonymous dirty Metal buffers; branch is uniform/loop-invariant per tensor!).
+inline uint q4_load_u32(const device uchar* base, ulong word_idx) {
+    ulong b = ulong(base);
+    uint sh = uint(b & 3ul);
+    const device uint* p = (const device uint*)(b & ~3ul) + word_idx;
+    if (sh == 0u) return p[0];
+    uint s8 = sh << 3;
+    return (p[0] >> s8) | (p[1] << (32u - s8));
+}
+
+inline uint2 q4_load_u32x2(const device uchar* base, ulong word_idx) {
+    ulong b = ulong(base);
+    uint sh = uint(b & 3ul);
+    const device uint* p = (const device uint*)(b & ~3ul) + word_idx;
+    if (sh == 0u) return uint2(p[0], p[1]);
+    uint s8 = sh << 3;
+    uint r8 = 32u - s8;
+    uint w0 = p[0], w1 = p[1], w2 = p[2];
+    return uint2((w0 >> s8) | (w1 << r8), (w1 >> s8) | (w2 << r8));
+}
+
+inline uint4 q4_load_u32x4(const device uchar* base, ulong word_idx) {
+    ulong b = ulong(base);
+    uint sh = uint(b & 3ul);
+    const device uint* p = (const device uint*)(b & ~3ul) + word_idx;
+    if (sh == 0u) return uint4(p[0], p[1], p[2], p[3]);
+    uint s8 = sh << 3;
+    uint r8 = 32u - s8;
+    uint w0 = p[0], w1 = p[1], w2 = p[2], w3 = p[3], w4 = p[4];
+    return uint4((w0 >> s8) | (w1 << r8), (w1 >> s8) | (w2 << r8),
+                 (w2 >> s8) | (w3 << r8), (w3 >> s8) | (w4 << r8));
+}
+
+inline ushort q4_load_u16(const device uchar* base, ulong elem_idx) {
+    ulong b = ulong(base);
+    if ((b & 1ul) == 0ul) return ((const device ushort*)base)[elem_idx];
+    const device uchar* p = base + (elem_idx << 1);
+    return ushort(p[0]) | (ushort(p[1]) << 8);
+}
+
 inline ushort f32_to_bf16(float v) {
     uint bits = as_type<uint>(v);
     uint lsb = (bits >> 16) & 1u;
@@ -41,9 +82,9 @@ struct QmmSkParams {
 // ============================================================================
 
 kernel void qmm_q4_g64_f32(
-    const device uint*   W     [[buffer(0)]],
-    const device ushort* S     [[buffer(1)]],
-    const device ushort* B     [[buffer(2)]],
+    const device uchar*  W     [[buffer(0)]],
+    const device uchar*  S     [[buffer(1)]],
+    const device uchar*  B     [[buffer(2)]],
     const device float*  X     [[buffer(3)]],
     device float*        Y     [[buffer(4)]],
     constant QmmParams&  p     [[buffer(5)]],
@@ -79,9 +120,9 @@ kernel void qmm_q4_g64_f32(
 
         for (uint rr = 0; rr < tn; rr++) {
             uint o = o0 + rr;
-            uint4 uq = *((const device uint4*)(W + (ulong)o * KW + wi));
-            float sc = bf16_to_f32(S[(ulong)o * KG + g]);
-            float bi = bf16_to_f32(B[(ulong)o * KG + g]);
+            uint4 uq = q4_load_u32x4(W, (ulong)o * KW + wi);
+            float sc = bf16_to_f32(q4_load_u16(S, (ulong)o * KG + g));
+            float bi = bf16_to_f32(q4_load_u16(B, (ulong)o * KG + g));
             uint ws[4] = {uq.x, uq.y, uq.z, uq.w};
             float d = 0.0f;
             #pragma unroll
@@ -145,9 +186,9 @@ inline float q4_dot32_and_sum(uint u0, uint u1, uint u2, uint u3, const device f
 }
 
 kernel void qmm_q4_g64_batch4(
-    const device uint*   W     [[buffer(0)]],
-    const device ushort* S     [[buffer(1)]],
-    const device ushort* B     [[buffer(2)]],
+    const device uchar*  W     [[buffer(0)]],
+    const device uchar*  S     [[buffer(1)]],
+    const device uchar*  B     [[buffer(2)]],
     const device float*  X     [[buffer(3)]],
     device float*        Y     [[buffer(4)]],
     constant QmmParams&  p     [[buffer(5)]],
@@ -162,9 +203,8 @@ kernel void qmm_q4_g64_batch4(
 
     uint KW = p.K >> 3;
     uint KG = p.K >> 6;
-    const device uint*   w_row = W + (ulong)o * KW;
-    const device ushort* s_row = S + (ulong)o * KG;
-    const device ushort* b_row = B + (ulong)o * KG;
+    const ulong w_row = (ulong)o * KW;
+    const ulong s_row = (ulong)o * KG;
     const device float*  x0_base = X + (ulong)(m0 + 0u) * p.K;
     const device float*  x1_base = X + (ulong)(m0 + min(1u, tm - 1u)) * p.K;
     const device float*  x2_base = X + (ulong)(m0 + min(2u, tm - 1u)) * p.K;
@@ -174,9 +214,10 @@ kernel void qmm_q4_g64_batch4(
     for (uint wi = lane * 4u; wi < KW; wi += 128u) {
         uint k0 = wi << 3;
         uint g  = wi >> 3;
-        uint u0 = w_row[wi + 0u], u1 = w_row[wi + 1u], u2 = w_row[wi + 2u], u3 = w_row[wi + 3u];
-        float sc = bf16_to_f32(s_row[g]);
-        float bi = bf16_to_f32(b_row[g]);
+        uint4 uq = q4_load_u32x4(W, w_row + wi);
+        uint u0 = uq.x, u1 = uq.y, u2 = uq.z, u3 = uq.w;
+        float sc = bf16_to_f32(q4_load_u16(S, s_row + g));
+        float bi = bf16_to_f32(q4_load_u16(B, s_row + g));
         float xs;
         a0 = fma(sc, q4_dot32_and_sum(u0, u1, u2, u3, x0_base + k0, xs), fma(bi, xs, a0));
         if (tm > 1u) a1 = fma(sc, q4_dot32_and_sum(u0, u1, u2, u3, x1_base + k0, xs), fma(bi, xs, a1));
@@ -203,12 +244,12 @@ kernel void qmm_q4_g64_batch4(
 // ============================================================================
 
 kernel void qmv_q4_g64_swiglu_f32(
-    const device uint*   Wg    [[buffer(0)]],
-    const device ushort* Sg    [[buffer(1)]],
-    const device ushort* Bg    [[buffer(2)]],
-    const device uint*   Wu    [[buffer(3)]],
-    const device ushort* Su    [[buffer(4)]],
-    const device ushort* Bu    [[buffer(5)]],
+    const device uchar*  Wg    [[buffer(0)]],
+    const device uchar*  Sg    [[buffer(1)]],
+    const device uchar*  Bg    [[buffer(2)]],
+    const device uchar*  Wu    [[buffer(3)]],
+    const device uchar*  Su    [[buffer(4)]],
+    const device uchar*  Bu    [[buffer(5)]],
     const device float*  X     [[buffer(6)]],
     device float*        Y     [[buffer(7)]],
     constant QmmParams&  p     [[buffer(8)]],
@@ -244,9 +285,9 @@ kernel void qmv_q4_g64_swiglu_f32(
             uint o = o0 + rr;
             // Gate
             {
-                uint4 uq = *((const device uint4*)(Wg + (ulong)o * KW + wi));
-                float sc = bf16_to_f32(Sg[(ulong)o * KG + g]);
-                float bi = bf16_to_f32(Bg[(ulong)o * KG + g]);
+                uint4 uq = q4_load_u32x4(Wg, (ulong)o * KW + wi);
+                float sc = bf16_to_f32(q4_load_u16(Sg, (ulong)o * KG + g));
+                float bi = bf16_to_f32(q4_load_u16(Bg, (ulong)o * KG + g));
                 uint ws[4] = {uq.x, uq.y, uq.z, uq.w};
                 float d = 0.0f;
                 #pragma unroll
@@ -262,9 +303,9 @@ kernel void qmv_q4_g64_swiglu_f32(
             }
             // Up
             {
-                uint4 uq = *((const device uint4*)(Wu + (ulong)o * KW + wi));
-                float sc = bf16_to_f32(Su[(ulong)o * KG + g]);
-                float bi = bf16_to_f32(Bu[(ulong)o * KG + g]);
+                uint4 uq = q4_load_u32x4(Wu, (ulong)o * KW + wi);
+                float sc = bf16_to_f32(q4_load_u16(Su, (ulong)o * KG + g));
+                float bi = bf16_to_f32(q4_load_u16(Bu, (ulong)o * KG + g));
                 uint ws[4] = {uq.x, uq.y, uq.z, uq.w};
                 float d = 0.0f;
                 #pragma unroll
@@ -319,9 +360,9 @@ inline float q4_dot32_f16x_magic(uint4 uq, const thread half4* xv) {
 }
 
 kernel void qmv_q4_g64_f16x(
-    const device uint*   W     [[buffer(0)]],
-    const device ushort* S     [[buffer(1)]],
-    const device ushort* B     [[buffer(2)]],
+    const device uchar*  W     [[buffer(0)]],
+    const device uchar*  S     [[buffer(1)]],
+    const device uchar*  B     [[buffer(2)]],
     const device half*   X     [[buffer(3)]],
     device float*        Y     [[buffer(4)]],
     constant QmmParams&  p     [[buffer(5)]],
@@ -352,9 +393,9 @@ kernel void qmv_q4_g64_f16x(
         #pragma clang loop unroll(full)
         for (uint rr = 0; rr < 2u; rr++) {
             uint o = min(o0 + rr, p.N - 1u);
-            uint4 uq = *((const device uint4*)(W + (ulong)o * KW + wi));
-            float sc = bf16_to_f32(S[(ulong)o * KG + g]);
-            float bi = bf16_to_f32(B[(ulong)o * KG + g]);
+            uint4 uq = q4_load_u32x4(W, (ulong)o * KW + wi);
+            float sc = bf16_to_f32(q4_load_u16(S, (ulong)o * KG + g));
+            float bi = bf16_to_f32(q4_load_u16(B, (ulong)o * KG + g));
             acc[rr] = fma(sc, q4_dot32_f16x_magic(uq, xv), fma(bi, xs, acc[rr]));
         }
     }
@@ -368,9 +409,9 @@ kernel void qmv_q4_g64_f16x(
 }
 
 kernel void qmv_q4_g64_f16x_sk(
-    const device uint*    W     [[buffer(0)]],
-    const device ushort*  S     [[buffer(1)]],
-    const device ushort*  B     [[buffer(2)]],
+    const device uchar*   W     [[buffer(0)]],
+    const device uchar*   S     [[buffer(1)]],
+    const device uchar*   B     [[buffer(2)]],
     const device half*    X     [[buffer(3)]],
     device float*         partY [[buffer(4)]],
     constant QmmSkParams& p     [[buffer(5)]],
@@ -408,9 +449,9 @@ kernel void qmv_q4_g64_f16x_sk(
         #pragma clang loop unroll(full)
         for (uint rr = 0; rr < 2u; rr++) {
             uint o = min(o0 + rr, p.N - 1u);
-            uint4 uq = *((const device uint4*)(W + (ulong)o * KW + wi));
-            float sc = bf16_to_f32(S[(ulong)o * KG + g]);
-            float bi = bf16_to_f32(B[(ulong)o * KG + g]);
+            uint4 uq = q4_load_u32x4(W, (ulong)o * KW + wi);
+            float sc = bf16_to_f32(q4_load_u16(S, (ulong)o * KG + g));
+            float bi = bf16_to_f32(q4_load_u16(B, (ulong)o * KG + g));
             acc[rr] = fma(sc, q4_dot32_f16x_magic(uq, xv), fma(bi, xs, acc[rr]));
         }
     }
@@ -423,12 +464,12 @@ kernel void qmv_q4_g64_f16x_sk(
 }
 
 kernel void qmv_q4_g64_swiglu_f16x(
-    const device uint*   Wg    [[buffer(0)]],
-    const device ushort* Sg    [[buffer(1)]],
-    const device ushort* Bg    [[buffer(2)]],
-    const device uint*   Wu    [[buffer(3)]],
-    const device ushort* Su    [[buffer(4)]],
-    const device ushort* Bu    [[buffer(5)]],
+    const device uchar*  Wg    [[buffer(0)]],
+    const device uchar*  Sg    [[buffer(1)]],
+    const device uchar*  Bg    [[buffer(2)]],
+    const device uchar*  Wu    [[buffer(3)]],
+    const device uchar*  Su    [[buffer(4)]],
+    const device uchar*  Bu    [[buffer(5)]],
     const device half*   X     [[buffer(6)]],
     device half*         Y     [[buffer(7)]],
     constant QmmParams&  p     [[buffer(8)]],
@@ -462,15 +503,15 @@ kernel void qmv_q4_g64_swiglu_f16x(
             ulong w_off = (ulong)o * KW + wi;
             ulong s_off = (ulong)o * KG + g;
             {
-                uint4 uq = *((const device uint4*)(Wg + w_off));
-                float sc = bf16_to_f32(Sg[s_off]);
-                float bi = bf16_to_f32(Bg[s_off]);
+                uint4 uq = q4_load_u32x4(Wg, w_off);
+                float sc = bf16_to_f32(q4_load_u16(Sg, s_off));
+                float bi = bf16_to_f32(q4_load_u16(Bg, s_off));
                 g_acc[rr] = fma(sc, q4_dot32_f16x_magic(uq, xv), fma(bi, xs, g_acc[rr]));
             }
             {
-                uint4 uq = *((const device uint4*)(Wu + w_off));
-                float sc = bf16_to_f32(Su[s_off]);
-                float bi = bf16_to_f32(Bu[s_off]);
+                uint4 uq = q4_load_u32x4(Wu, w_off);
+                float sc = bf16_to_f32(q4_load_u16(Su, s_off));
+                float bi = bf16_to_f32(q4_load_u16(Bu, s_off));
                 u_acc[rr] = fma(sc, q4_dot32_f16x_magic(uq, xv), fma(bi, xs, u_acc[rr]));
             }
         }
@@ -492,9 +533,9 @@ kernel void qmv_q4_g64_swiglu_f16x(
 // ============================================================================
 
 kernel void qmm_q4_g64_tiled(
-    const device uint*   W     [[buffer(0)]],
-    const device ushort* S     [[buffer(1)]],
-    const device ushort* B     [[buffer(2)]],
+    const device uchar*  W     [[buffer(0)]],
+    const device uchar*  S     [[buffer(1)]],
+    const device uchar*  B     [[buffer(2)]],
     const device float*  X     [[buffer(3)]],
     device float*        Y     [[buffer(4)]],
     constant QmmParams&  p     [[buffer(5)]],
@@ -535,9 +576,8 @@ kernel void qmm_q4_g64_tiled(
 
     threadgroup half4* sa_dst = (threadgroup half4*)(&sA[r_loc][c_blk]);
     threadgroup half4* sb_dst = (threadgroup half4*)(&sB[r_loc][c_blk]);
-    const device uint*   w_base = W + (ulong)gn_ld * KW;
-    const device ushort* s_base = S + (ulong)gn_ld * KG;
-    const device ushort* b_base = B + (ulong)gn_ld * KG;
+    const ulong w_row = (ulong)gn_ld * KW;
+    const ulong s_row = (ulong)gn_ld * KG;
     const device float*  x_base = X + (ulong)gm_ld * p.K;
 
     for (uint k0 = 0; k0 < p.K; k0 += 64u) {
@@ -545,8 +585,8 @@ kernel void qmm_q4_g64_tiled(
         half2 sc_h = half2(0.0h);
         half2 bi_h = half2(0.0h);
         if (gn_ok) {
-            sc_h = half2(half(bf16_to_f32(s_base[g])));
-            bi_h = half2(half(bf16_to_f32(b_base[g])));
+            sc_h = half2(half(bf16_to_f32(q4_load_u16(S, s_row + g))));
+            bi_h = half2(half(bf16_to_f32(q4_load_u16(B, s_row + g))));
         }
 
         #pragma clang loop unroll(full)
@@ -565,7 +605,7 @@ kernel void qmm_q4_g64_tiled(
 
             if (gn_ok) {
                 uint wi = (ks >> 3) + h_idx * 2u;
-                uint2 uq = *((const device uint2*)(w_base + wi));
+                uint2 uq = q4_load_u32x2(W, w_row + wi);
                 uint ws[2] = {uq.x, uq.y};
                 #pragma clang loop unroll(full)
                 for (uint w = 0; w < 2u; w++) {
@@ -632,9 +672,9 @@ kernel void qmm_q4_g64_tiled(
 // ============================================================================
 
 kernel void qmm_q4_g64_tiled_f16x(
-    const device uint*   W     [[buffer(0)]],
-    const device ushort* S     [[buffer(1)]],
-    const device ushort* B     [[buffer(2)]],
+    const device uchar*  W     [[buffer(0)]],
+    const device uchar*  S     [[buffer(1)]],
+    const device uchar*  B     [[buffer(2)]],
     const device half*   X     [[buffer(3)]],
     device float*        Y     [[buffer(4)]],
     constant QmmParams&  p     [[buffer(5)]],
@@ -685,9 +725,8 @@ kernel void qmm_q4_g64_tiled_f16x(
     bool gm_ok = gm_ld < p.M;
     bool gn_ok = gn_ld < p.N;
 
-    const device uint*   w_base = W + (ulong)(gn_ok ? gn_ld : 0u) * KW;
-    const device ushort* s_base = S + (ulong)(gn_ok ? gn_ld : 0u) * KG;
-    const device ushort* b_base = B + (ulong)(gn_ok ? gn_ld : 0u) * KG;
+    const ulong w_row = (ulong)(gn_ok ? gn_ld : 0u) * KW;
+    const ulong s_row = (ulong)(gn_ok ? gn_ld : 0u) * KG;
     const device half*   x_base = X + (ulong)(gm_ok ? gm_ld : 0u) * p.K;
 
     // Prologue: load first K=0..31 into buf 0 and hoist group-0 scale/bias across hg=0..1
@@ -703,9 +742,9 @@ kernel void qmm_q4_g64_tiled_f16x(
             sa_dst[0] = half4(0.0h); sa_dst[1] = half4(0.0h); sa_dst[2] = half4(0.0h); sa_dst[3] = half4(0.0h);
         }
         if (gn_ok) {
-            sc_h = half2(half(bf16_to_f32(s_base[0])));
-            bi_h = fma(half2(-1024.0h), sc_h, half2(half(bf16_to_f32(b_base[0]))));
-            uint2 uq = *((const device uint2*)(w_base + h_idx * 2u));
+            sc_h = half2(half(bf16_to_f32(q4_load_u16(S, s_row))));
+            bi_h = fma(half2(-1024.0h), sc_h, half2(half(bf16_to_f32(q4_load_u16(B, s_row)))));
+            uint2 uq = q4_load_u32x2(W, w_row + h_idx * 2u);
             uint ws[2] = {uq.x, uq.y};
             #pragma clang loop unroll(full)
             for (uint w = 0u; w < 2u; w++) {
@@ -730,7 +769,7 @@ kernel void qmm_q4_g64_tiled_f16x(
             const device half4* xp = (const device half4*)(x_base + k0 + 32u + c_blk);
             px0 = xp[0]; px1 = xp[1]; px2 = xp[2]; px3 = xp[3];
         }
-        uint2 puq = gn_ok ? *((const device uint2*)(w_base + (k0 >> 3) + 4u + h_idx * 2u)) : uint2(0u);
+        uint2 puq = gn_ok ? q4_load_u32x2(W, w_row + (k0 >> 3) + 4u + h_idx * 2u) : uint2(0u);
 
         #pragma clang loop unroll(full)
         for (uint kk = 0u; kk < 32u; kk += 8u) {
@@ -782,9 +821,9 @@ kernel void qmm_q4_g64_tiled_f16x(
             }
             if (gn_ok) {
                 uint g_nxt = k_nxt >> 6;
-                ns_raw = s_base[g_nxt];
-                nb_raw = b_base[g_nxt];
-                nuq = *((const device uint2*)(w_base + (k_nxt >> 3) + h_idx * 2u));
+                ns_raw = q4_load_u16(S, s_row + g_nxt);
+                nb_raw = q4_load_u16(B, s_row + g_nxt);
+                nuq = q4_load_u32x2(W, w_row + (k_nxt >> 3) + h_idx * 2u);
             }
         }
 
@@ -858,9 +897,9 @@ kernel void qmm_q4_g64_tiled_f16x(
 // ============================================================================
 
 kernel void qmm_q4_g64_smalln_f16x(
-    const device uint*   W     [[buffer(0)]],
-    const device ushort* S     [[buffer(1)]],
-    const device ushort* B     [[buffer(2)]],
+    const device uchar*  W     [[buffer(0)]],
+    const device uchar*  S     [[buffer(1)]],
+    const device uchar*  B     [[buffer(2)]],
     const device half*   X     [[buffer(3)]],
     device float*        Y     [[buffer(4)]],
     constant QmmParams&  p     [[buffer(5)]],
@@ -895,9 +934,8 @@ kernel void qmm_q4_g64_smalln_f16x(
     uint br = tid >> 2, bh = tid & 3u;
     uint gn = n0 + br;
     bool gn_ok = gn < p.N;
-    const device uint*   w_base = W + (ulong)(gn_ok ? gn : 0u) * KW;
-    const device ushort* s_base = S + (ulong)(gn_ok ? gn : 0u) * KG;
-    const device ushort* b_base = B + (ulong)(gn_ok ? gn : 0u) * KG;
+    const ulong w_row = (ulong)(gn_ok ? gn : 0u) * KW;
+    const ulong s_row = (ulong)(gn_ok ? gn : 0u) * KG;
     threadgroup half4* sb_dst = (threadgroup half4*)(&sB[br][bh * 16u]);
 
     for (uint k0 = 0; k0 < p.K; k0 += 64u) {
@@ -911,9 +949,9 @@ kernel void qmm_q4_g64_smalln_f16x(
         }
         if (gn_ok) {
             uint g = k0 >> 6;
-            half2 sc_h = half2(half(bf16_to_f32(s_base[g])));
-            half2 bi_h = fma(half2(-1024.0h), sc_h, half2(half(bf16_to_f32(b_base[g]))));
-            uint2 uq = *((const device uint2*)(w_base + (k0 >> 3) + bh * 2u));
+            half2 sc_h = half2(half(bf16_to_f32(q4_load_u16(S, s_row + g))));
+            half2 bi_h = fma(half2(-1024.0h), sc_h, half2(half(bf16_to_f32(q4_load_u16(B, s_row + g)))));
+            uint2 uq = q4_load_u32x2(W, w_row + (k0 >> 3) + bh * 2u);
             uint ws[2] = {uq.x, uq.y};
             #pragma clang loop unroll(full)
             for (uint w = 0; w < 2u; w++) {
@@ -979,9 +1017,9 @@ kernel void qmm_q4_g64_smalln_f16x(
 // ============================================================================
 
 kernel void mma_qmm8_q4_g64_f32(
-    const device uint*   W     [[buffer(0)]],
-    const device ushort* S     [[buffer(1)]],
-    const device ushort* B     [[buffer(2)]],
+    const device uchar*  W     [[buffer(0)]],
+    const device uchar*  S     [[buffer(1)]],
+    const device uchar*  B     [[buffer(2)]],
     const device float*  X     [[buffer(3)]],
     device float*        Y     [[buffer(4)]],
     constant QmmParams&  p     [[buffer(5)]],
@@ -1028,9 +1066,9 @@ kernel void mma_qmm8_q4_g64_f32(
             #pragma clang loop unroll(full)
             for (uint t = 0; t < TN; t++) {
                 uint n = min(n0 + 8u * t + fm, N - 1u);
-                wqs[u][t] = *(const device uint2*)(W + (ulong)n * KW + 8u * gg + 2u * b);
-                scs[u][t] = bf16_to_f32(S[(ulong)n * G + gg]);
-                bis[u][t] = bf16_to_f32(B[(ulong)n * G + gg]);
+                wqs[u][t] = q4_load_u32x2(W, (ulong)n * KW + 8u * gg + 2u * b);
+                scs[u][t] = bf16_to_f32(q4_load_u16(S, (ulong)n * G + gg));
+                bis[u][t] = bf16_to_f32(q4_load_u16(B, (ulong)n * G + gg));
             }
         }
         #pragma clang loop unroll(full)
@@ -1110,12 +1148,12 @@ kernel void mma_qmm8_q4_g64_f32(
 }
 
 kernel void mma_qmm8_q4_g64_swiglu_f32(
-    const device uint*   Wg    [[buffer(0)]],
-    const device ushort* Sg    [[buffer(1)]],
-    const device ushort* Bg    [[buffer(2)]],
-    const device uint*   Wu    [[buffer(3)]],
-    const device ushort* Su    [[buffer(4)]],
-    const device ushort* Bu    [[buffer(5)]],
+    const device uchar*  Wg    [[buffer(0)]],
+    const device uchar*  Sg    [[buffer(1)]],
+    const device uchar*  Bg    [[buffer(2)]],
+    const device uchar*  Wu    [[buffer(3)]],
+    const device uchar*  Su    [[buffer(4)]],
+    const device uchar*  Bu    [[buffer(5)]],
     const device float*  X     [[buffer(6)]],
     device float*        Y     [[buffer(7)]],
     constant QmmParams&  p     [[buffer(8)]],
@@ -1167,12 +1205,12 @@ kernel void mma_qmm8_q4_g64_swiglu_f32(
                 uint n = min(n0 + 8u * t + fm, N - 1u);
                 ulong w_off = (ulong)n * KW + 8u * gg + 2u * b;
                 ulong s_off = (ulong)n * G + gg;
-                wqg[u][t] = *(const device uint2*)(Wg + w_off);
-                scg[u][t] = bf16_to_f32(Sg[s_off]);
-                big[u][t] = bf16_to_f32(Bg[s_off]);
-                wqu[u][t] = *(const device uint2*)(Wu + w_off);
-                scu[u][t] = bf16_to_f32(Su[s_off]);
-                biu[u][t] = bf16_to_f32(Bu[s_off]);
+                wqg[u][t] = q4_load_u32x2(Wg, w_off);
+                scg[u][t] = bf16_to_f32(q4_load_u16(Sg, s_off));
+                big[u][t] = bf16_to_f32(q4_load_u16(Bg, s_off));
+                wqu[u][t] = q4_load_u32x2(Wu, w_off);
+                scu[u][t] = bf16_to_f32(q4_load_u16(Su, s_off));
+                biu[u][t] = bf16_to_f32(q4_load_u16(Bu, s_off));
             }
         }
         #pragma clang loop unroll(full)
@@ -1288,9 +1326,9 @@ kernel void mma_qmm8_q4_g64_swiglu_f32(
 // ============================================================================
 
 kernel void mma_qmm8_q4_g64_f16x(
-    const device uint*   W     [[buffer(0)]],
-    const device ushort* S     [[buffer(1)]],
-    const device ushort* B     [[buffer(2)]],
+    const device uchar*  W     [[buffer(0)]],
+    const device uchar*  S     [[buffer(1)]],
+    const device uchar*  B     [[buffer(2)]],
     const device half*   X     [[buffer(3)]],
     device float*        Y     [[buffer(4)]],
     constant QmmParams&  p     [[buffer(5)]],
@@ -1333,9 +1371,9 @@ kernel void mma_qmm8_q4_g64_f16x(
         #pragma clang loop unroll(full)
         for (uint t = 0; t < TN; t++) {
             uint n = min(n0 + 8u * t + fm, N - 1u);
-            wqs[t] = *(const device uint2*)(W + (ulong)n * KW + 8u * g + 2u * b);
-            scs[t] = bf16_to_f32(S[(ulong)n * G + g]);
-            bis[t] = bf16_to_f32(B[(ulong)n * G + g]);
+            wqs[t] = q4_load_u32x2(W, (ulong)n * KW + 8u * g + 2u * b);
+            scs[t] = bf16_to_f32(q4_load_u16(S, (ulong)n * G + g));
+            bis[t] = bf16_to_f32(q4_load_u16(B, (ulong)n * G + g));
         }
 
         uint kx = 64u * g + 16u * sb + 4u * se;
@@ -1410,9 +1448,9 @@ kernel void mma_qmm8_q4_g64_f16x(
 
 // Split-K along tgid.z for small-N, large-K decode projections (down_proj 5120x17408 sk=4/8; out_proj 5120x6144 sk=2)
 kernel void mma_qmm8_q4_g64_f16x_sk(
-    const device uint*   W     [[buffer(0)]],
-    const device ushort* S     [[buffer(1)]],
-    const device ushort* B     [[buffer(2)]],
+    const device uchar*  W     [[buffer(0)]],
+    const device uchar*  S     [[buffer(1)]],
+    const device uchar*  B     [[buffer(2)]],
     const device half*   X     [[buffer(3)]],
     device float*        partY [[buffer(4)]],
     constant QmmSkParams& p    [[buffer(5)]],
@@ -1457,9 +1495,9 @@ kernel void mma_qmm8_q4_g64_f16x_sk(
         #pragma clang loop unroll(full)
         for (uint t = 0; t < TN; t++) {
             uint n = min(n0 + 8u * t + fm, N - 1u);
-            wqs[t] = *(const device uint2*)(W + (ulong)n * KW + 8u * g + 2u * b);
-            scs[t] = bf16_to_f32(S[(ulong)n * G + g]);
-            bis[t] = bf16_to_f32(B[(ulong)n * G + g]);
+            wqs[t] = q4_load_u32x2(W, (ulong)n * KW + 8u * g + 2u * b);
+            scs[t] = bf16_to_f32(q4_load_u16(S, (ulong)n * G + g));
+            bis[t] = bf16_to_f32(q4_load_u16(B, (ulong)n * G + g));
         }
 
         uint kx = 64u * g + 16u * sb + 4u * se;
@@ -1865,12 +1903,12 @@ kernel void rmsnorm_f32_bf16w_dual(
 }
 
 kernel void mma_qmm8_q4_g64_swiglu_f16(
-    const device uint*   Wg    [[buffer(0)]],
-    const device ushort* Sg    [[buffer(1)]],
-    const device ushort* Bg    [[buffer(2)]],
-    const device uint*   Wu    [[buffer(3)]],
-    const device ushort* Su    [[buffer(4)]],
-    const device ushort* Bu    [[buffer(5)]],
+    const device uchar*  Wg    [[buffer(0)]],
+    const device uchar*  Sg    [[buffer(1)]],
+    const device uchar*  Bg    [[buffer(2)]],
+    const device uchar*  Wu    [[buffer(3)]],
+    const device uchar*  Su    [[buffer(4)]],
+    const device uchar*  Bu    [[buffer(5)]],
     const device half*   X     [[buffer(6)]],
     device half*         Y     [[buffer(7)]],
     constant QmmParams&  p     [[buffer(8)]],
@@ -1918,12 +1956,12 @@ kernel void mma_qmm8_q4_g64_swiglu_f16(
             uint n = min(n0 + 8u * t + fm, N - 1u);
             ulong w_off = (ulong)n * KW + 8u * g + 2u * b;
             ulong s_off = (ulong)n * G + g;
-            wqg[t] = *(const device uint2*)(Wg + w_off);
-            scg[t] = bf16_to_f32(Sg[s_off]);
-            big[t] = bf16_to_f32(Bg[s_off]);
-            wqu[t] = *(const device uint2*)(Wu + w_off);
-            scu[t] = bf16_to_f32(Su[s_off]);
-            biu[t] = bf16_to_f32(Bu[s_off]);
+            wqg[t] = q4_load_u32x2(Wg, w_off);
+            scg[t] = bf16_to_f32(q4_load_u16(Sg, s_off));
+            big[t] = bf16_to_f32(q4_load_u16(Bg, s_off));
+            wqu[t] = q4_load_u32x2(Wu, w_off);
+            scu[t] = bf16_to_f32(q4_load_u16(Su, s_off));
+            biu[t] = bf16_to_f32(q4_load_u16(Bu, s_off));
         }
 
         uint kx = 64u * g + 16u * sb + 4u * se;
@@ -2028,8 +2066,8 @@ kernel void mma_qmm8_q4_g64_swiglu_f16(
 // Round 20: Dedicated Ultra-Fast Fused in_proj_a + in_proj_b (M=1..8, N=48+48=96, 12 TGs x 128 threads!)
 // Shares X across both a and b, saturates GPU cores instead of 2+2 TG tail stragglers (14 GB/s -> 150+ GB/s)!
 kernel void mma_qmm8_in_proj_ab_f16x(
-    const device uint*   Wa [[buffer(0)]], const device ushort* Sa [[buffer(1)]], const device ushort* Ba [[buffer(2)]],
-    const device uint*   Wb [[buffer(3)]], const device ushort* Sb [[buffer(4)]], const device ushort* Bb [[buffer(5)]],
+    const device uchar*  Wa [[buffer(0)]], const device uchar*  Sa [[buffer(1)]], const device uchar*  Ba [[buffer(2)]],
+    const device uchar*  Wb [[buffer(3)]], const device uchar*  Sb [[buffer(4)]], const device uchar*  Bb [[buffer(5)]],
     const device half*   X  [[buffer(6)]],
     device float*        Ya [[buffer(7)]],
     device float*        Yb [[buffer(8)]],
@@ -2045,9 +2083,9 @@ kernel void mma_qmm8_in_proj_ab_f16x(
     const uint n0 = (is_b ? (tgid - n_tgs_half) : tgid) * 8u;
     if (n0 >= p.N) return;
 
-    const device uint*   W = is_b ? Wb : Wa;
-    const device ushort* S = is_b ? Sb : Sa;
-    const device ushort* B = is_b ? Bb : Ba;
+    const device uchar*  W = is_b ? Wb : Wa;
+    const device uchar*  S = is_b ? Sb : Sa;
+    const device uchar*  B = is_b ? Bb : Ba;
     device float*        Y = is_b ? Yb : Ya;
 
     const uint K = p.K, N = p.N, KW = K >> 3, G = K >> 6;
@@ -2066,9 +2104,9 @@ kernel void mma_qmm8_in_proj_ab_f16x(
     const uint n = min(n0 + fm, N - 1u);
 
     for (uint g = sg; g < G; g += KS) {
-        uint2 wq = *(const device uint2*)(W + (ulong)n * KW + 8u * g + 2u * b);
-        float sc = bf16_to_f32(S[(ulong)n * G + g]);
-        float bi = bf16_to_f32(B[(ulong)n * G + g]) - 1024.0f * sc;
+        uint2 wq = q4_load_u32x2(W, (ulong)n * KW + 8u * g + 2u * b);
+        float sc = bf16_to_f32(q4_load_u16(S, (ulong)n * G + g));
+        float bi = bf16_to_f32(q4_load_u16(B, (ulong)n * G + g)) - 1024.0f * sc;
 
         uint kx = 64u * g + 16u * sb + 4u * se;
         half4 a0 = m0ok ? *(const device half4*)(xr0 + kx)      : half4(0.0h);
@@ -2127,9 +2165,9 @@ kernel void mma_qmm8_in_proj_ab_f16x(
 }
 
 kernel void mma_qmm16_q4_g64_f32(
-    const device uint*   W     [[buffer(0)]],
-    const device ushort* S     [[buffer(1)]],
-    const device ushort* B     [[buffer(2)]],
+    const device uchar*  W     [[buffer(0)]],
+    const device uchar*  S     [[buffer(1)]],
+    const device uchar*  B     [[buffer(2)]],
     const device float*  X     [[buffer(3)]],
     device float*        Y     [[buffer(4)]],
     constant QmmParams&  p     [[buffer(5)]],
@@ -2183,9 +2221,9 @@ kernel void mma_qmm16_q4_g64_f32(
             #pragma clang loop unroll(full)
             for (uint t = 0; t < TN; t++) {
                 uint n = min(n0 + 8u * t + fm, N - 1u);
-                wqs[u][t] = *(const device uint2*)(W + (ulong)n * KW + 8u * gg + 2u * b);
-                scs[u][t] = bf16_to_f32(S[(ulong)n * G + gg]);
-                bis[u][t] = bf16_to_f32(B[(ulong)n * G + gg]);
+                wqs[u][t] = q4_load_u32x2(W, (ulong)n * KW + 8u * gg + 2u * b);
+                scs[u][t] = bf16_to_f32(q4_load_u16(S, (ulong)n * G + gg));
+                bis[u][t] = bf16_to_f32(q4_load_u16(B, (ulong)n * G + gg));
             }
         }
         #pragma clang loop unroll(full)
@@ -2281,9 +2319,9 @@ kernel void mma_qmm16_q4_g64_f32(
 // ============================================================================
 
 kernel void qmm_q4_g64_m8(
-    const device uint*   W     [[buffer(0)]],
-    const device ushort* S     [[buffer(1)]],
-    const device ushort* B     [[buffer(2)]],
+    const device uchar*  W     [[buffer(0)]],
+    const device uchar*  S     [[buffer(1)]],
+    const device uchar*  B     [[buffer(2)]],
     const device float*  X     [[buffer(3)]],
     device float*        Y     [[buffer(4)]],
     constant QmmParams&  p     [[buffer(5)]],
@@ -2334,10 +2372,9 @@ kernel void qmm_q4_g64_m8(
         if (gn < p.N && (k0 + c_blk) < p.K) {
             uint wi = (k0 >> 3) + lane4 * 4u;
             uint g  = (k0 + c_blk) >> 6;
-            const device uint* wp = W + (ulong)gn * KW + wi;
-            uint4 u = *((const device uint4*)wp);
-            float sc = bf16_to_f32(S[(ulong)gn * KG + g]);
-            float bi = bf16_to_f32(B[(ulong)gn * KG + g]);
+            uint4 u = q4_load_u32x4(W, (ulong)gn * KW + wi);
+            float sc = bf16_to_f32(q4_load_u16(S, (ulong)gn * KG + g));
+            float bi = bf16_to_f32(q4_load_u16(B, (ulong)gn * KG + g));
             uint words[4] = {u.x, u.y, u.z, u.w};
             #pragma unroll
             for (uint w = 0; w < 4u; w++) {
@@ -3030,9 +3067,9 @@ struct EmbedParams {
 };
 
 kernel void embed_q4_g64_f32(
-    const device uint*   W     [[buffer(0)]],
-    const device ushort* S     [[buffer(1)]],
-    const device ushort* B     [[buffer(2)]],
+    const device uchar*  W     [[buffer(0)]],
+    const device uchar*  S     [[buffer(1)]],
+    const device uchar*  B     [[buffer(2)]],
     const device int*    ids   [[buffer(3)]],
     device float*        out   [[buffer(4)]],
     constant EmbedParams& p    [[buffer(5)]],
@@ -3049,10 +3086,10 @@ kernel void embed_q4_g64_f32(
     uint nib_shift = (col & 7u) * 4u;
     uint g_idx = col >> 6;
 
-    uint word = W[(ulong)tok * KW + w_idx];
+    uint word = q4_load_u32(W, (ulong)tok * KW + w_idx);
     float q = float((word >> nib_shift) & 15u);
-    float sc = bf16_to_f32(S[(ulong)tok * KG + g_idx]);
-    float bi = bf16_to_f32(B[(ulong)tok * KG + g_idx]);
+    float sc = bf16_to_f32(q4_load_u16(S, (ulong)tok * KG + g_idx));
+    float bi = bf16_to_f32(q4_load_u16(B, (ulong)tok * KG + g_idx));
     out[(ulong)row * p.D + col] = fma(q, sc, bi);
 }
 
@@ -3291,9 +3328,9 @@ kernel void argmax_stage2(
 // ============================================================================
 
 kernel void mma_qmm8_lmhead_max_f16x(
-    const device uint*   W     [[buffer(0)]],
-    const device ushort* S     [[buffer(1)]],
-    const device ushort* B     [[buffer(2)]],
+    const device uchar*  W     [[buffer(0)]],
+    const device uchar*  S     [[buffer(1)]],
+    const device uchar*  B     [[buffer(2)]],
     const device half*   X     [[buffer(3)]],
     device float*        Y     [[buffer(4)]],
     device ArgmaxOut*    parts [[buffer(5)]],
@@ -3335,9 +3372,9 @@ kernel void mma_qmm8_lmhead_max_f16x(
         #pragma clang loop unroll(full)
         for (uint t = 0; t < TN; t++) {
             uint n = min(n0 + 8u * t + fm, N - 1u);
-            wqs[t] = *(const device uint2*)(W + (ulong)n * KW + 8u * g + 2u * b);
-            scs[t] = bf16_to_f32(S[(ulong)n * G + g]);
-            bis[t] = bf16_to_f32(B[(ulong)n * G + g]);
+            wqs[t] = q4_load_u32x2(W, (ulong)n * KW + 8u * g + 2u * b);
+            scs[t] = bf16_to_f32(q4_load_u16(S, (ulong)n * G + g));
+            bis[t] = bf16_to_f32(q4_load_u16(B, (ulong)n * G + g));
         }
 
         uint kx = 64u * g + 16u * sb + 4u * se;
@@ -3433,9 +3470,9 @@ kernel void mma_qmm8_lmhead_max_f16x(
 // ============================================================================
 
 kernel void qmv_q4_g64_f16x_indexed_max(
-    const device uint*   W       [[buffer(0)]],
-    const device ushort* S       [[buffer(1)]],
-    const device ushort* B       [[buffer(2)]],
+    const device uchar*  W       [[buffer(0)]],
+    const device uchar*  S       [[buffer(1)]],
+    const device uchar*  B       [[buffer(2)]],
     const device half*   X       [[buffer(3)]],
     device float*        Y       [[buffer(4)]],
     device ArgmaxOut*    parts   [[buffer(5)]],
@@ -3473,9 +3510,9 @@ kernel void qmv_q4_g64_f16x_indexed_max(
             #pragma clang loop unroll(full)
             for (uint rr = 0; rr < 2u; rr++) {
                 uint ro = orig[rr];
-                uint4 uq = *((const device uint4*)(W + (ulong)ro * KW + wi));
-                float sc = bf16_to_f32(S[(ulong)ro * KG + g]);
-                float bi = bf16_to_f32(B[(ulong)ro * KG + g]);
+                uint4 uq = q4_load_u32x4(W, (ulong)ro * KW + wi);
+                float sc = bf16_to_f32(q4_load_u16(S, (ulong)ro * KG + g));
+                float bi = bf16_to_f32(q4_load_u16(B, (ulong)ro * KG + g));
                 acc[rr] = fma(sc, q4_dot32_f16x_magic(uq, xv), fma(bi, xs, acc[rr]));
             }
         }
@@ -3504,9 +3541,9 @@ kernel void qmv_q4_g64_f16x_indexed_max(
 }
 
 kernel void mma_qmm8_lmhead_max_f16x_indexed(
-    const device uint*   W       [[buffer(0)]],
-    const device ushort* S       [[buffer(1)]],
-    const device ushort* B       [[buffer(2)]],
+    const device uchar*  W       [[buffer(0)]],
+    const device uchar*  S       [[buffer(1)]],
+    const device uchar*  B       [[buffer(2)]],
     const device half*   X       [[buffer(3)]],
     device float*        Y       [[buffer(4)]],
     device ArgmaxOut*    parts   [[buffer(5)]],
@@ -3555,9 +3592,9 @@ kernel void mma_qmm8_lmhead_max_f16x_indexed(
         #pragma clang loop unroll(full)
         for (uint t = 0; t < TN; t++) {
             uint n = orig_n[t];
-            wqs[t] = *(const device uint2*)(W + (ulong)n * KW + 8u * g + 2u * b);
-            scs[t] = bf16_to_f32(S[(ulong)n * G + g]);
-            bis[t] = bf16_to_f32(B[(ulong)n * G + g]);
+            wqs[t] = q4_load_u32x2(W, (ulong)n * KW + 8u * g + 2u * b);
+            scs[t] = bf16_to_f32(q4_load_u16(S, (ulong)n * G + g));
+            bis[t] = bf16_to_f32(q4_load_u16(B, (ulong)n * G + g));
         }
 
         uint kx = 64u * g + 16u * sb + 4u * se;
@@ -6695,9 +6732,9 @@ constant uint FC_BS_D [[function_constant(10)]];
 // Build 1-bit sign(W) [V, KW] + float2 W_meta [V] in STRIDE-2048 interleaved order once at startup (~2.5 ms).
 // Simdgroup s (0..2047) owns orig_row = r * 2048 + s (r = 0..R-1), stored contiguously at slot = s * R + r!
 kernel void lmh_build_bitscreen(
-    const device uint*   W      [[buffer(0)]], // Q4_g64 [V, D/8]
-    const device ushort* S      [[buffer(1)]], // bf16 [V, D/64]
-    const device ushort* B      [[buffer(2)]], // bf16 [V, D/64]
+    const device uchar*  W      [[buffer(0)]], // Q4_g64 [V, D/8]
+    const device uchar*  S      [[buffer(1)]], // bf16 [V, D/64]
+    const device uchar*  B      [[buffer(2)]], // bf16 [V, D/64]
     device uint*         W_bits [[buffer(3)]], // [V, D/32]
     device float2*       W_meta [[buffer(4)]], // [V]
     constant uint&       V      [[buffer(5)]],
@@ -6725,9 +6762,9 @@ kernel void lmh_build_bitscreen(
         uint kw = k * 32u + lane;
         if (kw < bs_kw) {
             uint g  = kw >> 1; // Q4 group-64
-            uint4 uq = *((const device uint4*)(W + (ulong)row * q4_w + kw * 4u));
-            float sc = bf16_to_f32(S[(ulong)row * q4_g + g]);
-            float bi = bf16_to_f32(B[(ulong)row * q4_g + g]);
+            uint4 uq = q4_load_u32x4(W, (ulong)row * q4_w + kw * 4u);
+            float sc = bf16_to_f32(q4_load_u16(S, (ulong)row * q4_g + g));
+            float bi = bf16_to_f32(q4_load_u16(B, (ulong)row * q4_g + g));
             uint ws[4] = {uq.x, uq.y, uq.z, uq.w};
             uint mask = 0u;
             #pragma clang loop unroll(full)
@@ -7047,9 +7084,9 @@ kernel void bitscreen_select_cands(
 // Stage 2: Exact Q4_g64 rescore on the <=256 candidates per batch row -> exact FP32 logits + ArgmaxOut parts!
 // Grid: (64, B, 1), TG: (32, 4, 1) (1 row/sg = 4 rows/TG -> 64 * 4 = 256 slots exact -> saturates all 40 M4 Max cores even at B=1!)
 kernel void bitscreen_rescore_q4(
-    const device uint*   W        [[buffer(0)]],
-    const device ushort* S        [[buffer(1)]],
-    const device ushort* B        [[buffer(2)]],
+    const device uchar*  W        [[buffer(0)]],
+    const device uchar*  S        [[buffer(1)]],
+    const device uchar*  B        [[buffer(2)]],
     const device half*   X        [[buffer(3)]], // [M, 5120]
     const device uint*   cands    [[buffer(4)]], // [M, 256]
     const device uint*   cand_cnt [[buffer(5)]], // [M]
@@ -7088,9 +7125,9 @@ kernel void bitscreen_rescore_q4(
                 xv[j] = v;
                 xs += (float(v.x) + float(v.y)) + (float(v.z) + float(v.w));
             }
-            uint4 uq = *((const device uint4*)(W + (ulong)ro * KW + wi));
-            float sc = bf16_to_f32(S[(ulong)ro * KG + g]);
-            float bi = bf16_to_f32(B[(ulong)ro * KG + g]);
+            uint4 uq = q4_load_u32x4(W, (ulong)ro * KW + wi);
+            float sc = bf16_to_f32(q4_load_u16(S, (ulong)ro * KG + g));
+            float bi = bf16_to_f32(q4_load_u16(B, (ulong)ro * KG + g));
             acc = fma(sc, q4_dot32_f16x_magic(uq, xv), fma(bi, xs, acc));
         }
         float v = simd_sum(acc);

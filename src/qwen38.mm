@@ -499,7 +499,7 @@ Qwen38Model::Qwen38Model(MetalContext& ctx, const std::string& model_dir, int ma
         }
     }
 
-    store_.load_dir(ctx_.device(), model_dir, skip_prefixes);
+    store_.load_dir(ctx_.device(), model_dir, skip_prefixes, /*prefetch_now=*/true, /*allow_unaligned_q4=*/true);
 
     std::string lm_pfx = store_.has("language_model.model.norm.weight")
         ? "language_model."
@@ -520,7 +520,7 @@ Qwen38Model::Qwen38Model(MetalContext& ctx, const std::string& model_dir, int ma
         if (store_.has(model_pfx + "embed_tokens.weight")) {
             embed_tokens_ = load_q4(store_, model_pfx + "embed_tokens");
         } else {
-            embed_store_.load_dir_only(ctx_.device(), model_dir, {model_pfx + "embed_tokens."}, /*prefetch_now=*/true);
+            embed_store_.load_dir_only(ctx_.device(), model_dir, {model_pfx + "embed_tokens."}, /*prefetch_now=*/true, /*allow_unaligned_q4=*/true);
             embed_tokens_ = load_q4(embed_store_, model_pfx + "embed_tokens");
         }
         lm_head_ = embed_tokens_;
@@ -707,11 +707,11 @@ Qwen38Model::Qwen38Model(MetalContext& ctx, const std::string& model_dir, int ma
             if (std::filesystem::is_directory(resolved_mtp)) {
                 for (const auto& entry : std::filesystem::directory_iterator(resolved_mtp)) {
                     if (entry.path().extension() == ".safetensors") {
-                        mtp_store_.load_file(ctx_.device(), entry.path().string());
+                        mtp_store_.load_file(ctx_.device(), entry.path().string(), "", /*prefetch_now=*/true, {}, /*allow_unaligned_q4=*/true);
                     }
                 }
             } else {
-                mtp_store_.load_file(ctx_.device(), resolved_mtp);
+                mtp_store_.load_file(ctx_.device(), resolved_mtp, "", /*prefetch_now=*/true, {}, /*allow_unaligned_q4=*/true);
             }
             ms = &mtp_store_;
             mp = mtp_store_.has("mtp.fc.weight") ? "mtp." : "";
@@ -842,7 +842,7 @@ Qwen38Model::Qwen38Model(MetalContext& ctx, const std::string& model_dir, int ma
         if (!mtp_loaded_ && !dflash_loaded_ && !force_gpu_embed && cpu_embed_.open(model_dir, model_pfx + "embed_tokens")) {
             use_cpu_embed_ = true;
         } else {
-            embed_store_.load_dir_only(ctx_.device(), model_dir, {model_pfx + "embed_tokens."}, /*prefetch_now=*/false);
+            embed_store_.load_dir_only(ctx_.device(), model_dir, {model_pfx + "embed_tokens."}, /*prefetch_now=*/false, /*allow_unaligned_q4=*/true);
             embed_tokens_ = load_q4(embed_store_, model_pfx + "embed_tokens");
         }
     }
