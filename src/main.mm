@@ -39,7 +39,7 @@ static void print_usage() {
         "Options:\n"
         "  --max-tokens N       Max tokens to generate (default: 256)\n"
         "  --max-seq N          KV cache capacity for full-attention layers (default: 8192)\n"
-        "  --kv-bits N          Full-attention KV cache precision: 16|8|4 (default: 16)\n"
+        "  --kv-bits N          Full-attention KV cache precision: 16|8|4 (default: 8)\n"
         "  --sparse-kv-budget N Optional Quest query-aware block-sparse decode budget (0 = exact dense, e.g. 8192 or 12288)\n"
         "  --temp T             Sampling temperature, 0 = greedy (default: 0.0)\n"
         "  --top-k K            Top-k cutoff (default: 20)\n"
@@ -130,7 +130,7 @@ int main(int argc, char** argv) {
     int port = 8089;
     int max_tokens = 256;
     int max_seq = 8192;
-    int kv_bits = 16;
+    int kv_bits = 8;
     int ane_share_layers = 0;
     int sparse_kv_budget = 0;
     int prompt_tokens_bench = 128;

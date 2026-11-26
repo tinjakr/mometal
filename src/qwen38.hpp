@@ -22,7 +22,7 @@ public:
     Qwen38Model(MetalContext& ctx, const std::string& model_dir, int max_seq_len = 8192,
                 const std::string& mtp_dir = "", int mtp_depth = 5, bool enable_pld = true,
                 const std::string& ane_models_dir = "auto", const std::string& ane_tag = "auto",
-                int kv_bits = 16, int ane_share_layers = 0, int sparse_kv_budget = 0,
+                int kv_bits = 8, int ane_share_layers = 0, int sparse_kv_budget = 0,
                 const std::string& dflash_dir = "");
     ~Qwen38Model() override;
 
@@ -155,7 +155,7 @@ private:
     int lin_conv_dim_ = 10240;
     int max_seq_len_ = 8192;
     int kv_cap_ = 0; // Round 33: Lazy KV capacity grown on demand up to max_seq_len_!
-    int kv_bits_ = 16; // 16 (FP16), 8 (Q8_G64), or 4 (Q4_G64)
+    int kv_bits_ = 8; // 16 (FP16), 8 (Q8_G64), or 4 (Q4_G64)
     int mtp_kv_bits_ = 4; // Lossless KV4 for 1-layer MTP drafter (independent of target kv_bits_!)
     int sparse_kv_budget_ = 0; // Optional Quest block-sparse decode budget (0 = exact dense)
     static constexpr uint32_t QUEST_PAGE_SIZE = 32u;
