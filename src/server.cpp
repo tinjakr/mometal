@@ -79,6 +79,9 @@ bool read_http_request(int fd, std::string& method, std::string& path, std::stri
     if (lower_hdrs.find("transfer-encoding: chunked") != std::string::npos) {
         chunked = true;
     }
+    if (lower_hdrs.find("expect: 100-continue") != std::string::npos) {
+        send_str(fd, "HTTP/1.1 100 Continue\r\n\r\n");
+    }
 
     body = buf.substr(hdr_end + 4);
     if (chunked) {
@@ -653,6 +656,11 @@ void run_http_server(Model& model, const Tokenizer& tok, const ServerConfig& cfg
                     }
                     return model.forward(toks, n, out_am, st);
                 };
+
+                const size_t new_pf_toks = prompt_ids.size() - static_cast<size_t>(start_idx);
+                std::fprintf(stderr, "[req] prefill prompt=%zu (cached=%d, new=%zu, tools=%zu, stream=%d)...\n",
+                             prompt_ids.size(), start_idx, new_pf_toks, tools_json.size(), stream ? 1 : 0);
+                std::fflush(stderr);
 
                 if (sys_ckpt_len > start_idx) {
                     StepStats s1{};

@@ -101,7 +101,7 @@ python3 scripts/probe_m_chip.py
 
 ## Caveats
 
-- Single-copy ANE-Share depends on Apple's undocumented Mach-O `model.hwx` `__KERN*` layout and readable `/Library/Caches/com.apple.aned/.../ModelAssetsCache`. If a macOS update alters the binary layout or permissions, boot-time `weight.bin` verification catches the mismatch, prints a diagnostic, unloads ANE completely, and falls back cleanly to GPU-only mode without duplicating weights.
+- Single-copy ANE-Share reads Apple's undocumented Mach-O `model.hwx` `__KERN*` layout inside `/Library/Caches/com.apple.aned/.../ModelAssetsCache`, which macOS protects with SIP (`com.apple.rootless`). Enabling `--ane-share` currently requires disabling SIP and granting your user read access (`sudo chmod -R +a "user:$USER allow list,search,readattr,readextattr,readsecurity,file_inherit,directory_inherit" /Library/Caches/com.apple.aned`). With SIP enabled, `mometal` detects `EACCES` immediately and falls back cleanly to GPU-only mode (GPU-only + `--dflash` works out of the box without touching SIP, and never duplicates weights).
 - Cross-chip `lut4` / `nf4` layouts were verified bit-exact for `h13g` (M1) through `h17g` (M5) via `ANECompiler.framework`; live throughput was measured on M4 Max.
 
 ## License

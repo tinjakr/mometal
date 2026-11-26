@@ -8,6 +8,7 @@
 #include "sampler.hpp"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -327,6 +328,17 @@ Qwen38Model::Qwen38Model(MetalContext& ctx, const std::string& model_dir, int ma
     std::string auto_fmt = resolve_ane_build_format("auto");
     std::string effective_tag = ane_tag;
     if (resolved_ane == "off" || resolved_ane == "none") {
+        resolved_ane.clear();
+    } else if (access("/Library/Caches/com.apple.aned", R_OK | X_OK) != 0) {
+        const int err = errno;
+        if (ane_share_layers > 0 || resolved_ane != "auto") {
+            std::fprintf(stderr,
+                         "[ane-share] Cannot read /Library/Caches/com.apple.aned (%s); falling back to GPU-only.\n"
+                         "[ane-share] Single-copy ANE-Share currently requires SIP disabled + read ACL:\n"
+                         "[ane-share]   sudo chmod -R +a \"user:$USER allow list,search,readattr,readextattr,readsecurity,file_inherit,directory_inherit\" /Library/Caches/com.apple.aned\n"
+                         "[ane-share] (GPU-only + DFlash 2 works out of the box with SIP enabled.)\n",
+                         std::strerror(err));
+        }
         resolved_ane.clear();
     } else if (resolved_ane == "auto") {
         std::string c1 = model_dir + "/ane-models";

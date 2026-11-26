@@ -7,6 +7,7 @@
 #include <array>
 #include <atomic>
 #include <cctype>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -920,10 +921,18 @@ AneShareManager::AneShareManager(MetalContext& ctx, const std::string& ane_model
         };
 
         // Tier 2: Scan ONLY own-process ModelAssetsCache/<proc>_* first (64 files vs 681+!)
+        const bool can_read_aned = (access(aned_root.c_str(), R_OK | X_OK) == 0);
+        if (!can_read_aned) {
+            std::fprintf(stderr,
+                         "[ane-share] Cannot read %s (%s). Single-copy ANE-Share requires SIP disabled + read ACL:\n"
+                         "[ane-share]   sudo chmod -R +a \"user:$USER allow list,search,readattr,readextattr,readsecurity,file_inherit,directory_inherit\" %s\n"
+                         "[ane-share] (GPU-only fallback works out of the box with SIP enabled.)\n",
+                         aned_root.c_str(), std::strerror(errno), aned_root.c_str());
+        }
         std::string proc = current_proc_basename();
         std::string osver = macos_build_version();
         std::error_code ec_root;
-        if (!proc.empty() && fs::exists(aned_root, ec_root) && !ec_root) {
+        if (can_read_aned && !proc.empty() && fs::exists(aned_root, ec_root) && !ec_root) {
             std::vector<std::string> own_paths;
             std::vector<uint64_t> own_sizes;
             std::vector<fs::path> ver_dirs;
@@ -957,7 +966,7 @@ AneShareManager::AneShareManager(MetalContext& ctx, const std::string& ane_model
         }
 
         // Tier 3: Full fallback scan across ALL ModelAssetsCache owner dirs if any layers remain unmatched
-        if (shared_count_ < num_layers && fs::exists(aned_root, ec_root) && !ec_root) {
+        if (can_read_aned && shared_count_ < num_layers && fs::exists(aned_root, ec_root) && !ec_root) {
             std::vector<std::string> all_paths;
             std::vector<uint64_t> all_sizes;
             std::error_code ec_ver;
