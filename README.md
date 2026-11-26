@@ -4,11 +4,11 @@ From-scratch C++20, Objective-C++, and Metal inference engine for Apple Silicon 
 
 Full engineering report & open CC BY 4.0 dataset: **[starmo.ai/reports/mometal-ane-share](https://starmo.ai/reports/mometal-ane-share)**
 
-## Why single-copy ANE weight sharing?
+## How single-copy ANE weight sharing works
 
-Offloading 27B dense MLP prefill to Apple's Neural Engine more than doubles prompt speed on Apple Silicon, but standard 2-copy execution wires both the 15.4 GiB `.safetensors` weights for Metal GPU decode *and* 8.7 GiB of compiled CoreML `model.hwx` + I/O buffers (`25.20 GiB` active at 4k, `27.40 GiB` at 66k). On a 48 GiB M4 Max on AC power, 2-copy triggers **343.5 GiB of live VM compressor thrashing** during 66k prefill (`−20%`) and faults **9.06 GiB of decompressions** during decode (`−19%`).
+Offloading 27B dense MLP prefill to Apple's Neural Engine more than doubles prompt speed on Apple Silicon, but pairing ANE prefill with Metal decode normally wires both the 15.4 GiB `.safetensors` checkpoint and 8.7 GiB of compiled CoreML `model.hwx` + I/O buffers (~25 GiB active, pushing 48 GiB Macs into VM compression at long context).
 
-**`mometal`** enforces a strict **single-copy ANE-Share** path (zero 2-copy duplication; if any layer cannot be verified single-copy, ANE is unloaded and the engine falls back cleanly to pure Metal GPU-only). It parses Apple's Mach-O (`0xbeefface`) `__KERN*` 16-chunk 4-bit weight layout inside `/Library/Caches/com.apple.aned/.../model.hwx` (across any readable signed or unsigned owner cache directory), runs a boot-time bit-exact verification against `weight.bin` (32-byte group-0 fingerprint + mid/last-group spot checks per projection, accelerated to `~77–88 ms` via `.hwx_manifest`), and maps those files read-only via `MAP_SHARED` so Metal GPU decode reads the **exact same wired physical pages** as `com.apple.aned` while leaving duplicate `.safetensors` MLPs unmapped and unwired.
+**`mometal`** enforces a strict **single-copy ANE-Share** path (if any layer cannot be verified single-copy, ANE is unloaded and the engine falls back cleanly to pure Metal GPU-only). It parses Apple's Mach-O (`0xbeefface`) `__KERN*` 16-chunk 4-bit weight layout inside `/Library/Caches/com.apple.aned/.../model.hwx` (across any readable signed or unsigned owner cache directory), runs a boot-time bit-exact verification against `weight.bin` (32-byte group-0 fingerprint + mid/last-group spot checks per projection, accelerated to `~77–88 ms` via `.hwx_manifest`), and maps those files read-only via `MAP_SHARED` so Metal GPU decode reads the **exact same wired physical pages** as `com.apple.aned` while leaving duplicate `.safetensors` MLPs unmapped and unwired.
 
 ### Cross-Chip Apple Silicon Support (M1–M5) & Wave 3 `nf4`
 - **Metal 3.0 shaders across M1–M5**: `common.metal`, `qwen38.metal`, `dflash.metal`, `inkling2.metal`, and `vision.metal` all compile under Metal 3.0 (M1/M2+), while automatically enabling Metal 3.1 native `simdgroup_bfloat8x8` in `vision.metal` on Apple9+ (M3/M4/M5).
@@ -21,21 +21,21 @@ Offloading 27B dense MLP prefill to Apple's Neural Engine more than doubles prom
 
 ## Verified Apple M4 Max (48 GiB, AC Power) Benchmarks
 
-### v1.3 Head-to-Head vs Splash 1.7.3 (Same Model `mlx-community/Qwen3.8-27B-4bit`, M4 Max 48 GiB, AC Power, KV8, `SPEED-Bench`)
+### v1.3 DFlash 2 & Splash 1.7.3 Comparison (Same Model `mlx-community/Qwen3.8-27B-4bit`, M4 Max 48 GiB, AC Power, KV8, `SPEED-Bench`)
 
-Apples-to-apples comparison on identical [`mlx-community/Qwen3.8-27B-4bit`](https://huggingface.co/mlx-community/Qwen3.8-27B-4bit) weights + [`incoai/Qwen3.8-27B-DFlash2`](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2) drafter (`KV8`, AC power, 46/46 clean v1.3 runs, 0 errors). Full raw dataset published at [`benchmarks/v13_splash_head2head.json`](benchmarks/v13_splash_head2head.json):
+Same-checkpoint comparison on identical [`mlx-community/Qwen3.8-27B-4bit`](https://huggingface.co/mlx-community/Qwen3.8-27B-4bit) weights + [`incoai/Qwen3.8-27B-DFlash2`](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2) drafter (`KV8`, AC power, 46/46 clean v1.3 runs, 0 errors). Full raw dataset published at [`benchmarks/v13_splash_head2head.json`](benchmarks/v13_splash_head2head.json):
 
 | Engine | Ready | Idle / 32k FP | SB-code (`none`) med / mean | SB-code (`med`) med / mean | Transcripts med / mean | Cold PF `2k / 8k / 16k / 32k` | Dec `2k / 8k / 16k / 32k / 32k-m` |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | `splash_173` (ANE+DFlash2) | 95.75 s* | 18.59 / 23.73 GiB | 130.2 / 128.9 | 119.0 / 118.8 | **112.3 / 103.3** | 506 / 499 / 470 / 424 | **105.8** / 92.6 / 97.7 / 88.6 / **83.2** |
 | `mometal v1.2` ANE (MTP) | **0.82 s** | **6.06 / 7.65 GiB** | 123.4 / 115.6 | 99.4 / 97.1 | 93.5 / 87.8 | **676 / 662 / 604 / 519** | 83.0 / 97.0 / **110.2** / 104.1 / 69.0 |
 | `mometal v1.2` GPU (MTP) | 6.10 s | 14.93 / 16.52 GiB | 123.6 / 115.6 | 102.0 / 99.9 | 93.1 / 86.4 | 261 / 256 / 247 / 231 | 78.4 / **114.8** / 85.8 / **120.6** / 58.6 |
-| **`mometal v1.3` ANE + DFlash2** | **1.22 s (78.5×)** | **6.81 / 8.35 GiB**† | **136.2** / 128.8 | 118.9 / 116.3 | 106.3 / 98.6 | **649 / 658 / 600 / 515 (+21–32%)** | 90.9 / **109.5 (+18%)** / **106.8 (+9%)** / **118.3 (+34%)** / 73.0 |
-| **`mometal v1.3` GPU + DFlash2** | **8.14 s (11.8×)** | **15.65 / 17.19 GiB** | **136.8 / 130.7** | **120.5 / 119.0** | 111.7 / 99.9 | 270 / 264 / 255 / 239 | 94.1 / **112.4 (+21%)** / 96.7 / **110.0 (+24%)** / 70.7 |
+| **`mometal v1.3` ANE + DFlash2** | **1.22 s** | **6.81 / 8.35 GiB**† | **136.2** / 128.8 | 118.9 / 116.3 | 106.3 / 98.6 | **649 / 658 / 600 / 515 (+21–32%)** | 90.9 / **109.5 (+18%)** / **106.8 (+9%)** / **118.3 (+34%)** / 73.0 |
+| **`mometal v1.3` GPU + DFlash2** | **8.14 s** | **15.65 / 17.19 GiB** | **136.8 / 130.7** | **120.5 / 119.0** | 111.7 / 99.9 | 270 / 264 / 255 / 239 | 94.1 / **112.4 (+21%)** / 96.7 / **110.0 (+24%)** / 70.7 |
 
-- **Exact-weight `mometal v1.3` GPU + DFlash2**: Beats Splash 1.7.3 on **both median and mean** of both `SPEED-Bench` coding suites (`SB-code none`: **`136.8 / 130.7`** vs `130.2 / 128.9`, peaking at `163.6 tok/s` on `sb_code_4`; `SB-code medium`: **`120.5 / 119.0`** vs `119.0 / 118.8`) plus `8k` (`+21%`) and `32k` (`+24%`) decode using identical `g64` weights, while using **`−2.9 to −6.5 GiB` less RAM** and starting `11.8×` faster.
-- **`mometal v1.3` ANE + DFlash2**: Hits **`136.2 tok/s`** median coding (`sb_code_0 = 151.1`, `sb_code_2 = 151.3`, `sb_code_4 = 154.4`), **`+9% to +34%` faster** `8k/16k/32k` decode, **`+21% to +32%` faster** `2k–32k` cold prefill (`−13.7 s` 32k TTFT), **`1.22 s`** server ready, and **`−3.1 to −6.7 GiB` less total RAM** (`†` even counting `~8.7 GiB` shared ANE `neural` weights alongside `6.81 / 8.35 GiB` process FP).
-- **Honest scope notes**: `*` Splash 1.7.3's `95.75 s` cold ready includes `61.4 s` of one-time first-start ANE calibration; Splash also supports `4–8` concurrent serving lanes and GGUF/MoE models, and led `Transcripts` (`112.3 / 103.3` vs `111.7 / 99.9`), `2k` decode (`105.8` vs `94.1`), and `32k-medium` (`83.2` vs `73.0`).
+- **Exact-weight `mometal v1.3` GPU + DFlash2**: Measures **`136.8 median / 130.7 mean`** on `SPEED-Bench` coding `none` (vs `130.2 / 128.9` for Splash 1.7.3, peaking at `163.6 tok/s` on `sb_code_4`) and **`120.5 / 119.0`** on `medium` reasoning (vs `119.0 / 118.8`), plus `+21%` at `8k` and `+24%` at `32k` decode on identical `g64` weights, using **`−2.9 to −6.5 GiB` less RAM** and `8.14 s` warm ready.
+- **`mometal v1.3` ANE + DFlash2**: Measures **`136.2 tok/s`** median coding (`sb_code_0 = 151.1`, `sb_code_2 = 151.3`, `sb_code_4 = 154.4`), **`+9% to +34%` faster** `8k/16k/32k` decode, **`+21% to +32%` faster** `2k–32k` cold prefill (`−13.7 s` 32k TTFT), **`1.22 s`** warm ready, and **`−3.1 to −6.7 GiB` less total RAM** (`†` including `~8.7 GiB` shared ANE `neural` weights alongside `6.81 / 8.35 GiB` process FP).
+- **Scope notes**: `*` Splash 1.7.3's `95.75 s` cold ready includes `61.4 s` of one-time first-start ANE calibration; Splash also supports `4–8` concurrent serving lanes and GGUF/MoE models, and measured higher on `Transcripts` (`112.3 / 103.3` vs `111.7 / 99.9`), `2k` decode (`105.8` vs `94.1`), and `32k-medium` (`83.2` vs `73.0`).
 
 ---
 
@@ -50,16 +50,15 @@ Checkpoint: [`netprojects/Qwen3.8-27B-pi-adapted-MLX-4bit`](https://huggingface.
 - **Memory & Zero-Swap 128k**: Phys FP drops **`−0.94 to −1.70 GiB`** across all contexts (**`6.05 GiB`** FP / `14.62 GiB` wired at `256–1k`, **`5.05 GiB`** FP / `13.64 GiB` wired with `--mtp off`), eliminating swap at `128k` (**`1.17 → 0.00 GiB`**, keeping **`8.31 GiB`** of ANE weights resident).
 - **Fast Boot & Native Builder**: Warm model load **`550–629 ms`** (`2.6–2.8×` faster vs `1,516–1,774 ms`), `FULL M=8` verify **`38.89 ms`** (vs `41.31 ms`), and 64-layer C++ `build-ane` in **`8.39 s` (`hf4`) / `7.23 s` (`nf4`)**.
 
-#### Head-to-head (3.7k cold prefill, 4-task greedy `T=0.0` mean, 384 tok each)
+#### Peer comparison (3.7k cold prefill, 4-task greedy `T=0.0` mean, 384 tok each)
 
-Original balanced interleaved `n=3` 3-mode AC-proof dataset (`v1.1`, raw dumps in [`benchmarks/raw_ac_proof/`](benchmarks/raw_ac_proof/)) shown alongside the verified **v1.2** AC-power measurement on the identical 4-task harness (`benchmarks/bench_hn_proof.py`):
+Balanced interleaved `n=3` AC-power baseline (`v1.1`, raw dumps in [`benchmarks/raw_ac_proof/`](benchmarks/raw_ac_proof/)) shown alongside the verified **v1.2** AC-power measurement on the identical 4-task harness (`benchmarks/bench_hn_proof.py`):
 
 | Engine | MLPs / KV | Cold 3.7k PF | Greedy Mean | Active RAM (GiB) | Process Wired | Swapped |
 |---|---|---:|---:|---:|---:|---:|
-| **`mometal v1.2` (1-copy ANE-Share)** | `hf4` / `KV8` | **646.0 tok/s** *(707.2 @ 4k)* | **98.2 tok/s** | **14.21 GiB** *(6.22 FP)* | **14.08 GiB** | **0.00 GiB** |
-| `mometal v1.1` (1-copy ANE-Share, `n=3`) | `hf4` / `KV8` | 621.9 tok/s *(684.7 @ 4k)* | 93.8 tok/s | 16.24 GiB | 15.05 GiB | 0.00 GiB |
+| **`mometal v1.2` (ANE-Share)** | `hf4` / `KV8` | **646.0 tok/s** *(707.2 @ 4k)* | **98.2 tok/s** | **14.21 GiB** *(6.22 FP)* | **14.08 GiB** | **0.00 GiB** |
+| `mometal v1.1` (ANE-Share, `n=3`) | `hf4` / `KV8` | 621.9 tok/s *(684.7 @ 4k)* | 93.8 tok/s | 16.24 GiB | 15.05 GiB | 0.00 GiB |
 | `mometal v1.1` (GPU-only exact `g64`, `n=3`) | `g64` / `KV8` | 271.5 tok/s | 91.6 tok/s *(+35% vs #2)* | 16.41 GiB | 15.21 GiB | 1.10 GiB |
-| `mometal v1.1` (2-copy ANE + `g64`, `n=3`) | `hf4`+`g64` / `KV8` | 464.7 tok/s *(629.8 w/o cache)* | 95.2 tok/s | 25.20 GiB | 23.95 GiB | 1.13 GiB |
 | `mlx-serve v26.11.3` (Zig/MLX + MTP) | `g64` / `KV8` | 263.0 tok/s | 68.1 tok/s | 16.48 GiB | — | — |
 | `oMLX v0.8.3` (Python/MLX + MTP) | `g64` / `BF16` | 260.3 tok/s | 64.0 tok/s | 18.44 GiB | — | — |
 | `TensorFold v1.3.4` (Zig/Metal MTP-6) | `g64` / `BF16` | 233.2 tok/s | 57.7 tok/s | 21.88 GiB | — | — |
@@ -178,7 +177,7 @@ python3 scripts/probe_m_chip.py
 ## Reproducing Benchmarks
 
 ```bash
-# AC-power interleaved n=3 3-mode verification + 66k live vm_stat paging proof
+# AC-power interleaved n=3 verification + 66k live vm_stat memory check
 MOMETAL_MODEL=~/models/qwen38-pi-adapted-mlx4 python3 benchmarks/verify_ac_3mode.py
 
 # WikiText-2 PPL/KL, HumanEval 164, matched-KV controls, and 4k-128k sweep
@@ -187,7 +186,7 @@ MOMETAL_MODEL=~/models/qwen38-pi-adapted-mlx4 python3 benchmarks/harden_suite.py
 
 ## Caveats
 
-- Single-copy ANE-Share depends on Apple's undocumented Mach-O `model.hwx` `__KERN*` layout and readable `/Library/Caches/com.apple.aned/.../ModelAssetsCache`. If a macOS update or unsupported chip alters the binary layout or permissions, the boot-time `weight.bin` verification catches the mismatch, prints a `stderr` diagnostic, unloads ANE completely, and falls back cleanly to GPU-only mode (never silently duplicating weights in 2-copy mode).
+- Single-copy ANE-Share depends on Apple's undocumented Mach-O `model.hwx` `__KERN*` layout and readable `/Library/Caches/com.apple.aned/.../ModelAssetsCache`. If a macOS update or unsupported chip alters the binary layout or permissions, the boot-time `weight.bin` verification catches the mismatch, prints a `stderr` diagnostic, unloads ANE completely, and falls back cleanly to GPU-only mode (never silently duplicating weights).
 - Cross-chip `lut4` / `nf4` binary layouts were verified bit-exact for `h13g` (M1) through `h17g` (M5) via `ANECompiler.framework`; live M1/M2/M3 ANE throughput and macOS 15 cache permissions can be checked locally with `python3 scripts/probe_m_chip.py`.
 - Both 4-bit ANE MLP conversion (`mometal build-ane` / auto-build on `--ane-share`) and inference (including `--dflash` on-the-fly NEON quantization) are 100% native C++20/Obj-C++/Metal with zero Python or MLX runtime dependencies. (`scripts/build_ane_mlps.py` remains available for optional calibration-stats SmoothQuant builds.)
 
