@@ -50,6 +50,7 @@ static void print_usage() {
         "  --raw                Skip chat template, tokenize prompt directly\n"
         "  --mtp MODE           MTP speculative decoding: auto|off|<path> (default: auto)\n"
         "  --mtp-depth N        Number of speculative draft tokens per round (default: auto [5 Qwen, 3 Inkling])\n"
+        "  --dflash DIR         DFlash 2 block-diffusion speculative drafter directory (e.g. Qwen3.8-27B-DFlash2)\n"
         "  --no-pld             Disable 4-gram prompt-lookup copy drafting\n"
         "  --ane-models DIR     Single-copy ANE-Share MLP directory: auto|off|<dir> (default: auto; falls back to GPU-only)\n"
         "  --ane-tag TAG        ANE model tag (e.g. hf4, lut4, nf4; default: auto per chip gen)\n"
@@ -63,13 +64,13 @@ static std::unique_ptr<Model> load_model(
     MetalContext& ctx, const std::string& dir, int max_seq, bool exact_nvfp4_act,
     const std::string& mtp_dir, int mtp_depth, bool enable_pld,
     const std::string& ane_models_dir, const std::string& ane_tag, int kv_bits, int ane_share_layers,
-    int sparse_kv_budget = 0
+    int sparse_kv_budget = 0, const std::string& dflash_dir = ""
 ) {
     Json cfg = parse_json(read_file_to_string(dir + "/config.json"));
     std::string mtype = cfg["model_type"].as_string();
     if (mtype == "qwen3_5" || mtype == "qwen3_5_text") {
         int q_depth = (mtp_depth > 0) ? mtp_depth : 5;
-        return std::make_unique<Qwen38Model>(ctx, dir, max_seq, mtp_dir, q_depth, enable_pld, ane_models_dir, ane_tag, kv_bits, ane_share_layers, sparse_kv_budget);
+        return std::make_unique<Qwen38Model>(ctx, dir, max_seq, mtp_dir, q_depth, enable_pld, ane_models_dir, ane_tag, kv_bits, ane_share_layers, sparse_kv_budget, dflash_dir);
     }
     if (mtype == "inkling2_loop" || mtype == "inkling2_loop_text") {
         int i_depth = (mtp_depth > 0) ? mtp_depth : 3;
@@ -114,6 +115,7 @@ int main(int argc, char** argv) {
     std::string save_ref_path;
     std::string eval_ref_path;
     std::string mtp_dir = "auto";
+    std::string dflash_dir;
     std::string ane_models_dir = "auto";
     std::string ane_tag = "auto";
     std::string ane_out_dir;
@@ -171,6 +173,7 @@ int main(int argc, char** argv) {
             else if (a == "--gen-tokens") gen_tokens_bench = std::stoi(next());
             else if (a == "--mtp") mtp_dir = next();
             else if (a == "--mtp-depth") mtp_depth = std::stoi(next());
+            else if (a == "--dflash") dflash_dir = next();
             else if (a == "--no-pld") enable_pld = false;
             else if (a == "--ane-models") ane_models_dir = next();
             else if (a == "--ane-tag") ane_tag = next();
@@ -232,7 +235,7 @@ int main(int argc, char** argv) {
         @autoreleasepool {
             ctx_ptr = std::make_unique<MetalContext>();
             model = load_model(*ctx_ptr, model_dir, max_seq, exact_nvfp4_act, mtp_dir, mtp_depth, enable_pld,
-                               ane_models_dir, ane_tag, kv_bits, ane_share_layers, sparse_kv_budget);
+                               ane_models_dir, ane_tag, kv_bits, ane_share_layers, sparse_kv_budget, dflash_dir);
         }
         MetalContext& ctx = *ctx_ptr;
         const ModelInfo& info = model->info();

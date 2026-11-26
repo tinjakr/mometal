@@ -62,8 +62,9 @@ public:
     // returns next token ID without copying logits to CPU!
     virtual int forward_greedy(int token, StepStats* stats = nullptr) = 0;
 
-    // MTP speculative decoding support (optional, active when --mtp loaded)
+    // MTP / DFlash speculative decoding support (optional, active when --mtp or --dflash loaded)
     virtual bool has_mtp() const { return false; }
+    virtual bool has_dflash() const { return false; }
     virtual int mtp_depth() const { return 0; }
 
     // Run one speculative draft+verify round starting from `anchor_token` (the most recently emitted

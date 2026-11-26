@@ -72,6 +72,14 @@ struct MtpGatherParams {
     uint32_t out_hid_idx[8];
 };
 struct PathReplayParams { uint32_t len, pre_pos, Hkv, D, kv_bits, pad0, pad1, pad2; uint32_t path[16]; };
+struct DFlashNormParams { uint32_t M, D; float eps; };
+struct DFlashConvParams { uint32_t M, D, group_size, stage; };
+struct DFlashKvWriteParams { uint32_t M, Hkv, D, pos_start, window; float rope_theta, eps; };
+struct DFlashQkvPrepParams { uint32_t M, Hq, Hkv, D, pos_start; float rope_theta, eps; };
+struct DFlashAttnParams { uint32_t M, Hq, Hkv, D, pos_start, ctx_len, window, num_splits; float scale; };
+struct DFlashTopKParams { uint32_t M, V, K, num_chunks; };
+struct DFlashCaptureParams { uint32_t M, D, num_targets, slot_idx, src_row_off, dst_row_off; };
+struct DFlashHiddenProjParams { uint32_t M, R, D; };
 struct AneShareParams {
     uint32_t M;
     uint32_t HID;
@@ -115,11 +123,13 @@ Qwen38Model::Q4Weight Qwen38Model::load_q4(const SafetensorsStore& st, const std
 Qwen38Model::Qwen38Model(MetalContext& ctx, const std::string& model_dir, int max_seq_len,
                          const std::string& mtp_dir, int mtp_depth, bool enable_pld,
                          const std::string& ane_models_dir, const std::string& ane_tag,
-                         int kv_bits, int ane_share_layers, int sparse_kv_budget)
+                         int kv_bits, int ane_share_layers, int sparse_kv_budget,
+                         const std::string& dflash_dir)
     : ctx_(ctx), max_seq_len_(max_seq_len), kv_bits_(kv_bits), sparse_kv_budget_(sparse_kv_budget),
       pld_enabled_(enable_pld),
       mtp_depth_(std::clamp(mtp_depth, 1, MAX_VERIFY - 1)),
       cur_mtp_depth_(std::clamp(mtp_depth, 1, MAX_VERIFY - 1)) {
+    const bool want_dflash = !dflash_dir.empty() && dflash_dir != "off" && dflash_dir != "none";
     if (kv_bits_ != 16 && kv_bits_ != 8 && kv_bits_ != 4) {
         throw std::runtime_error("Unsupported --kv-bits value (expected 16, 8, or 4): " + std::to_string(kv_bits_));
     }
@@ -379,7 +389,7 @@ Qwen38Model::Qwen38Model(MetalContext& ctx, const std::string& model_dir, int ma
         skip_prefixes.push_back("model.language_model.embed_tokens.");
         skip_prefixes.push_back("model.embed_tokens.");
     }
-    if (mtp_dir == "off" || mtp_dir == "none") {
+    if (want_dflash || mtp_dir == "off" || mtp_dir == "none") {
         skip_prefixes.push_back("mtp.");
     }
     if (!resolved_ane.empty()) {
@@ -598,9 +608,73 @@ Qwen38Model::Qwen38Model(MetalContext& ctx, const std::string& model_dir, int ma
     size_t C_attn = (ane_ && ane_->ready())
         ? static_cast<size_t>(AneMlpEngine::MAX_SUBS * ane_->block_rows() + 64)
         : C_mlp;
+    c_attn_ = C_attn;
 
-    // Optional MTP drafter loading (check already-mapped bundled store_ FIRST to avoid double-mapping model-mtp.safetensors!)
-    std::string resolved_mtp = mtp_dir;
+    // Optional DFlash 2 block-diffusion drafter (replaces 1-layer MTP & BitScreen -> saves ~288 MiB!)
+    if (want_dflash) {
+        dflash_ = std::make_unique<DFlashEngine>(ctx_, dflash_dir);
+        const DFlashConfig& dcfg = dflash_->config();
+        if (!dflash_->ready()) {
+            throw std::runtime_error("Failed to initialize DFlash 2 engine from " + dflash_dir);
+        }
+        if (dcfg.hidden_size != hidden_size_ || dcfg.vocab_size != vocab_size_) {
+            throw std::runtime_error("DFlash 2 hidden_size/vocab_size mismatch with target Qwen3.8 model");
+        }
+        if (dcfg.block_size < 2 || dcfg.block_size > MAX_VERIFY) {
+            throw std::runtime_error("Unsupported DFlash 2 block_size (expected 2.." + std::to_string(MAX_VERIFY) + ")");
+        }
+
+        ctx_.load_shader_file("dflash", shader_dir + "/dflash.metal");
+        pso_df_rmsnorm_f16_     = ctx_.pipeline("dflash", "dflash_rmsnorm_f16");
+        pso_df_conv_prep_f16_   = ctx_.pipeline("dflash", "dflash_conv_prepare_f16");
+        pso_df_conv_finish_f32_ = ctx_.pipeline("dflash", "dflash_conv_finish_add_f32");
+        pso_df_kv_write_        = ctx_.pipeline("dflash", "dflash_context_kv_write");
+        pso_df_qkv_prep_        = ctx_.pipeline("dflash", "dflash_qkv_prep");
+        pso_df_attn_p1_         = ctx_.pipeline("dflash", "dflash_attn_bidir_window_p1");
+        pso_df_attn_p2_         = ctx_.pipeline("dflash", "dflash_attn_bidir_window_p2");
+        pso_df_topk16_p1_       = ctx_.pipeline("dflash", "dflash_lmhead_topk16_p1");
+        pso_df_topk16_p2_       = ctx_.pipeline("dflash", "dflash_lmhead_topk16_p2");
+        pso_df_capture_hidden_  = ctx_.pipeline("dflash", "dflash_capture_hidden");
+        pso_df_hidden_proj_f16_ = ctx_.pipeline("dflash", "dflash_hidden_proj_f16");
+
+        // 5-layer FP16 sliding-window ring KV cache ([Hkv, window, D] per layer, ~40 MiB total!)
+        df_k_cache_.resize(static_cast<size_t>(dcfg.num_layers), nil);
+        df_v_cache_.resize(static_cast<size_t>(dcfg.num_layers), nil);
+        const size_t ring_sz = static_cast<size_t>(dcfg.num_kv_heads) * dcfg.sliding_window * dcfg.head_dim * sizeof(uint16_t);
+        for (int l = 0; l < dcfg.num_layers; ++l) {
+            df_k_cache_[l] = ctx_.alloc_private(ring_sz);
+            df_v_cache_[l] = ctx_.alloc_private(ring_sz);
+            kv_bytes += 2 * ring_sz;
+        }
+
+        // Compact target-hidden capture buffer (per-chunk, NOT 2048 rows!) + block-8 draft scratch (~0.75 MiB)
+        const size_t n_tgt = dcfg.target_layer_ids.size();
+        const size_t B = static_cast<size_t>(dcfg.block_size);
+        const size_t P = B - 1u;
+        const size_t H = static_cast<size_t>(dcfg.hidden_size);
+        const size_t G_dyn = 2u * static_cast<size_t>(dcfg.conv_kernel_size) * (H / static_cast<size_t>(dcfg.conv_group_size));
+        const size_t num_chunks = ceil_div(static_cast<uint32_t>(vocab_size_), 2048u);
+
+        df_cap_rows_      = (ane_ && ane_->ready()) ? (2 * C_attn) : C_attn;
+        buf_df_capture_   = ctx_.alloc_private(df_cap_rows_ * n_tgt * H * sizeof(uint16_t));
+        buf_df_ids_       = ctx_.alloc_shared(B * sizeof(int));
+        buf_df_h_         = ctx_.alloc_private(B * H * sizeof(float));
+        buf_df_x_         = ctx_.alloc_private(B * H * sizeof(uint16_t));
+        buf_df_x2_        = ctx_.alloc_private(B * H * sizeof(uint16_t));
+        buf_df_dyn_       = ctx_.alloc_private(B * G_dyn * sizeof(float));
+        buf_df_o_         = ctx_.alloc_private(B * H * sizeof(float));
+        buf_df_q_h_       = ctx_.alloc_private(static_cast<size_t>(dcfg.num_heads) * 8u * dcfg.head_dim * sizeof(uint16_t));
+        buf_df_kn_        = ctx_.alloc_private(static_cast<size_t>(dcfg.num_kv_heads) * B * dcfg.head_dim * sizeof(uint16_t));
+        buf_df_vn_        = ctx_.alloc_private(static_cast<size_t>(dcfg.num_kv_heads) * B * dcfg.head_dim * sizeof(uint16_t));
+        buf_df_attn_out_  = ctx_.alloc_private(B * static_cast<size_t>(dcfg.num_heads) * dcfg.head_dim * sizeof(uint16_t));
+        buf_df_topk_part_ = ctx_.alloc_private(P * num_chunks * static_cast<size_t>(dcfg.selector_top_k) * sizeof(LogitCand));
+        buf_df_topk_out_  = ctx_.alloc_shared(P * static_cast<size_t>(dcfg.selector_top_k) * sizeof(LogitCand));
+        buf_df_sel_h_     = ctx_.alloc_shared(P * static_cast<size_t>(dcfg.selector_rank) * sizeof(uint16_t));
+        dflash_loaded_ = true;
+    }
+
+    // Optional MTP drafter loading (skipped when DFlash 2 is active; check bundled store_ FIRST!)
+    std::string resolved_mtp = want_dflash ? std::string() : mtp_dir;
     if (resolved_mtp == "off" || resolved_mtp == "none") {
         resolved_mtp.clear();
     } else if (resolved_mtp == "auto") {
@@ -715,7 +789,17 @@ Qwen38Model::Qwen38Model(MetalContext& ctx, const std::string& model_dir, int ma
         mtp_k_bounds_ = nil;
         mtp_quest_built_pages_ = 0;
 
-        // Allocate ping-pong MAX_VERIFY-token record buffers for Lazy Fused GDN Replay (ZERO bak_ssm_state_ -> -66 MB RAM!)
+        buf_mtp_seed_hid_   = ctx_.alloc_private(16ull * hidden_size_ * sizeof(float));
+        buf_mtp_last_hid_   = ctx_.alloc_private(hidden_size_ * sizeof(float));
+        buf_mtp_verify_hid_ = ctx_.alloc_private(static_cast<size_t>(MAX_VERIFY) * hidden_size_ * sizeof(float));
+        buf_mtp_in_hid_     = ctx_.alloc_private((C_attn + 1) * hidden_size_ * sizeof(float));
+        buf_mtp_sync_ids_   = ctx_.alloc_shared(static_cast<size_t>(MAX_VERIFY + 10) * sizeof(int));
+        buf_draft_dists_    = ctx_.alloc_shared(16ull * sizeof(DraftDist));
+        mtp_loaded_ = true;
+    }
+
+    // Shared speculative verification & Lazy Fused GDN Replay buffers (used by BOTH MTP and DFlash 2!)
+    if (mtp_loaded_ || dflash_loaded_) {
         for (int sl = 0; sl < 2; ++sl) {
             rec_qkv_[sl].resize(num_layers_, nil);
             rec_a_[sl].resize(num_layers_, nil);
@@ -731,27 +815,19 @@ Qwen38Model::Qwen38Model(MetalContext& ctx, const std::string& model_dir, int ma
                 kv_bytes += static_cast<size_t>(MAX_VERIFY) * (lin_conv_dim_ + 2 * lin_num_v_heads_) * sizeof(float);
             }
         }
-
-        buf_mtp_seed_hid_   = ctx_.alloc_private(16ull * hidden_size_ * sizeof(float));
-        buf_mtp_last_hid_   = ctx_.alloc_private(hidden_size_ * sizeof(float));
-        buf_mtp_verify_hid_ = ctx_.alloc_private(static_cast<size_t>(MAX_VERIFY) * hidden_size_ * sizeof(float));
-        buf_mtp_in_hid_     = ctx_.alloc_private((C_attn + 1) * hidden_size_ * sizeof(float));
         buf_mtp_logits_     = ctx_.alloc_shared(static_cast<size_t>(MAX_VERIFY) * vocab_size_ * sizeof(float));
         buf_mtp_argmax_     = ctx_.alloc_shared(static_cast<size_t>(MAX_VERIFY) * sizeof(uint32_t));
-        buf_mtp_sync_ids_   = ctx_.alloc_shared(static_cast<size_t>(MAX_VERIFY + 10) * sizeof(int));
         buf_verify_row_max_ = ctx_.alloc_private(static_cast<size_t>(MAX_VERIFY) * sizeof(float));
         buf_verify_cands_   = ctx_.alloc_shared(static_cast<size_t>(MAX_VERIFY) * MAX_VERIFY_CANDS * sizeof(LogitCand));
         buf_verify_cnt_     = ctx_.alloc_shared(static_cast<size_t>(MAX_VERIFY) * sizeof(uint32_t));
-        buf_draft_dists_    = ctx_.alloc_shared(16ull * sizeof(DraftDist));
-        mtp_loaded_ = true;
     }
 
-    // Finalize embed_tokens loading now that mtp_loaded_ is known:
-    // - When !mtp_loaded_ (and untied): zero-Metal-wiring CpuMmapQ4Weight (-682 MiB wired IOAccelerator RAM!)
-    // - When mtp_loaded_: dedicated un-prefetched embed_store_ (zero MADV_WILLNEED startup fault, keeps single-CB MTP + cb2_pre!)
+    // Finalize embed_tokens loading now that mtp_loaded_ / dflash_loaded_ are known:
+    // - When neither MTP nor DFlash is active (and untied): zero-Metal-wiring CpuMmapQ4Weight (-682 MiB wired IOAccelerator RAM!)
+    // - When MTP or DFlash is active: dedicated un-prefetched embed_store_ (zero MADV_WILLNEED startup fault, keeps single-CB GPU embed + cb2_pre!)
     if (!embed_tokens_.w.valid()) {
         const bool force_gpu_embed = (std::getenv("MI_CPU_EMBED") && std::atoi(std::getenv("MI_CPU_EMBED")) == 0);
-        if (!mtp_loaded_ && !force_gpu_embed && cpu_embed_.open(model_dir, model_pfx + "embed_tokens")) {
+        if (!mtp_loaded_ && !dflash_loaded_ && !force_gpu_embed && cpu_embed_.open(model_dir, model_pfx + "embed_tokens")) {
             use_cpu_embed_ = true;
         } else {
             embed_store_.load_dir_only(ctx_.device(), model_dir, {model_pfx + "embed_tokens."}, /*prefetch_now=*/false);
@@ -777,7 +853,13 @@ Qwen38Model::Qwen38Model(MetalContext& ctx, const std::string& model_dir, int ma
             ? ctx_.alloc_shared(C_attn * hidden_size_ * sizeof(float))
             : ctx_.alloc_private(C_attn * hidden_size_ * sizeof(float));
     }
-    buf_normed_       = ctx_.alloc_private(C_attn * hidden_size_ * sizeof(float));
+    // Size buf_normed_ to also hold race-free FP16 SwiGLU output (C_mlp * intermediate_size_ * 2B):
+    // swiglu_f32_to_f16 MUST NEVER alias float* gate (4B) and half* out (2B) on the same buffer.
+    const size_t sz_normed = std::max(
+        C_attn * static_cast<size_t>(hidden_size_) * sizeof(float),
+        C_mlp  * static_cast<size_t>(intermediate_size_) * sizeof(uint16_t)
+    );
+    buf_normed_       = ctx_.alloc_private(sz_normed);
     buf_a_            = ctx_.alloc_private(C_attn * lin_num_v_heads_ * sizeof(float));
     buf_b_            = ctx_.alloc_private(C_attn * lin_num_v_heads_ * sizeof(float));
     buf_g_            = ctx_.alloc_private(C_attn * lin_num_v_heads_ * sizeof(float));
@@ -1026,12 +1108,17 @@ Qwen38Model::Qwen38Model(MetalContext& ctx, const std::string& model_dir, int ma
     if (mtp_loaded_) {
         info_.quant_desc += " + MTP depth " + std::to_string(mtp_depth_) + (pld_enabled_ ? " + PLD" : "");
     }
+    if (dflash_loaded_) {
+        const DFlashConfig& dcfg = dflash_->config();
+        info_.quant_desc += " + DFlash2(b" + std::to_string(dcfg.block_size) + ", " + std::to_string(dcfg.num_layers) + "L)";
+    }
     info_.vocab_size = vocab_size_;
     info_.hidden_size = hidden_size_;
     info_.num_layers = num_layers_;
     info_.num_visits = num_layers_;
     info_.max_seq_len = max_seq_len_;
-    info_.mapped_weight_bytes = store_.total_mapped_bytes() + mtp_store_.total_mapped_bytes() + embed_store_.total_mapped_bytes();
+    info_.mapped_weight_bytes = store_.total_mapped_bytes() + mtp_store_.total_mapped_bytes() + embed_store_.total_mapped_bytes()
+                              + (dflash_loaded_ ? dflash_->gpu_weight_bytes() : 0ull);
     info_.kv_cache_bytes = kv_bytes;
 
     // Join async 4-deep ANE warmup (overlapped with safetensors load & BitScreen build!) before returning ready model
@@ -1258,6 +1345,9 @@ void Qwen38Model::reset() {
     pos_ = 0;
     rope_delta_ = 0;
     mtp_pos_ = 0;
+    df_kv_len_ = 0;
+    df_pending_commit_ = 0;
+    df_pending_pos_ = 0;
     if (kv_cap_ > 8192) {
         shrink_kv_capacity(2048);
     }
@@ -1928,11 +2018,12 @@ void Qwen38Model::encode_mlp_q4(id enc_id, const LayerWeights& lw, uint32_t M,
             threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
         barrier();
 
+        // Write FP16 SwiGLU into dead buf_normed_ (strictly disjoint from FP32 buf_mlp_gate_ -> zero TG race!)
         uint32_t n_elem = M * static_cast<uint32_t>(intermediate_size_);
         [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_swiglu_f16_];
         [enc setBuffer:(id<MTLBuffer>)buf_mlp_gate_ offset:0 atIndex:0];
         [enc setBuffer:(id<MTLBuffer>)buf_mlp_up_ offset:0 atIndex:1];
-        [enc setBuffer:(id<MTLBuffer>)buf_mlp_gate_ offset:0 atIndex:2];
+        [enc setBuffer:(id<MTLBuffer>)buf_normed_ offset:0 atIndex:2];
         [enc setBytes:&n_elem length:sizeof(n_elem) atIndex:3];
         [enc dispatchThreads:MTLSizeMake(n_elem, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         barrier();
@@ -1940,7 +2031,7 @@ void Qwen38Model::encode_mlp_q4(id enc_id, const LayerWeights& lw, uint32_t M,
         [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_ane_hf4_tiled_down_];
         [enc setBuffer:(id<MTLBuffer>)sl.hwx_buf offset:0 atIndex:0];
         [enc setBuffer:(id<MTLBuffer>)sl.buf_scales_offs offset:0 atIndex:1];
-        [enc setBuffer:(id<MTLBuffer>)buf_mlp_gate_ offset:0 atIndex:2];
+        [enc setBuffer:(id<MTLBuffer>)buf_normed_ offset:0 atIndex:2];
         [enc setBuffer:(id<MTLBuffer>)buf_hidden_ offset:0 atIndex:3];
         [enc setBytes:&ap length:sizeof(ap) atIndex:4];
         [enc dispatchThreadgroups:MTLSizeMake(tgx_tiled_dn, m_tiles, 1u)
@@ -2002,16 +2093,17 @@ void Qwen38Model::encode_mlp_q4(id enc_id, const LayerWeights& lw, uint32_t M,
         encode_qmm_q4_f16x(enc, lw.up_proj,   buf_normed_, 0, buf_mlp_up_,   0, M, false);
         barrier();
 
+        // Write FP16 SwiGLU into dead buf_normed_ (strictly disjoint from FP32 buf_mlp_gate_ -> zero TG race!)
         uint32_t n_elem = M * static_cast<uint32_t>(intermediate_size_);
         [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_swiglu_f16_];
         [enc setBuffer:(id<MTLBuffer>)buf_mlp_gate_ offset:0 atIndex:0];
         [enc setBuffer:(id<MTLBuffer>)buf_mlp_up_ offset:0 atIndex:1];
-        [enc setBuffer:(id<MTLBuffer>)buf_mlp_gate_ offset:0 atIndex:2];
+        [enc setBuffer:(id<MTLBuffer>)buf_normed_ offset:0 atIndex:2];
         [enc setBytes:&n_elem length:sizeof(n_elem) atIndex:3];
         [enc dispatchThreads:MTLSizeMake(n_elem, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         barrier();
 
-        encode_qmm_q4_f16x(enc, lw.down_proj, buf_mlp_gate_, 0, buf_hidden_, 0, M, true);
+        encode_qmm_q4_f16x(enc, lw.down_proj, buf_normed_, 0, buf_hidden_, 0, M, true);
         barrier();
         return;
     }
@@ -2804,11 +2896,12 @@ void Qwen38Model::encode_ane_tail_mlp(id enc_id, const LayerWeights& lw, id hid_
                 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
             barrier();
 
+            // Write FP16 SwiGLU into dead buf_normed_ (strictly disjoint from FP32 buf_mlp_gate_ -> zero TG race!)
             uint32_t n_elem = gm * static_cast<uint32_t>(intermediate_size_);
             [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_swiglu_f16_];
             [enc setBuffer:(id<MTLBuffer>)buf_mlp_gate_ offset:0 atIndex:0];
             [enc setBuffer:(id<MTLBuffer>)buf_mlp_up_ offset:0 atIndex:1];
-            [enc setBuffer:(id<MTLBuffer>)buf_mlp_gate_ offset:0 atIndex:2];
+            [enc setBuffer:(id<MTLBuffer>)buf_normed_ offset:0 atIndex:2];
             [enc setBytes:&n_elem length:sizeof(n_elem) atIndex:3];
             [enc dispatchThreads:MTLSizeMake(n_elem, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             barrier();
@@ -2816,7 +2909,7 @@ void Qwen38Model::encode_ane_tail_mlp(id enc_id, const LayerWeights& lw, id hid_
             [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_ane_hf4_tiled_down_];
             [enc setBuffer:(id<MTLBuffer>)sl.hwx_buf offset:0 atIndex:0];
             [enc setBuffer:(id<MTLBuffer>)sl.buf_scales_offs offset:0 atIndex:1];
-            [enc setBuffer:(id<MTLBuffer>)buf_mlp_gate_ offset:0 atIndex:2];
+            [enc setBuffer:(id<MTLBuffer>)buf_normed_ offset:0 atIndex:2];
             [enc setBuffer:(id<MTLBuffer>)hid_buf offset:tail_hid_off atIndex:3];
             [enc setBytes:&ap length:sizeof(ap) atIndex:4];
             [enc dispatchThreadgroups:MTLSizeMake(tgx_tiled_dn, m_tiles, 1u)
@@ -2830,16 +2923,16 @@ void Qwen38Model::encode_ane_tail_mlp(id enc_id, const LayerWeights& lw, id hid_
         [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_swiglu_f16_];
         [enc setBuffer:(id<MTLBuffer>)buf_mlp_gate_ offset:0 atIndex:0];
         [enc setBuffer:(id<MTLBuffer>)buf_mlp_up_ offset:0 atIndex:1];
-        [enc setBuffer:(id<MTLBuffer>)buf_mlp_gate_ offset:0 atIndex:2];
+        [enc setBuffer:(id<MTLBuffer>)buf_normed_ offset:0 atIndex:2];
         [enc setBytes:&n_elem length:sizeof(n_elem) atIndex:3];
         [enc dispatchThreads:MTLSizeMake(n_elem, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         barrier();
-        encode_qmm_q4_f16x(enc, lw.down_proj, buf_mlp_gate_, 0, hid_buf, tail_hid_off, gm, true);
+        encode_qmm_q4_f16x(enc, lw.down_proj, buf_normed_, 0, hid_buf, tail_hid_off, gm, true);
     }
 }
 
 void Qwen38Model::forward_ane_chunk(const int* tokens, int n_chunk, bool is_last, bool compute_argmax,
-                                    const int* pos3d, const float* const* vis_ptrs) {
+                                    const int* pos3d, const float* const* vis_ptrs, int df_capture_from_pos) {
     // Two-Half Zero-Copy GPU || ANE Pipelined Prefill:
     //   Half A (slot 0, buf_hidden_)     & Half B (slot 1, buf_hidden_alt_)
     //   While GPU runs Attention/GDN + IOSurface pack on half s, ANE runs 64-layer MLP on half (1 - s)!
@@ -2921,6 +3014,25 @@ void Qwen38Model::forward_ane_chunk(const int* tokens, int n_chunk, bool is_last
     const int pos_off[2] = { pos_, pos_ + mA };
     const size_t tok_off[2] = { 0, static_cast<size_t>(mA) * sizeof(int) };
     id hid_bufs[2] = { buf_hidden_, buf_hidden_alt_ };
+
+    // DFlash 2 per-half capture ranges overlapping [df_capture_from_pos, INT_MAX) (0 work on early chunks of long prefills!)
+    int df_cap_src[2] = { 0, 0 };
+    int df_cap_n[2]   = { 0, 0 };
+    int df_cap_dst[2] = { 0, 0 };
+    int df_cap_pos[2] = { 0, 0 };
+    if (dflash_loaded_) {
+        for (int s = 0; s < 2; ++s) {
+            int c0 = std::max(pos_off[s], df_capture_from_pos);
+            int c1 = pos_off[s] + ms[s];
+            if (c1 > c0) {
+                df_cap_src[s] = c0 - pos_off[s];
+                df_cap_n[s]   = c1 - c0;
+                df_cap_pos[s] = c0;
+            }
+        }
+        df_cap_dst[0] = 0;
+        df_cap_dst[1] = df_cap_n[0];
+    }
 
     std::memcpy([(id<MTLBuffer>)buf_token_ids_ contents], tokens, static_cast<size_t>(n_chunk) * sizeof(int));
     if (use_cpu_embed_) {
@@ -3059,6 +3171,13 @@ void Qwen38Model::forward_ane_chunk(const int* tokens, int n_chunk, bool is_last
             // Fused: add layer (L-1)'s ANE MLP output + compute layer L's input RMSNorm in ONE pass!
             encode_ane_add_and_norm(enc, s, L);
             barrier();
+            if (dflash_loaded_ && df_cap_n[s] > 0) {
+                int df_slot = dflash_->target_capture_slot(L - 1);
+                if (df_slot >= 0) {
+                    encode_dflash_capture(enc, hid_bufs[s], df_cap_src[s], df_cap_dst[s], df_cap_n[s], df_slot);
+                    barrier();
+                }
+            }
             skip_norm = true;
         }
 
@@ -3179,6 +3298,15 @@ void Qwen38Model::forward_ane_chunk(const int* tokens, int n_chunk, bool is_last
             encode_final_norm_and_mtp(enc, buf_hidden_, buf_token_ids_, 0,
                                       static_cast<uint32_t>(mA), pos_, false, false);
         }
+        if (dflash_loaded_ && df_cap_n[0] > 0) {
+            int slot_last = dflash_->target_capture_slot(num_layers_ - 1);
+            if (slot_last >= 0) {
+                if (qs[0] > 0) barrier();
+                encode_dflash_capture(enc, buf_hidden_, df_cap_src[0], df_cap_dst[0], df_cap_n[0], slot_last);
+            }
+            barrier();
+            encode_dflash_context_commit(enc, df_cap_dst[0], df_cap_n[0], df_cap_pos[0]);
+        }
         [enc endEncoding];
         [cb commit];
         [cb waitUntilCompleted];
@@ -3200,7 +3328,7 @@ void Qwen38Model::forward_ane_chunk(const int* tokens, int n_chunk, bool is_last
                      n_chunk, mA, ane_m[0], gpu_m[0], mB, ane_m[1], gpu_m[1], gpu_wait_ms, ane_wait_ms);
     }
 
-    // Finalize Half 1 (L63 add + final RMSNorm + lm_head + Half 1 MTP priming)
+    // Finalize Half 1 (L63 add + final RMSNorm + lm_head + Half 1 MTP/DFlash commit)
     @autoreleasepool {
         id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)ctx_.queue() commandBuffer];
         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
@@ -3214,6 +3342,15 @@ void Qwen38Model::forward_ane_chunk(const int* tokens, int n_chunk, bool is_last
             encode_final_norm_and_mtp(enc, buf_hidden_alt_, buf_token_ids_, tok_off[1],
                                       static_cast<uint32_t>(mB), pos_ + mA, is_last, is_last && compute_argmax);
         }
+        if (dflash_loaded_ && df_cap_n[1] > 0) {
+            barrier();
+            int slot_last = dflash_->target_capture_slot(num_layers_ - 1);
+            if (slot_last >= 0) {
+                encode_dflash_capture(enc, buf_hidden_alt_, df_cap_src[1], df_cap_dst[1], df_cap_n[1], slot_last);
+                barrier();
+            }
+            encode_dflash_context_commit(enc, df_cap_dst[1], df_cap_n[1], df_cap_pos[1]);
+        }
 
         [enc endEncoding];
         [cb commit];
@@ -3225,6 +3362,7 @@ void Qwen38Model::forward_ane_chunk(const int* tokens, int n_chunk, bool is_last
     }
 
     pos_ += n_chunk;
+    if (dflash_loaded_) df_kv_len_ = pos_;
 }
 
 void Qwen38Model::encode_full_attn_layer(
@@ -3772,7 +3910,8 @@ void Qwen38Model::encode_full_attn_layer(
 
 void Qwen38Model::encode_chunk(
     id enc_id, int M_int, int start_pos, bool compute_logits, bool compute_argmax,
-    bool verify_all_logits, bool record_gdn, float compact_margin, bool use_tree_buf
+    bool verify_all_logits, bool record_gdn, float compact_margin, bool use_tree_buf,
+    int df_cap_src_row, int df_cap_n_rows
 ) {
     id<MTLComputeCommandEncoder> enc = enc_id;
     uint32_t M = static_cast<uint32_t>(M_int);
@@ -3832,12 +3971,19 @@ void Qwen38Model::encode_chunk(
         const TensorView* next_in_norm = fuse_decode_norms
             ? (!is_last_layer ? &layers_[i + 1].input_norm : (fuse_final_dual ? &final_norm_ : nullptr))
             : nullptr;
-        id dual_f32 = (is_last_layer && fuse_final_dual) ? buf_mtp_verify_hid_ : nil;
+        id dual_f32 = (is_last_layer && fuse_final_dual && mtp_loaded_) ? buf_mtp_verify_hid_ : nil;
 
         if (!lw.is_linear) {
             encode_full_attn_layer(enc, lw, st.k_cache, st.v_cache, M, start_pos, st.k_sb, st.v_sb,
                                    skip_in_norm, next_in_norm, dual_f32, st.k_bounds, &st.quest_built_pages,
                                    /*is_mtp=*/false, use_tree_buf);
+            if (dflash_loaded_ && df_cap_n_rows > 0 && df_cap_src_row >= 0) {
+                int df_slot = dflash_->target_capture_slot(i);
+                if (df_slot >= 0) {
+                    encode_dflash_capture(enc, buf_hidden_, df_cap_src_row, 0, df_cap_n_rows, df_slot);
+                    barrier();
+                }
+            }
             continue;
         }
 
@@ -4070,6 +4216,13 @@ void Qwen38Model::encode_chunk(
         }
 
         encode_mlp_q4(enc, lw, M, next_in_norm, dual_f32);
+        if (dflash_loaded_ && df_cap_n_rows > 0 && df_cap_src_row >= 0) {
+            int df_slot = dflash_->target_capture_slot(i);
+            if (df_slot >= 0) {
+                encode_dflash_capture(enc, buf_hidden_, df_cap_src_row, 0, df_cap_n_rows, df_slot);
+                barrier();
+            }
+        }
     }
     if (record_gdn) {
         rec_slot_ = cur_rec_slot;
@@ -4267,6 +4420,11 @@ void Qwen38Model::encode_chunk(
             [enc setBytes:&n_tg length:sizeof(n_tg) atIndex:2];
             [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
         }
+    }
+
+    if (dflash_loaded_ && df_cap_n_rows > 0 && df_cap_src_row >= 0) {
+        barrier();
+        encode_dflash_context_commit(enc, 0, df_cap_n_rows, start_pos + df_cap_src_row);
     }
 }
 
@@ -5050,6 +5208,7 @@ const float* Qwen38Model::forward(const int* tokens, int n_tokens, int* out_argm
     const int ane_base_chunk = (ane_ && ane_->ready()) ? (2 * AneMlpEngine::MAX_SUBS * ane_->block_rows()) : 0;
     const int ane_max_chunk = (ane_base_chunk > 0) ? (ane_base_chunk + 2 * cur_coexec_g) : 0;
     const int ane_min = ane_min_;
+    const int df_cap_from = dflash_loaded_ ? std::max(0, (pos_ + n_tokens) - dflash_->config().sliding_window) : INT_MAX;
     bool used_ane = false;
     while (offset < n_tokens) {
         int rem = n_tokens - offset;
@@ -5064,7 +5223,7 @@ const float* Qwen38Model::forward(const int* tokens, int n_tokens, int* out_argm
                 m = rem / 2;
             }
             bool is_last = (offset + m == n_tokens);
-            forward_ane_chunk(tokens + offset, m, is_last, is_last && (out_argmax != nullptr));
+            forward_ane_chunk(tokens + offset, m, is_last, is_last && (out_argmax != nullptr), nullptr, nullptr, df_cap_from);
             used_ane = true;
             offset += m;
             continue;
@@ -5073,6 +5232,12 @@ const float* Qwen38Model::forward(const int* tokens, int n_tokens, int* out_argm
 
         int m = std::min(chunk_size_, rem);
         bool is_last = (offset + m == n_tokens);
+        int df_src = -1, df_n = 0;
+        if (dflash_loaded_) {
+            int c0 = std::max(pos_, df_cap_from);
+            int c1 = pos_ + m;
+            if (c1 > c0) { df_src = c0 - pos_; df_n = c1 - c0; }
+        }
         std::memcpy([(id<MTLBuffer>)buf_token_ids_ contents], tokens + offset, static_cast<size_t>(m) * sizeof(int));
         if (use_cpu_embed_) {
             cpu_embed_.gather_f32(tokens + offset, m, reinterpret_cast<float*>([(id<MTLBuffer>)buf_hidden_ contents]));
@@ -5081,7 +5246,7 @@ const float* Qwen38Model::forward(const int* tokens, int n_tokens, int* out_argm
         @autoreleasepool {
             id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)ctx_.queue() commandBuffer];
             id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
-            encode_chunk(enc, m, pos_, is_last, is_last && (out_argmax != nullptr), false, false);
+            encode_chunk(enc, m, pos_, is_last, is_last && (out_argmax != nullptr), false, false, 0.0f, false, df_src, df_n);
             [enc endEncoding];
             [cb commit];
             [cb waitUntilCompleted];
@@ -5091,6 +5256,7 @@ const float* Qwen38Model::forward(const int* tokens, int n_tokens, int* out_argm
             }
         }
         pos_ += m;
+        if (dflash_loaded_) df_kv_len_ = pos_;
         offset += m;
     }
 
@@ -5207,6 +5373,7 @@ const float* Qwen38Model::forward_multimodal(
     );
 
     const int ane_min = ane_min_;
+    const int df_cap_from = dflash_loaded_ ? std::max(0, (pos_ + n_tokens) - dflash_->config().sliding_window) : INT_MAX;
     while (offset < n_tokens) {
         int rem = n_tokens - offset;
         if (ane_max_chunk > 0 && rem >= ane_min) {
@@ -5219,13 +5386,19 @@ const float* Qwen38Model::forward_multimodal(
             bool is_last = (offset + m == n_tokens);
             forward_ane_chunk(tokens + offset, m, is_last, is_last && (out_argmax != nullptr),
                               all_pos3d.data() + static_cast<size_t>(offset) * 3,
-                              all_vis_ptrs.data() + offset);
+                              all_vis_ptrs.data() + offset, df_cap_from);
             offset += m;
             continue;
         }
 
         int m = std::min(chunk_size_, rem);
         bool is_last = (offset + m == n_tokens);
+        int df_src = -1, df_n = 0;
+        if (dflash_loaded_) {
+            int c0 = std::max(pos_, df_cap_from);
+            int c1 = pos_ + m;
+            if (c1 > c0) { df_src = c0 - pos_; df_n = c1 - c0; }
+        }
         std::memcpy([(id<MTLBuffer>)buf_token_ids_ contents], tokens + offset, static_cast<size_t>(m) * sizeof(int));
         if (use_cpu_embed_) {
             cpu_embed_.gather_f32(tokens + offset, m, reinterpret_cast<float*>([(id<MTLBuffer>)buf_hidden_ contents]));
@@ -5263,7 +5436,7 @@ const float* Qwen38Model::forward_multimodal(
         @autoreleasepool {
             id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)ctx_.queue() commandBuffer];
             id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
-            encode_chunk(enc, m, pos_, is_last, is_last && (out_argmax != nullptr), false, false);
+            encode_chunk(enc, m, pos_, is_last, is_last && (out_argmax != nullptr), false, false, 0.0f, false, df_src, df_n);
             [enc endEncoding];
             [cb commit];
             [cb waitUntilCompleted];
@@ -5277,6 +5450,7 @@ const float* Qwen38Model::forward_multimodal(
         cur_mrope_buf_ = nil;
         cur_vis_count_ = 0;
         pos_ += m;
+        if (dflash_loaded_) df_kv_len_ = pos_;
         offset += m;
     }
 
@@ -5306,6 +5480,30 @@ int Qwen38Model::forward_greedy(int token, StepStats* stats) {
 
 void Qwen38Model::flush_pending_mtp() {
     if (!pending_sync_) return;
+    if (dflash_loaded_) {
+        @autoreleasepool {
+            id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)ctx_.queue() commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+            if (pending_replay_m_ > 0) {
+                encode_gdn_replay_compute(enc, pending_replay_m_, nullptr);
+                pending_replay_m_ = 0;
+            }
+            if (df_pending_commit_ > 0) {
+                encode_dflash_context_commit(enc, 0, df_pending_commit_, df_pending_pos_);
+                df_kv_len_ = df_pending_pos_ + df_pending_commit_;
+                df_pending_commit_ = 0;
+            }
+            [enc endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+            if (cb.error) {
+                throw std::runtime_error(std::string("Metal DFlash flush sync error: ") + [[cb.error localizedDescription] UTF8String]);
+            }
+        }
+        pending_sync_ = false;
+        pending_path_noncontig_ = false;
+        return;
+    }
     int* sync_ptr = reinterpret_cast<int*>([(id<MTLBuffer>)buf_mtp_sync_ids_ contents]);
     std::memcpy(sync_ptr, pending_feed_tokens_,
                 static_cast<size_t>(pending_feed_off_ + pending_feed_count_) * sizeof(int));
@@ -6470,7 +6668,516 @@ void Qwen38Model::forward_mtp_tree_impl(int anchor_token, Sampler* sampler, std:
     }
 }
 
+void Qwen38Model::encode_dflash_capture(
+    id enc_id, id src_hid_buf, int src_row_off, int dst_row_off, int n_rows, int slot_idx
+) {
+    if (n_rows <= 0 || slot_idx < 0) return;
+    id<MTLComputeCommandEncoder> enc = enc_id;
+    const DFlashConfig& dcfg = dflash_->config();
+    DFlashCaptureParams cp{
+        static_cast<uint32_t>(n_rows),
+        static_cast<uint32_t>(hidden_size_),
+        static_cast<uint32_t>(dcfg.target_layer_ids.size()),
+        static_cast<uint32_t>(slot_idx),
+        static_cast<uint32_t>(src_row_off),
+        static_cast<uint32_t>(dst_row_off)
+    };
+    [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_df_capture_hidden_];
+    [enc setBuffer:(id<MTLBuffer>)src_hid_buf offset:0 atIndex:0];
+    [enc setBuffer:(id<MTLBuffer>)buf_df_capture_ offset:0 atIndex:1];
+    [enc setBytes:&cp length:sizeof(cp) atIndex:2];
+    [enc dispatchThreads:MTLSizeMake(ceil_div(cp.D, 4u), cp.M, 1)
+        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+}
+
+void Qwen38Model::encode_dflash_context_commit(id enc_id, int cap_row_off, int n_rows, int pos_start) {
+    if (n_rows <= 0) return;
+    id<MTLComputeCommandEncoder> enc = enc_id;
+    auto barrier = [&]() { [enc memoryBarrierWithScope:MTLBarrierScopeBuffers]; };
+    const DFlashConfig& dcfg = dflash_->config();
+    const uint32_t H = static_cast<uint32_t>(dcfg.hidden_size);
+    const uint32_t Hkv = static_cast<uint32_t>(dcfg.num_kv_heads);
+    const uint32_t D_h = static_cast<uint32_t>(dcfg.head_dim);
+    const uint32_t win = static_cast<uint32_t>(dcfg.sliding_window);
+    const size_t n_tgt = dcfg.target_layer_ids.size();
+    const Q4Weight fc_w = as_q4(dflash_->fc());
+    const TensorView& hnorm = dflash_->hidden_norm();
+
+    int done = 0;
+    while (done < n_rows) {
+        const int sub = std::min(n_rows - done, static_cast<int>(c_attn_));
+        const uint32_t sub_u = static_cast<uint32_t>(sub);
+        const size_t cap_off = static_cast<size_t>(cap_row_off + done) * n_tgt * hidden_size_ * sizeof(uint16_t);
+
+        // 1. fc([sub, 25600] FP16) -> buf_qkv_ ([sub, 5120] FP32)
+        encode_qmm_q4_f16x(enc, fc_w, buf_df_capture_, cap_off, buf_qkv_, 0, sub_u, false);
+        barrier();
+
+        // 2. Standard Qwen3 RMSNorm (NO +1.0) with hidden_norm -> buf_normed_ ([sub, 5120] FP16)
+        DFlashNormParams np{sub_u, H, dcfg.rms_eps};
+        [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_df_rmsnorm_f16_];
+        [enc setBuffer:(id<MTLBuffer>)buf_qkv_ offset:0 atIndex:0];
+        [enc setBuffer:(id<MTLBuffer>)hnorm.buffer offset:hnorm.offset atIndex:1];
+        [enc setBuffer:(id<MTLBuffer>)buf_normed_ offset:0 atIndex:2];
+        [enc setBytes:&np length:sizeof(np) atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake(sub_u, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        barrier();
+
+        // 3. Project context K/V for all 5 DFlash layers -> k_norm + full-dim D=128 RoPE -> FP16 ring buffer!
+        DFlashKvWriteParams kp{
+            sub_u, Hkv, D_h, static_cast<uint32_t>(pos_start + done), win, dcfg.rope_theta, dcfg.rms_eps
+        };
+        for (int l = 0; l < dcfg.num_layers; ++l) {
+            const DFlashLayerWeights& dl = dflash_->layer(l);
+            encode_qmm_q4_f16x(enc, as_q4(dl.k_proj), buf_normed_, 0, buf_k_, 0, sub_u, false);
+            encode_qmm_q4_f16x(enc, as_q4(dl.v_proj), buf_normed_, 0, buf_v_, 0, sub_u, false);
+            barrier();
+
+            [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_df_kv_write_];
+            [enc setBuffer:(id<MTLBuffer>)buf_k_ offset:0 atIndex:0];
+            [enc setBuffer:(id<MTLBuffer>)buf_v_ offset:0 atIndex:1];
+            [enc setBuffer:(id<MTLBuffer>)dl.k_norm.buffer offset:dl.k_norm.offset atIndex:2];
+            [enc setBuffer:(id<MTLBuffer>)df_k_cache_[l] offset:0 atIndex:3];
+            [enc setBuffer:(id<MTLBuffer>)df_v_cache_[l] offset:0 atIndex:4];
+            [enc setBytes:&kp length:sizeof(kp) atIndex:5];
+            [enc dispatchThreadgroups:MTLSizeMake(Hkv, sub_u, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            barrier();
+        }
+        done += sub;
+    }
+}
+
+void Qwen38Model::encode_dflash_draft_step(id enc_id, int start_pos) {
+    id<MTLComputeCommandEncoder> enc = enc_id;
+    auto barrier = [&]() { [enc memoryBarrierWithScope:MTLBarrierScopeBuffers]; };
+    const DFlashConfig& dcfg = dflash_->config();
+    const uint32_t B   = static_cast<uint32_t>(dcfg.block_size);
+    const uint32_t P   = B - 1u;
+    const uint32_t H   = static_cast<uint32_t>(dcfg.hidden_size);
+    const uint32_t Hq  = static_cast<uint32_t>(dcfg.num_heads);
+    const uint32_t Hkv = static_cast<uint32_t>(dcfg.num_kv_heads);
+    const uint32_t D_h = static_cast<uint32_t>(dcfg.head_dim);
+    const uint32_t gs  = static_cast<uint32_t>(dcfg.conv_group_size);
+    const uint32_t win = static_cast<uint32_t>(dcfg.sliding_window);
+    const float eps    = dcfg.rms_eps;
+
+    // 0. Deferred previous-step context commit (merges prior accepted target hiddens into this single CB!)
+    if (df_pending_commit_ > 0) {
+        encode_dflash_context_commit(enc, 0, df_pending_commit_, df_pending_pos_);
+        df_kv_len_ = df_pending_pos_ + df_pending_commit_;
+        df_pending_commit_ = 0;
+    }
+
+    // 1. Embed [anchor_id, MASK x (B-1)] using target embed_tokens_ -> buf_df_h_ (FP32 [B, H])
+    {
+        EmbedParams ep{B, H, eps};
+        [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_embed_];
+        [enc setBuffer:(id<MTLBuffer>)embed_tokens_.w.buffer offset:embed_tokens_.w.offset atIndex:0];
+        [enc setBuffer:(id<MTLBuffer>)embed_tokens_.s.buffer offset:embed_tokens_.s.offset atIndex:1];
+        [enc setBuffer:(id<MTLBuffer>)embed_tokens_.b.buffer offset:embed_tokens_.b.offset atIndex:2];
+        [enc setBuffer:(id<MTLBuffer>)buf_df_ids_ offset:0 atIndex:3];
+        [enc setBuffer:(id<MTLBuffer>)buf_df_h_ offset:0 atIndex:4];
+        [enc setBytes:&ep length:sizeof(ep) atIndex:5];
+        [enc dispatchThreads:MTLSizeMake(H, B, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        barrier();
+    }
+
+    const uint32_t eff_ctx = static_cast<uint32_t>(std::min(df_kv_len_, dcfg.sliding_window));
+    const uint32_t num_splits = (eff_ctx > 256u) ? 8u : 1u;
+    const DFlashNormParams np_b{B, H, eps};
+    const DFlashConvParams cp_prep{B, H, gs, 0u};
+    const DFlashConvParams cp_fin{B, H, gs, 1u};
+    const DFlashQkvPrepParams qkvp{B, Hq, Hkv, D_h, static_cast<uint32_t>(start_pos), dcfg.rope_theta, eps};
+    const DFlashAttnParams ap{
+        B, Hq, Hkv, D_h, static_cast<uint32_t>(start_pos), static_cast<uint32_t>(df_kv_len_),
+        win, num_splits, 1.0f / std::sqrt(static_cast<float>(dcfg.head_dim))
+    };
+
+    // 2. 5 DFlash 2 Bidirectional Sliding-Window Decoder Layers with GroupedDynamicCausalConv
+    for (int l = 0; l < dcfg.num_layers; ++l) {
+        const DFlashLayerWeights& dl = dflash_->layer(l);
+
+        // 2a. Input RMSNorm -> attn_conv kernel_projection -> conv prepare (stage=0)
+        [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_df_rmsnorm_f16_];
+        [enc setBuffer:(id<MTLBuffer>)buf_df_h_ offset:0 atIndex:0];
+        [enc setBuffer:(id<MTLBuffer>)dl.input_layernorm.buffer offset:dl.input_layernorm.offset atIndex:1];
+        [enc setBuffer:(id<MTLBuffer>)buf_df_x_ offset:0 atIndex:2];
+        [enc setBytes:&np_b length:sizeof(np_b) atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake(B, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        barrier();
+
+        encode_qmm_q4_f16x(enc, as_q4(dl.attn_kernel_proj), buf_df_x_, 0, buf_df_dyn_, 0, B, false);
+        barrier();
+
+        [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_df_conv_prep_f16_];
+        [enc setBuffer:(id<MTLBuffer>)buf_df_x_ offset:0 atIndex:0];
+        [enc setBuffer:(id<MTLBuffer>)buf_df_dyn_ offset:0 atIndex:1];
+        [enc setBuffer:(id<MTLBuffer>)dl.attn_base_kernel.buffer offset:dl.attn_base_kernel.offset atIndex:2];
+        [enc setBuffer:(id<MTLBuffer>)buf_df_x2_ offset:0 atIndex:3];
+        [enc setBytes:&cp_prep length:sizeof(cp_prep) atIndex:4];
+        [enc dispatchThreads:MTLSizeMake(H, B, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        barrier();
+
+        // 2b. Concurrent Q, K, V projections -> q_norm/k_norm + full-dim D=128 RoPE
+        encode_qmm_q4_f16x(enc, as_q4(dl.q_proj), buf_df_x2_, 0, buf_q_, 0, B, false);
+        encode_qmm_q4_f16x(enc, as_q4(dl.k_proj), buf_df_x2_, 0, buf_k_, 0, B, false);
+        encode_qmm_q4_f16x(enc, as_q4(dl.v_proj), buf_df_x2_, 0, buf_v_, 0, B, false);
+        barrier();
+
+        [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_df_qkv_prep_];
+        [enc setBuffer:(id<MTLBuffer>)buf_q_ offset:0 atIndex:0];
+        [enc setBuffer:(id<MTLBuffer>)buf_k_ offset:0 atIndex:1];
+        [enc setBuffer:(id<MTLBuffer>)buf_v_ offset:0 atIndex:2];
+        [enc setBuffer:(id<MTLBuffer>)dl.q_norm.buffer offset:dl.q_norm.offset atIndex:3];
+        [enc setBuffer:(id<MTLBuffer>)dl.k_norm.buffer offset:dl.k_norm.offset atIndex:4];
+        [enc setBuffer:(id<MTLBuffer>)buf_df_q_h_ offset:0 atIndex:5];
+        [enc setBuffer:(id<MTLBuffer>)buf_df_kn_ offset:0 atIndex:6];
+        [enc setBuffer:(id<MTLBuffer>)buf_df_vn_ offset:0 atIndex:7];
+        [enc setBytes:&qkvp length:sizeof(qkvp) atIndex:8];
+        [enc dispatchThreadgroups:MTLSizeMake(Hq + Hkv, 8, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        barrier();
+
+        // 2c. Bidirectional Sliding-Window GQA-4 AMX Attention (ring + noise; does NOT write noise to ring!)
+        [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_df_attn_p1_];
+        [enc setBuffer:(id<MTLBuffer>)buf_df_q_h_ offset:0 atIndex:0];
+        [enc setBuffer:(id<MTLBuffer>)df_k_cache_[l] offset:0 atIndex:1];
+        [enc setBuffer:(id<MTLBuffer>)df_v_cache_[l] offset:0 atIndex:2];
+        [enc setBuffer:(id<MTLBuffer>)buf_df_kn_ offset:0 atIndex:3];
+        [enc setBuffer:(id<MTLBuffer>)buf_df_vn_ offset:0 atIndex:4];
+        [enc setBuffer:(id<MTLBuffer>)((num_splits == 1u) ? buf_df_attn_out_ : buf_split_o_) offset:0 atIndex:5];
+        [enc setBuffer:(id<MTLBuffer>)buf_split_m_ offset:0 atIndex:6];
+        [enc setBuffer:(id<MTLBuffer>)buf_split_l_ offset:0 atIndex:7];
+        [enc setBytes:&ap length:sizeof(ap) atIndex:8];
+        [enc dispatchThreadgroups:MTLSizeMake(Hkv, num_splits, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        barrier();
+
+        if (num_splits > 1u) {
+            [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_df_attn_p2_];
+            [enc setBuffer:(id<MTLBuffer>)buf_split_o_ offset:0 atIndex:0];
+            [enc setBuffer:(id<MTLBuffer>)buf_split_m_ offset:0 atIndex:1];
+            [enc setBuffer:(id<MTLBuffer>)buf_split_l_ offset:0 atIndex:2];
+            [enc setBuffer:(id<MTLBuffer>)buf_df_attn_out_ offset:0 atIndex:3];
+            [enc setBytes:&ap length:sizeof(ap) atIndex:4];
+            [enc dispatchThreadgroups:MTLSizeMake(Hq, B, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            barrier();
+        }
+
+        // 2d. o_proj -> attn_conv finish + residual add into buf_df_h_
+        encode_qmm_q4_f16x(enc, as_q4(dl.o_proj), buf_df_attn_out_, 0, buf_df_o_, 0, B, false);
+        barrier();
+
+        [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_df_conv_finish_f32_];
+        [enc setBuffer:(id<MTLBuffer>)buf_df_o_ offset:0 atIndex:0];
+        [enc setBuffer:(id<MTLBuffer>)buf_df_dyn_ offset:0 atIndex:1];
+        [enc setBuffer:(id<MTLBuffer>)dl.attn_base_kernel.buffer offset:dl.attn_base_kernel.offset atIndex:2];
+        [enc setBuffer:(id<MTLBuffer>)buf_df_h_ offset:0 atIndex:3];
+        [enc setBytes:&cp_fin length:sizeof(cp_fin) atIndex:4];
+        [enc dispatchThreads:MTLSizeMake(H, B, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        barrier();
+
+        // 2e. Post-Attention RMSNorm -> mlp_conv kernel_projection -> conv prepare (stage=0)
+        [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_df_rmsnorm_f16_];
+        [enc setBuffer:(id<MTLBuffer>)buf_df_h_ offset:0 atIndex:0];
+        [enc setBuffer:(id<MTLBuffer>)dl.post_attention_layernorm.buffer offset:dl.post_attention_layernorm.offset atIndex:1];
+        [enc setBuffer:(id<MTLBuffer>)buf_df_x_ offset:0 atIndex:2];
+        [enc setBytes:&np_b length:sizeof(np_b) atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake(B, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        barrier();
+
+        encode_qmm_q4_f16x(enc, as_q4(dl.mlp_kernel_proj), buf_df_x_, 0, buf_df_dyn_, 0, B, false);
+        barrier();
+
+        [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_df_conv_prep_f16_];
+        [enc setBuffer:(id<MTLBuffer>)buf_df_x_ offset:0 atIndex:0];
+        [enc setBuffer:(id<MTLBuffer>)buf_df_dyn_ offset:0 atIndex:1];
+        [enc setBuffer:(id<MTLBuffer>)dl.mlp_base_kernel.buffer offset:dl.mlp_base_kernel.offset atIndex:2];
+        [enc setBuffer:(id<MTLBuffer>)buf_df_x2_ offset:0 atIndex:3];
+        [enc setBytes:&cp_prep length:sizeof(cp_prep) atIndex:4];
+        [enc dispatchThreads:MTLSizeMake(H, B, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        barrier();
+
+        // 2f. Fused SwiGLU (gate + up + SiLU -> FP16 buf_mlp_gate_) -> Split-K down_proj -> mlp_conv finish + residual
+        QmmParams qp_mlp{B, dl.gate_proj.out_dim, dl.gate_proj.in_dim, 0u};
+        [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_mma_qmm8_swiglu_f16_];
+        [enc setBuffer:(id<MTLBuffer>)dl.gate_proj.w.buffer offset:dl.gate_proj.w.offset atIndex:0];
+        [enc setBuffer:(id<MTLBuffer>)dl.gate_proj.s.buffer offset:dl.gate_proj.s.offset atIndex:1];
+        [enc setBuffer:(id<MTLBuffer>)dl.gate_proj.b.buffer offset:dl.gate_proj.b.offset atIndex:2];
+        [enc setBuffer:(id<MTLBuffer>)dl.up_proj.w.buffer offset:dl.up_proj.w.offset atIndex:3];
+        [enc setBuffer:(id<MTLBuffer>)dl.up_proj.s.buffer offset:dl.up_proj.s.offset atIndex:4];
+        [enc setBuffer:(id<MTLBuffer>)dl.up_proj.b.buffer offset:dl.up_proj.b.offset atIndex:5];
+        [enc setBuffer:(id<MTLBuffer>)buf_df_x2_ offset:0 atIndex:6];
+        [enc setBuffer:(id<MTLBuffer>)buf_mlp_gate_ offset:0 atIndex:7];
+        [enc setBytes:&qp_mlp length:sizeof(qp_mlp) atIndex:8];
+        [enc dispatchThreadgroups:MTLSizeMake(ceil_div(dl.gate_proj.out_dim, 16u), 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        barrier();
+
+        encode_qmm_q4_f16x(enc, as_q4(dl.down_proj), buf_mlp_gate_, 0, buf_df_o_, 0, B, false);
+        barrier();
+
+        [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_df_conv_finish_f32_];
+        [enc setBuffer:(id<MTLBuffer>)buf_df_o_ offset:0 atIndex:0];
+        [enc setBuffer:(id<MTLBuffer>)buf_df_dyn_ offset:0 atIndex:1];
+        [enc setBuffer:(id<MTLBuffer>)dl.mlp_base_kernel.buffer offset:dl.mlp_base_kernel.offset atIndex:2];
+        [enc setBuffer:(id<MTLBuffer>)buf_df_h_ offset:0 atIndex:3];
+        [enc setBytes:&cp_fin length:sizeof(cp_fin) atIndex:4];
+        [enc dispatchThreads:MTLSizeMake(H, B, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        barrier();
+    }
+
+    // 3. Final Norm on proposal rows 1..B-1 (P = 7 rows!) -> concurrent target lm_head + selector hidden_proj -> exact Top-16
+    {
+        const TensorView& fnorm = dflash_->norm();
+        DFlashNormParams np_p{P, H, eps};
+        [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_df_rmsnorm_f16_];
+        [enc setBuffer:(id<MTLBuffer>)buf_df_h_ offset:static_cast<size_t>(H) * sizeof(float) atIndex:0];
+        [enc setBuffer:(id<MTLBuffer>)fnorm.buffer offset:fnorm.offset atIndex:1];
+        [enc setBuffer:(id<MTLBuffer>)buf_df_x_ offset:0 atIndex:2];
+        [enc setBytes:&np_p length:sizeof(np_p) atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake(P, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        barrier();
+    }
+
+    encode_qmm_q4_f16x(enc, lm_head_, buf_df_x_, 0, buf_mtp_logits_, 0, P, false);
+    {
+        const TensorView& hp = dflash_->selector_hidden_proj();
+        DFlashHiddenProjParams hpp{P, static_cast<uint32_t>(dcfg.selector_rank), H};
+        [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_df_hidden_proj_f16_];
+        [enc setBuffer:(id<MTLBuffer>)buf_df_x_ offset:0 atIndex:0];
+        [enc setBuffer:(id<MTLBuffer>)hp.buffer offset:hp.offset atIndex:1];
+        [enc setBuffer:(id<MTLBuffer>)buf_df_sel_h_ offset:0 atIndex:2];
+        [enc setBytes:&hpp length:sizeof(hpp) atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake(ceil_div(hpp.R, 4u), ceil_div(P, 8u), 1)
+            threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    }
+    barrier();
+
+    {
+        const uint32_t V = static_cast<uint32_t>(vocab_size_);
+        const uint32_t K = static_cast<uint32_t>(dcfg.selector_top_k);
+        const uint32_t num_chunks = ceil_div(V, 2048u);
+        DFlashTopKParams tkp{P, V, K, num_chunks};
+
+        [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_df_topk16_p1_];
+        [enc setBuffer:(id<MTLBuffer>)buf_mtp_logits_ offset:0 atIndex:0];
+        [enc setBuffer:(id<MTLBuffer>)buf_df_topk_part_ offset:0 atIndex:1];
+        [enc setBytes:&tkp length:sizeof(tkp) atIndex:2];
+        [enc dispatchThreadgroups:MTLSizeMake(num_chunks, P, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        barrier();
+
+        [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_df_topk16_p2_];
+        [enc setBuffer:(id<MTLBuffer>)buf_df_topk_part_ offset:0 atIndex:0];
+        [enc setBuffer:(id<MTLBuffer>)buf_df_topk_out_ offset:0 atIndex:1];
+        [enc setBytes:&tkp length:sizeof(tkp) atIndex:2];
+        [enc dispatchThreadgroups:MTLSizeMake(1, P, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        barrier();
+    }
+}
+
+void Qwen38Model::forward_dflash_impl(int anchor_token, Sampler* sampler, std::vector<int>& out_tokens, StepStats* stats) {
+    const DFlashConfig& dcfg = dflash_->config();
+    const int B = dcfg.block_size; // 8
+    const int K = B - 1;           // 7
+    const bool is_greedy = (sampler == nullptr || sampler->is_greedy());
+    const float v_margin = is_greedy ? 0.0f : sampler->compact_margin();
+    const int pre_pos = pos_;
+    ensure_kv_capacity(pre_pos + B);
+
+    auto t0 = std::chrono::steady_clock::now();
+
+    int draft[MAX_VERIFY] = {};
+    DraftDist df_dists[MAX_VERIFY] = {};
+    bool use_sampled_q = false;
+    bool used_pld = false;
+    double cb1_gpu_ms = 0.0, cb2_gpu_ms = 0.0, sel_us = 0.0;
+
+    // Lossless Greedy SuffixCache / PLD Hybrid Fast-Path:
+    // On high-confidence, unambiguous long suffix matches (full K-token continuation), bypass the
+    // ~5 ms DFlash 5L+lm_head CB #1 and verify directly in a SINGLE CB (while flushing any pending
+    // DFlash context KV before encode_chunk overwrites buf_df_capture_ so DFlash stays 100% synced!).
+    static const bool kDfPldAllow = !(std::getenv("DF_PLD") && std::atoi(std::getenv("DF_PLD")) == 0);
+    if (is_greedy && pld_enabled_ && kDfPldAllow) {
+        SuffixResult sr0 = suffix_cache_.lookup(token_history_, anchor_token);
+        if (sr0.n_branches == 1 && sr0.b[0].cont_len >= K) {
+            const SuffixBranch& top = sr0.b[0];
+            const bool pld_strong = top.from_session ? (top.match_len >= 12) : (top.match_len >= 16);
+            if (pld_strong) {
+                for (int d = 0; d < K; ++d) draft[d] = top.cont[d];
+                used_pld = true;
+            }
+        }
+    }
+
+    @autoreleasepool {
+        if (used_pld) {
+            // Single-CB PLD Verify: [anchor_token, draft[0..K-1]] verified linearly (100% greedy-exact!).
+            int* tid_ptr = reinterpret_cast<int*>([(id<MTLBuffer>)buf_token_ids_ contents]);
+            tid_ptr[0] = anchor_token;
+            for (int d = 0; d < K; ++d) tid_ptr[d + 1] = draft[d];
+
+            id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)ctx_.queue() commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+            if (df_pending_commit_ > 0) {
+                encode_dflash_context_commit(enc, 0, df_pending_commit_, df_pending_pos_);
+                df_kv_len_ = df_pending_pos_ + df_pending_commit_;
+                df_pending_commit_ = 0;
+            }
+            encode_chunk(enc, B, pre_pos, true, true, true, true, 0.0f, /*use_tree_buf=*/false,
+                         /*df_cap_src_row=*/0, /*df_cap_n_rows=*/B);
+            [enc endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+            if (cb.error) {
+                throw std::runtime_error(std::string("Metal DFlash-PLD verify CB error: ") +
+                                         [[cb.error localizedDescription] UTF8String]);
+            }
+            cb2_gpu_ms = (cb.GPUEndTime - cb.GPUStartTime) * 1000.0;
+        } else {
+            // Populate [anchor_token, MASK x (B-1)] for DFlash block forward
+            int* df_ids = reinterpret_cast<int*>([(id<MTLBuffer>)buf_df_ids_ contents]);
+            df_ids[0] = anchor_token;
+            for (int i = 1; i < B; ++i) df_ids[i] = dcfg.mask_token_id;
+
+            // CB #1: Single-CB deferred context commit + 5L DFlash block + target lm_head (M=7) + Top-16 + hidden_proj!
+            id<MTLCommandBuffer> cb1 = [(id<MTLCommandQueue>)ctx_.queue() commandBuffer];
+            id<MTLComputeCommandEncoder> enc1 = [cb1 computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+            encode_dflash_draft_step(enc1, pre_pos);
+            [enc1 endEncoding];
+            [cb1 commit];
+
+            // 100%-hit speculative CB #2 pre-encoding on CPU WHILE GPU executes CB #1 (hides ~0.65 ms CPU encode for free!)
+            const int saved_rec_slot = rec_slot_;
+            const int saved_pending_replay_m = pending_replay_m_;
+            id<MTLCommandBuffer> cb2 = [(id<MTLCommandQueue>)ctx_.queue() commandBuffer];
+            id<MTLComputeCommandEncoder> enc2 = [cb2 computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+            encode_chunk(enc2, B, pre_pos, true, is_greedy, true, true, v_margin, /*use_tree_buf=*/false,
+                         /*df_cap_src_row=*/0, /*df_cap_n_rows=*/B);
+            [enc2 endEncoding];
+
+            [cb1 waitUntilCompleted];
+            if (cb1.error) {
+                rec_slot_ = saved_rec_slot;
+                pending_replay_m_ = saved_pending_replay_m;
+                throw std::runtime_error(std::string("Metal DFlash draft CB error: ") +
+                                         [[cb1.error localizedDescription] UTF8String]);
+            }
+            cb1_gpu_ms = (cb1.GPUEndTime - cb1.GPUStartTime) * 1000.0;
+
+            // CPU ARM64 NEON CandidateSelector (<20 us, 0 B Metal wired codebook RAM!)
+            const auto ts0 = std::chrono::steady_clock::now();
+            const LogitCand* topk_cands = reinterpret_cast<const LogitCand*>([(id<MTLBuffer>)buf_df_topk_out_ contents]);
+            const uint16_t* sel_h_f16   = reinterpret_cast<const uint16_t*>([(id<MTLBuffer>)buf_df_sel_h_ contents]);
+            if (is_greedy || sampler->config().temperature <= 0.0f) {
+                dflash_->select_greedy(anchor_token, topk_cands, sel_h_f16, draft);
+                use_sampled_q = false;
+            } else {
+                dflash_->select_sampled(anchor_token, topk_cands, sel_h_f16,
+                                        sampler->config().temperature, sampler->next_seed(), draft, df_dists);
+                use_sampled_q = true;
+            }
+            sel_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - ts0).count();
+
+            // Write [anchor_token, draft[0..K-1]] into shared buf_token_ids_ BEFORE committing pre-encoded CB #2!
+            int* tid_ptr = reinterpret_cast<int*>([(id<MTLBuffer>)buf_token_ids_ contents]);
+            tid_ptr[0] = anchor_token;
+            for (int d = 0; d < K; ++d) tid_ptr[d + 1] = draft[d];
+
+            [cb2 commit];
+            [cb2 waitUntilCompleted];
+            if (cb2.error) {
+                throw std::runtime_error(std::string("Metal DFlash verify CB error: ") +
+                                         [[cb2.error localizedDescription] UTF8String]);
+            }
+            cb2_gpu_ms = (cb2.GPUEndTime - cb2.GPUStartTime) * 1000.0;
+        }
+    }
+
+    // Exact Verification (Greedy = 100% token-for-token exact AR; Sampled = exact Leviathan rejection sampling!)
+    int accepted = 0;
+    int bonus_tok = 0;
+    if (is_greedy) {
+        const uint32_t* preds = reinterpret_cast<const uint32_t*>([(id<MTLBuffer>)buf_mtp_argmax_ contents]);
+        for (int d = 0; d < K; ++d) {
+            if (static_cast<int>(preds[d]) == draft[d]) {
+                out_tokens.push_back(draft[d]);
+                ++accepted;
+            } else {
+                break;
+            }
+        }
+        bonus_tok = static_cast<int>(preds[accepted]);
+        out_tokens.push_back(bonus_tok);
+    } else {
+        const float* all_logits    = reinterpret_cast<const float*>([(id<MTLBuffer>)buf_mtp_logits_ contents]);
+        const LogitCand* all_cands = reinterpret_cast<const LogitCand*>([(id<MTLBuffer>)buf_verify_cands_ contents]);
+        const uint32_t* cand_cnts  = reinterpret_cast<const uint32_t*>([(id<MTLBuffer>)buf_verify_cnt_ contents]);
+        bool rejected = false;
+        for (int d = 0; d < K; ++d) {
+            const float* row_lg        = all_logits + static_cast<size_t>(d) * vocab_size_;
+            const LogitCand* row_cands = all_cands + static_cast<size_t>(d) * MAX_VERIFY_CANDS;
+            const DraftDist* dd        = use_sampled_q ? &df_dists[d] : nullptr;
+            bool ok = false;
+            int tok = sampler->sample_or_accept_draft_dist(
+                row_cands, cand_cnts[d], MAX_VERIFY_CANDS, row_lg, vocab_size_, draft[d], dd, ok
+            );
+            if (ok) {
+                out_tokens.push_back(draft[d]);
+                sampler->observe(draft[d]);
+                ++accepted;
+            } else {
+                bonus_tok = tok;
+                out_tokens.push_back(bonus_tok);
+                rejected = true;
+                break;
+            }
+        }
+        if (!rejected) {
+            const float* last_lg        = all_logits + static_cast<size_t>(K) * vocab_size_;
+            const LogitCand* last_cands = all_cands + static_cast<size_t>(K) * MAX_VERIFY_CANDS;
+            bonus_tok = sampler->sample_from_cands(last_cands, cand_cnts[K], MAX_VERIFY_CANDS, last_lg, vocab_size_);
+            out_tokens.push_back(bonus_tok);
+        }
+    }
+
+    pos_ = pre_pos + accepted + 1;
+    push_history_token(anchor_token);
+    for (int j = 0; j < accepted; ++j) push_history_token(draft[j]);
+
+    // Defer Lazy Fused GDN Replay + DFlash Context KV Commit of accepted rows [0..accepted] to next round!
+    pending_sync_ = true;
+    pending_replay_m_ = accepted + 1;
+    pending_path_noncontig_ = false;
+    pending_path_len_ = static_cast<uint32_t>(accepted + 1);
+    for (int j = 0; j <= accepted; ++j) pending_path_[j] = static_cast<uint32_t>(j);
+    df_pending_commit_ = accepted + 1;
+    df_pending_pos_ = pre_pos;
+
+    static const bool kDfProf = (std::getenv("DF_PROF") != nullptr);
+    if (kDfProf) {
+        std::fprintf(stderr, "[df_prof] pos=%d acc=%d/%d pld=%d cb1=%.2fms sel=%.1fus cb2=%.2fms\n",
+                     pre_pos, accepted, K, used_pld ? 1 : 0, cb1_gpu_ms, sel_us, cb2_gpu_ms);
+    }
+
+    auto t1 = std::chrono::steady_clock::now();
+    if (stats) {
+        stats->gpu_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        stats->tokens_processed = accepted + 1;
+        stats->mtp_accepted = accepted;
+        stats->mtp_drafted = K;
+        stats->pld_hits = used_pld ? 1 : 0;
+    }
+}
+
 void Qwen38Model::forward_mtp_greedy(int anchor_token, std::vector<int>& out_tokens, StepStats* stats) {
+    if (dflash_loaded_) {
+        if (pos_ + dflash_->config().block_size > max_seq_len_) {
+            int nxt = forward_greedy(anchor_token, stats);
+            out_tokens.push_back(nxt);
+            return;
+        }
+        forward_dflash_impl(anchor_token, nullptr, out_tokens, stats);
+        return;
+    }
     if (!mtp_loaded_ || pos_ + MAX_VERIFY > max_seq_len_) {
         int nxt = forward_greedy(anchor_token, stats);
         out_tokens.push_back(nxt);
@@ -6621,6 +7328,15 @@ void Qwen38Model::forward_mtp_greedy(int anchor_token, std::vector<int>& out_tok
 }
 
 void Qwen38Model::forward_mtp_sampled(int anchor_token, Sampler& sampler, std::vector<int>& out_tokens, StepStats* stats) {
+    if (dflash_loaded_) {
+        if (pos_ + dflash_->config().block_size > max_seq_len_) {
+            const float* lg = forward(&anchor_token, 1, nullptr, stats);
+            out_tokens.push_back(sampler.sample(lg, vocab_size_));
+            return;
+        }
+        forward_dflash_impl(anchor_token, &sampler, out_tokens, stats);
+        return;
+    }
     if (!mtp_loaded_ || pos_ + MAX_VERIFY > max_seq_len_) {
         const float* lg = forward(&anchor_token, 1, nullptr, stats);
         out_tokens.push_back(sampler.sample(lg, vocab_size_));
@@ -6820,12 +7536,16 @@ bool Qwen38Model::save_state_to_file(const std::string& path, const std::vector<
         ? (static_cast<size_t>(mtp_pos_) * num_kv_heads_ * (head_dim_ / 64) * 2 * sizeof(uint16_t))
         : 0;
     size_t mtp_hid_bytes = mtp_loaded_ ? (static_cast<size_t>(hidden_size_) * sizeof(float)) : 0;
+    size_t df_ring_sz = dflash_loaded_
+        ? (static_cast<size_t>(dflash_->config().num_kv_heads) * dflash_->config().sliding_window * dflash_->config().head_dim * sizeof(uint16_t))
+        : 0;
 
     size_t total_state = 0;
     for (int i = 0; i < num_layers_; ++i) {
         total_state += layers_[i].is_linear ? (cs_bytes + ss_bytes) : (2 * kv_active + 2 * sb_active);
     }
     if (mtp_loaded_) total_state += 2 * mtp_kv_active + 2 * mtp_sb_active + mtp_hid_bytes;
+    if (dflash_loaded_) total_state += static_cast<size_t>(dflash_->config().num_layers) * 2 * df_ring_sz;
 
     @autoreleasepool {
         id<MTLBuffer> stage = ctx_.alloc_shared(total_state);
@@ -6867,6 +7587,14 @@ bool Qwen38Model::save_state_to_file(const std::string& path, const std::vector<
             [blit copyFromBuffer:(id<MTLBuffer>)buf_mtp_last_hid_ sourceOffset:0 toBuffer:stage destinationOffset:off size:mtp_hid_bytes];
             off += mtp_hid_bytes;
         }
+        if (dflash_loaded_) {
+            for (int l = 0; l < dflash_->config().num_layers; ++l) {
+                [blit copyFromBuffer:(id<MTLBuffer>)df_k_cache_[l] sourceOffset:0 toBuffer:stage destinationOffset:off size:df_ring_sz];
+                off += df_ring_sz;
+                [blit copyFromBuffer:(id<MTLBuffer>)df_v_cache_[l] sourceOffset:0 toBuffer:stage destinationOffset:off size:df_ring_sz];
+                off += df_ring_sz;
+            }
+        }
         [blit endEncoding];
         [cb commit];
         [cb waitUntilCompleted];
@@ -6879,7 +7607,7 @@ bool Qwen38Model::save_state_to_file(const std::string& path, const std::vector<
         hdr.pos = static_cast<uint32_t>(pos_);
         hdr.reserved = mtp_loaded_
             ? (0x80000000u | (mtp_kv_bits_ < 16 ? 0x40000000u : 0u) | (mtp_kv_bits_ == 4 ? 0x20000000u : 0u) | (static_cast<uint32_t>(mtp_pos_) & 0x1FFFFFFFu))
-            : 0u;
+            : (dflash_loaded_ ? (0x40000000u | (static_cast<uint32_t>(df_kv_len_) & 0x1FFFFFFFu)) : 0u);
         hdr.state_bytes = total_state;
         MultimodalCacheMeta meta{static_cast<int32_t>(rope_delta_), static_cast<uint32_t>(image_hashes.size())};
 
@@ -7022,11 +7750,16 @@ bool Qwen38Model::load_state_from_file(const std::string& path, std::vector<int>
         ? (static_cast<size_t>(hdr.pos) * num_kv_heads_ * (head_dim_ / 64) * 2 * sizeof(uint16_t))
         : 0;
     bool has_mtp_payload = (hdr.reserved & 0x80000000u) != 0u;
+    bool has_df_payload  = (!has_mtp_payload) && ((hdr.reserved & 0x40000000u) != 0u);
     bool mtp_is_q        = (hdr.reserved & 0x40000000u) != 0u;
     bool mtp_is_q4       = (hdr.reserved & 0x20000000u) != 0u;
     uint32_t saved_mtp_pos = hdr.reserved & 0x1FFFFFFFu;
     int saved_mtp_bits   = mtp_is_q ? (mtp_is_q4 ? 4 : 8) : 16;
     if (has_mtp_payload && mtp_loaded_ && (saved_mtp_bits != mtp_kv_bits_)) {
+        unmap_guard();
+        return false;
+    }
+    if (dflash_loaded_ && !has_df_payload) {
         unmap_guard();
         return false;
     }
@@ -7038,11 +7771,15 @@ bool Qwen38Model::load_state_from_file(const std::string& path, std::vector<int>
         ? (static_cast<size_t>(saved_mtp_pos) * num_kv_heads_ * (head_dim_ / 64) * 2 * sizeof(uint16_t))
         : 0;
     size_t mtp_hid_bytes = has_mtp_payload ? (static_cast<size_t>(hidden_size_) * sizeof(float)) : 0;
+    size_t df_ring_sz = (has_df_payload && dflash_loaded_)
+        ? (static_cast<size_t>(dflash_->config().num_kv_heads) * dflash_->config().sliding_window * dflash_->config().head_dim * sizeof(uint16_t))
+        : 0;
     size_t expected_state = 0;
     for (int i = 0; i < num_layers_; ++i) {
         expected_state += layers_[i].is_linear ? (cs_bytes + ss_bytes) : (2 * kv_active + 2 * sb_active);
     }
     if (has_mtp_payload) expected_state += 2 * mtp_kv_active + 2 * mtp_sb_active + mtp_hid_bytes;
+    if (has_df_payload && dflash_loaded_) expected_state += static_cast<size_t>(dflash_->config().num_layers) * 2 * df_ring_sz;
     if (expected_state != hdr.state_bytes) {
         unmap_guard();
         return false;
@@ -7099,6 +7836,14 @@ bool Qwen38Model::load_state_from_file(const std::string& path, std::vector<int>
             [blit copyFromBuffer:stage sourceOffset:off toBuffer:(id<MTLBuffer>)buf_mtp_last_hid_ destinationOffset:0 size:mtp_hid_bytes];
             off += mtp_hid_bytes;
         }
+        if (has_df_payload && dflash_loaded_) {
+            for (int l = 0; l < dflash_->config().num_layers; ++l) {
+                [blit copyFromBuffer:stage sourceOffset:off toBuffer:(id<MTLBuffer>)df_k_cache_[l] destinationOffset:0 size:df_ring_sz];
+                off += df_ring_sz;
+                [blit copyFromBuffer:stage sourceOffset:off toBuffer:(id<MTLBuffer>)df_v_cache_[l] destinationOffset:0 size:df_ring_sz];
+                off += df_ring_sz;
+            }
+        }
         [blit endEncoding];
         [cb commit];
         [cb waitUntilCompleted];
@@ -7113,6 +7858,9 @@ bool Qwen38Model::load_state_from_file(const std::string& path, std::vector<int>
     cur_vis_count_ = 0;
     mtp_pos_ = (has_mtp_payload && mtp_loaded_) ? static_cast<int>(saved_mtp_pos) : 0;
     mtp_seeded_ = false;
+    df_kv_len_ = (has_df_payload && dflash_loaded_) ? static_cast<int>(saved_mtp_pos) : 0;
+    df_pending_commit_ = 0;
+    df_pending_pos_ = 0;
     pending_sync_ = false;
     token_history_.clear();
     suffix_cache_.begin_turn();
@@ -7600,6 +8348,34 @@ void Qwen38Model::profile_ops() {
         bench_gpu("1x MTP decode root-sync M=6 (pos=512)", 0.0, [&](id<MTLComputeCommandEncoder> enc) {
             encode_mtp_steps(enc, buf_token_ids_, 0, buf_mtp_verify_hid_, 0, 6, 512, false);
         });
+    }
+    if (dflash_loaded_) {
+        const DFlashConfig& dcfg = dflash_->config();
+        std::printf("\n--- DFlash 2 Drafting Component Timings (%dL, block=%d, win=%d) ---\n",
+                    dcfg.num_layers, dcfg.block_size, dcfg.sliding_window);
+        int* df_ids = reinterpret_cast<int*>([(id<MTLBuffer>)buf_df_ids_ contents]);
+        df_ids[0] = 100;
+        for (int i = 1; i < dcfg.block_size; ++i) df_ids[i] = dcfg.mask_token_id;
+        bench_gpu("1x DFlash2 context commit (M=6, fc+5L KV)", 0.0, [&](id<MTLComputeCommandEncoder> enc) {
+            encode_dflash_context_commit(enc, 0, 6, 512);
+        });
+        df_pending_commit_ = 0;
+        df_kv_len_ = 512;
+        bench_gpu("1x DFlash2 draft block (5L+lmh M=7+topk16, L=512)", 0.0, [&](id<MTLComputeCommandEncoder> enc) {
+            encode_dflash_draft_step(enc, 512);
+        });
+        df_kv_len_ = dcfg.sliding_window;
+        bench_gpu("1x DFlash2 draft block (5L+lmh M=7+topk16, L=2048)", 0.0, [&](id<MTLComputeCommandEncoder> enc) {
+            encode_dflash_draft_step(enc, dcfg.sliding_window);
+        });
+        const LogitCand* topk_ptr = reinterpret_cast<const LogitCand*>([(id<MTLBuffer>)buf_df_topk_out_ contents]);
+        const uint16_t* sel_ptr   = reinterpret_cast<const uint16_t*>([(id<MTLBuffer>)buf_df_sel_h_ contents]);
+        int tmp_draft[MAX_VERIFY] = {};
+        auto ts0 = std::chrono::steady_clock::now();
+        for (int r = 0; r < 20; ++r) dflash_->select_greedy(100, topk_ptr, sel_ptr, tmp_draft);
+        double sel_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - ts0).count() / 20.0;
+        std::printf("  %-46s %6.1f us\n", "1x DFlash2 CPU NEON CandidateSelector (greedy)", sel_us);
+        std::fflush(stdout);
     }
 
     std::printf("\n--- Prefill GPU vs ANE Component Timings (64 layers, M=256 / M=512) ---\n");

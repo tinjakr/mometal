@@ -2,12 +2,14 @@
 
 #include "ane_mlp.hpp"
 #include "ane_share.hpp"
+#include "dflash.hpp"
 #include "metal_ctx.hpp"
 #include "model.hpp"
 #include "safetensors.hpp"
 #include "suffix_cache.hpp"
 #include "vision.hpp"
 
+#include <climits>
 #include <memory>
 #include <string>
 #include <thread>
@@ -20,7 +22,8 @@ public:
     Qwen38Model(MetalContext& ctx, const std::string& model_dir, int max_seq_len = 8192,
                 const std::string& mtp_dir = "", int mtp_depth = 5, bool enable_pld = true,
                 const std::string& ane_models_dir = "auto", const std::string& ane_tag = "auto",
-                int kv_bits = 16, int ane_share_layers = 0, int sparse_kv_budget = 0);
+                int kv_bits = 16, int ane_share_layers = 0, int sparse_kv_budget = 0,
+                const std::string& dflash_dir = "");
     ~Qwen38Model() override;
 
     const ModelInfo& info() const override { return info_; }
@@ -30,10 +33,13 @@ public:
     const float* forward(const int* tokens, int n_tokens, int* out_argmax = nullptr, StepStats* stats = nullptr) override;
     int forward_greedy(int token, StepStats* stats = nullptr) override;
 
-    bool has_mtp() const override { return mtp_loaded_; }
-    int mtp_depth() const override { return mtp_loaded_ ? mtp_depth_ : 0; }
+    bool has_mtp() const override { return mtp_loaded_ || dflash_loaded_; }
+    bool has_dflash() const override { return dflash_loaded_; }
+    int mtp_depth() const override {
+        return dflash_loaded_ ? (dflash_->config().block_size - 1) : (mtp_loaded_ ? mtp_depth_ : 0);
+    }
     void forward_mtp_greedy(int anchor_token, std::vector<int>& out_tokens, StepStats* stats = nullptr) override;
-    bool supports_mtp_sampled() const override { return mtp_loaded_; }
+    bool supports_mtp_sampled() const override { return mtp_loaded_ || dflash_loaded_; }
     void forward_mtp_sampled(int anchor_token, Sampler& sampler, std::vector<int>& out_tokens, StepStats* stats = nullptr) override;
 
     bool has_vision() const override { return vision_ && vision_->ready(); }
@@ -273,6 +279,31 @@ private:
     std::vector<id> rec_b_[2];   // f32 [MAX_VERIFY, Hv] per linear layer
     int rec_slot_ = 0;           // slot holding LAST recorded verify round's projections
 
+    // Native DFlash 2 block-diffusion speculative drafter (active when --dflash <dir> is provided)
+    std::unique_ptr<DFlashEngine> dflash_;
+    bool dflash_loaded_ = false;
+    int df_kv_len_ = 0;
+    int df_pending_commit_ = 0;
+    int df_pending_pos_ = 0;
+    size_t c_attn_ = 512;
+    size_t df_cap_rows_ = 0;
+    std::vector<id> df_k_cache_; // private half [Hkv, sliding_window, D] per DFlash layer
+    std::vector<id> df_v_cache_; // private half [Hkv, sliding_window, D] per DFlash layer
+    id buf_df_capture_   = nil;  // private half [df_cap_rows_, num_targets * hidden_size]
+    id buf_df_ids_       = nil;  // shared int [block_size]
+    id buf_df_h_         = nil;  // private float [block_size, hidden_size]
+    id buf_df_x_         = nil;  // private half [block_size, hidden_size]
+    id buf_df_x2_        = nil;  // private half [block_size, hidden_size]
+    id buf_df_dyn_       = nil;  // private float [block_size, 2 * kernel_size * (H / group_size)]
+    id buf_df_o_         = nil;  // private float [block_size, hidden_size]
+    id buf_df_q_h_       = nil;  // private half [Hq, 8, D]
+    id buf_df_kn_        = nil;  // private half [Hkv, block_size, D]
+    id buf_df_vn_        = nil;  // private half [Hkv, block_size, D]
+    id buf_df_attn_out_  = nil;  // private half [block_size, Hq * D]
+    id buf_df_topk_part_ = nil;  // private LogitCand [P, num_chunks, K]
+    id buf_df_topk_out_  = nil;  // shared LogitCand [P * K]
+    id buf_df_sel_h_     = nil;  // shared half [P * selector_rank]
+
     // Native CoreML/IOSurface ANE MLP accelerator for prefill (+ optional single-copy hf4 weight sharing!)
     std::unique_ptr<AneMlpEngine> ane_;
     std::unique_ptr<AneShareManager> ane_share_;
@@ -492,9 +523,22 @@ private:
     id pso_bs_score_b3_ = nil;
     id pso_bs_select_cands_ = nil;
     id pso_bs_rescore_q4_ = nil;
+    // DFlash 2 block-diffusion drafter pipelines (loaded ONLY when --dflash <dir> is active)
+    id pso_df_rmsnorm_f16_ = nil;
+    id pso_df_conv_prep_f16_ = nil;
+    id pso_df_conv_finish_f32_ = nil;
+    id pso_df_kv_write_ = nil;
+    id pso_df_qkv_prep_ = nil;
+    id pso_df_attn_p1_ = nil;
+    id pso_df_attn_p2_ = nil;
+    id pso_df_topk16_p1_ = nil;
+    id pso_df_topk16_p2_ = nil;
+    id pso_df_capture_hidden_ = nil;
+    id pso_df_hidden_proj_f16_ = nil;
 
     id encode_draft_lm_head(id enc, uint32_t B, uint32_t& out_V, uint32_t& out_n_parts);
 
+    static Q4Weight as_q4(const DFlashQ4Weight& w) { return Q4Weight{w.w, w.s, w.b, w.out_dim, w.in_dim}; }
     Q4Weight load_q4(const SafetensorsStore& st, const std::string& prefix);
     void ensure_kv_capacity(int needed);
     void shrink_kv_capacity(int target_cap);
@@ -530,11 +574,16 @@ private:
 
     void encode_chunk(id enc, int M, int start_pos, bool compute_logits, bool compute_argmax,
                       bool verify_all_logits = false, bool record_gdn = false, float compact_margin = 0.0f,
-                      bool use_tree_buf = false);
+                      bool use_tree_buf = false, int df_cap_src_row = -1, int df_cap_n_rows = 0);
     void encode_final_norm_and_mtp(id enc, id hid_buf, id tok_buf, size_t tok_off, uint32_t M, int start_pos,
                                    bool compute_logits, bool compute_argmax);
     void forward_ane_chunk(const int* tokens, int n_chunk, bool is_last, bool compute_argmax,
-                           const int* pos3d = nullptr, const float* const* vis_ptrs = nullptr);
+                           const int* pos3d = nullptr, const float* const* vis_ptrs = nullptr,
+                           int df_capture_from_pos = INT_MAX);
+    void encode_dflash_capture(id enc, id src_hid_buf, int src_row_off, int dst_row_off, int n_rows, int slot_idx);
+    void encode_dflash_context_commit(id enc, int cap_row_off, int n_rows, int pos_start);
+    void encode_dflash_draft_step(id enc, int start_pos);
+    void forward_dflash_impl(int anchor_token, Sampler* sampler, std::vector<int>& out_tokens, StepStats* stats);
     void encode_mtp_kv_prime(id enc, id tok_buf, size_t tok_off, id hid_buf, size_t hid_off, int M, int start_pos);
     void encode_mtp_steps(id enc, id tok_buf, size_t tok_off, id hid_buf, size_t hid_off, int M, int start_pos,
                           bool compute_argmax_last, id argmax_dst_buf = nil, size_t argmax_dst_off = 0,

@@ -16,6 +16,7 @@ add_executable(mometal
     src/ane_mlp.mm
     src/ane_share.mm
     src/ane_builder.mm
+    src/dflash.mm
     src/vision.mm
     src/tokenizer.mm
     src/sampler.cpp
@@ -87,6 +88,7 @@ if(MOMETAL_HAS_METAL_RC EQUAL 0 AND MOMETAL_HAS_METALLIB_RC EQUAL 0)
 
     mometal_add_metallib("common"   "common.metal"   "metal3.0" "m30")
     mometal_add_metallib("qwen38"   "qwen38.metal"   "metal3.0" "m30")
+    mometal_add_metallib("dflash"   "dflash.metal"   "metal3.0" "m30")
     mometal_add_metallib("inkling2" "inkling2.metal" "metal3.0" "m30")
     mometal_add_metallib("vision"   "vision.metal"   "metal3.0" "m30")
     mometal_add_metallib("vision"   "vision.metal"   "metal3.1" "m31")

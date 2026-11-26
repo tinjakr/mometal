@@ -229,6 +229,74 @@ size_t partial_tag_overlap(const std::string& s, const char* tag) {
     return 0;
 }
 
+// Drain all complete, RFC 3629-valid UTF-8 code points from `buf` into `out`.
+// When `flush_all == false`, any valid incomplete trailing 2/3/4-byte prefix (e.g. a multi-byte
+// UTF-8 char split across ByteLevel BPE tokens) stays buffered in `buf` for the next token.
+// Any genuinely invalid byte (or incomplete tail when `flush_all == true`) is replaced with
+// U+FFFD ("\xEF\xBF\xBD") so emitted SSE JSON frames are guaranteed 100% valid UTF-8.
+void drain_valid_utf8(std::string& buf, std::string& out, bool flush_all) {
+    static constexpr const char kRepl[4] = "\xEF\xBF\xBD";
+    const size_t n = buf.size();
+    size_t i = 0;
+    while (i < n) {
+        const unsigned char b0 = static_cast<unsigned char>(buf[i]);
+        if (b0 < 0x80u) {
+            out.push_back(static_cast<char>(b0));
+            ++i;
+            continue;
+        }
+        size_t need = 0;
+        unsigned char b1_lo = 0x80u, b1_hi = 0xBFu;
+        if (b0 >= 0xC2u && b0 <= 0xDFu) {
+            need = 2;
+        } else if (b0 == 0xE0u) {
+            need = 3; b1_lo = 0xA0u; b1_hi = 0xBFu;
+        } else if ((b0 >= 0xE1u && b0 <= 0xECu) || (b0 >= 0xEEu && b0 <= 0xEFu)) {
+            need = 3;
+        } else if (b0 == 0xEDu) {
+            need = 3; b1_lo = 0x80u; b1_hi = 0x9Fu; // reject UTF-16 surrogates U+D800..U+DFFF
+        } else if (b0 == 0xF0u) {
+            need = 4; b1_lo = 0x90u; b1_hi = 0xBFu;
+        } else if (b0 >= 0xF1u && b0 <= 0xF3u) {
+            need = 4;
+        } else if (b0 == 0xF4u) {
+            need = 4; b1_lo = 0x80u; b1_hi = 0x8Fu; // cap at U+10FFFF
+        } else {
+            out.append(kRepl, 3);
+            ++i;
+            continue;
+        }
+
+        const size_t avail = std::min(need, n - i);
+        size_t bad_at = 0;
+        for (size_t k = 1; k < avail; ++k) {
+            const unsigned char bk = static_cast<unsigned char>(buf[i + k]);
+            const unsigned char lo = (k == 1) ? b1_lo : 0x80u;
+            const unsigned char hi = (k == 1) ? b1_hi : 0xBFu;
+            if (bk < lo || bk > hi) {
+                bad_at = k;
+                break;
+            }
+        }
+        if (bad_at > 0) {
+            out.append(kRepl, 3);
+            i += bad_at;
+            continue;
+        }
+        if (avail < need) {
+            if (flush_all) {
+                out.append(kRepl, 3);
+                i = n;
+            }
+            break; // keep valid incomplete prefix in buf for next token
+        }
+        out.append(buf, i, need);
+        i += need;
+    }
+    if (i == n) buf.clear();
+    else if (i > 0) buf.erase(0, i);
+}
+
 } // namespace
 
 void run_http_server(Model& model, const Tokenizer& tok, const ServerConfig& cfg) {
@@ -634,6 +702,8 @@ void run_http_server(Model& model, const Tokenizer& tok, const ServerConfig& cfg
                 OutMode mode = (is_chat && thinking_enabled) ? OutMode::THINKING : OutMode::CONTENT;
                 std::string pending;
                 std::string tool_buf;
+                std::string utf8_reasoning_buf;
+                std::string utf8_content_buf;
                 std::string full_reasoning;
                 std::string full_content;
                 std::vector<ToolCall> emitted_tools;
@@ -662,29 +732,43 @@ void run_http_server(Model& model, const Tokenizer& tok, const ServerConfig& cfg
                     return true;
                 };
 
-                auto emit_reasoning = [&](const std::string& s) {
-                    if (s.empty() || !conn_ok) return;
-                    full_reasoning += s;
+                auto emit_reasoning = [&](const std::string& s, bool flush_utf8 = false) {
+                    if (!conn_ok) return;
+                    if (!s.empty()) utf8_reasoning_buf += s;
+                    if (utf8_reasoning_buf.empty()) return;
+                    std::string ready;
+                    ready.reserve(utf8_reasoning_buf.size());
+                    drain_valid_utf8(utf8_reasoning_buf, ready, flush_utf8);
+                    if (ready.empty()) return;
+                    full_reasoning += ready;
                     Json::Object d;
-                    d["reasoning_content"] = s;
+                    d["reasoning_content"] = ready;
                     send_sse_delta(std::move(d));
                 };
 
-                auto emit_content = [&](std::string s) {
-                    if (s.empty() || !conn_ok) return;
-                    if (strip_post_think_nl) {
-                        size_t p = 0;
-                        while (p < s.size() && (s[p] == '\n' || s[p] == '\r')) ++p;
-                        if (p < s.size()) {
-                            s.erase(0, p);
-                            strip_post_think_nl = false;
-                        } else {
-                            return;
+                auto emit_content = [&](std::string s, bool flush_utf8 = false) {
+                    if (!conn_ok) return;
+                    if (!s.empty()) {
+                        if (strip_post_think_nl) {
+                            size_t p = 0;
+                            while (p < s.size() && (s[p] == '\n' || s[p] == '\r')) ++p;
+                            if (p < s.size()) {
+                                s.erase(0, p);
+                                strip_post_think_nl = false;
+                            } else {
+                                s.clear();
+                            }
                         }
+                        utf8_content_buf += s;
                     }
-                    full_content += s;
+                    if (utf8_content_buf.empty()) return;
+                    std::string ready;
+                    ready.reserve(utf8_content_buf.size());
+                    drain_valid_utf8(utf8_content_buf, ready, flush_utf8);
+                    if (ready.empty()) return;
+                    full_content += ready;
                     Json::Object d;
-                    d["content"] = s;
+                    d["content"] = ready;
                     send_sse_delta(std::move(d));
                 };
 
@@ -715,7 +799,7 @@ void run_http_server(Model& model, const Tokenizer& tok, const ServerConfig& cfg
                         if (mode == OutMode::THINKING) {
                             size_t pos = pending.find("</think>");
                             if (pos != std::string::npos) {
-                                emit_reasoning(pending.substr(0, pos));
+                                emit_reasoning(pending.substr(0, pos), true);
                                 pending.erase(0, pos + 8);
                                 mode = OutMode::CONTENT;
                                 strip_post_think_nl = true;
@@ -723,14 +807,16 @@ void run_http_server(Model& model, const Tokenizer& tok, const ServerConfig& cfg
                             }
                             size_t hold = flush_all ? 0 : partial_tag_overlap(pending, "</think>");
                             if (pending.size() > hold) {
-                                emit_reasoning(pending.substr(0, pending.size() - hold));
+                                emit_reasoning(pending.substr(0, pending.size() - hold), flush_all);
                                 pending.erase(0, pending.size() - hold);
+                            } else if (flush_all) {
+                                emit_reasoning("", true);
                             }
                             break;
                         } else if (mode == OutMode::CONTENT) {
                             size_t pos = pending.find("<tool_call>");
                             if (pos != std::string::npos) {
-                                emit_content(pending.substr(0, pos));
+                                emit_content(pending.substr(0, pos), true);
                                 pending.erase(0, pos + 11);
                                 tool_buf.clear();
                                 mode = OutMode::TOOL_CALL;
@@ -738,8 +824,10 @@ void run_http_server(Model& model, const Tokenizer& tok, const ServerConfig& cfg
                             }
                             size_t hold = flush_all ? 0 : partial_tag_overlap(pending, "<tool_call>");
                             if (pending.size() > hold) {
-                                emit_content(pending.substr(0, pending.size() - hold));
+                                emit_content(pending.substr(0, pending.size() - hold), flush_all);
                                 pending.erase(0, pending.size() - hold);
+                            } else if (flush_all) {
+                                emit_content("", true);
                             }
                             break;
                         } else { // TOOL_CALL
@@ -795,9 +883,11 @@ void run_http_server(Model& model, const Tokenizer& tok, const ServerConfig& cfg
                             finish_reason = "stop";
                             return false;
                         }
-                        if (raw_sp == "<|content_thinking|>") { mode = OutMode::THINKING; return gen_count < max_tokens; }
-                        if (raw_sp == "<|content_text|>") { mode = OutMode::CONTENT; return gen_count < max_tokens; }
+                        if (raw_sp == "<|content_thinking|>") { emit_content("", true); mode = OutMode::THINKING; return gen_count < max_tokens; }
+                        if (raw_sp == "<|content_text|>") { emit_reasoning("", true); mode = OutMode::CONTENT; return gen_count < max_tokens; }
                         if (raw_sp == "<|content_invoke_tool_json|>") {
+                            emit_reasoning("", true);
+                            emit_content("", true);
                             tool_buf.clear();
                             mode = OutMode::TOOL_CALL;
                             return gen_count < max_tokens;
@@ -885,6 +975,8 @@ void run_http_server(Model& model, const Tokenizer& tok, const ServerConfig& cfg
                 }
 
                 if (is_chat && !is_inkling) pump_qwen_pending(true);
+                emit_reasoning("", true);
+                emit_content("", true);
                 if (!emitted_tools.empty() && finish_reason == "stop") {
                     finish_reason = "tool_calls";
                 }
