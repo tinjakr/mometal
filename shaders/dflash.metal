@@ -27,6 +27,15 @@ struct DFlashConvParams {
     uint stage;      // 0 = prepare, 1 = finish
 };
 
+struct DFlashConvNormParams {
+    uint  M;              // block_size (8)
+    uint  D;              // hidden_size (5120)
+    uint  group_size;     // conv_group_size (16)
+    uint  stage;          // 1 = finish
+    uint  norm_row_start; // 0 for layer internal norms (all M rows), 1 for final norm (P = M-1 rows)
+    float eps;            // rms_eps (1e-6f)
+};
+
 struct DFlashKvWriteParams {
     uint  M;          // rows to commit (prefill <=512, decode <=8)
     uint  Hkv;        // 8
@@ -208,6 +217,126 @@ kernel void dflash_conv_finish_add_f32(
     const float cur  = x[(ulong)r * p.D + c];
     const float prev = (r > 0u) ? x[(ulong)(r - 1u) * p.D + c] : 0.0f;
     h[(ulong)r * p.D + c] += fma(cur, k0, prev * k1);
+}
+
+// ============================================================================
+// 2b. Fused GroupedDynamicCausalConv Finish+ResidualAdd + Standard Qwen3 RMSNorm
+//     Eliminates 10 kernel launches, 10 barriers, and 10 full FP32 h re-reads/round!
+//     Updates h[r, :] in-place for all r in [0..M-1], and for r >= norm_row_start
+//     writes RMSNorm(h[r, :]) * norm_w -> y[r - norm_row_start, :] (FP16).
+//     Grid: (M, 1, 1), TG: (256, 1, 1)
+// ============================================================================
+kernel void dflash_conv_finish_add_rmsnorm_f16(
+    const device float*            x      [[buffer(0)]], // [M, D]
+    const device float*            dyn    [[buffer(1)]], // [M, 2_stages, 2_taps, D / group_size]
+    const device half*             base_k [[buffer(2)]], // [2_stages, 2_taps, D]
+    device float*                  h      [[buffer(3)]], // [M, D] in-place residual +=
+    const device half*             norm_w [[buffer(4)]], // [D] FP16 (NO +1.0!)
+    device half*                   y      [[buffer(5)]], // [M - norm_row_start, D] FP16
+    constant DFlashConvNormParams& p      [[buffer(6)]],
+    uint row                              [[threadgroup_position_in_grid]],
+    uint tid                              [[thread_position_in_threadgroup]],
+    uint tg_size                          [[threads_per_threadgroup]]
+) {
+    if (row >= p.M) return;
+
+    const uint G = p.D / p.group_size;
+    const ulong dyn_base = ((ulong)row * 4ul + (ulong)p.stage * 2ul) * G;
+    const ulong bk_base  = (ulong)p.stage * 2ul * p.D;
+    const device float* xr = x + (ulong)row * p.D;
+    const device float* xp = (row > 0u) ? (x + (ulong)(row - 1u) * p.D) : nullptr;
+    device float*       hr = h + (ulong)row * p.D;
+
+    const bool do_norm = (row >= p.norm_row_start);
+
+    // Fast vectorized register-cached path (covers D=5120 -> 5 float4s/thread, up to D=8192)
+    if ((p.D & 3u) == 0u && (p.group_size & 3u) == 0u && p.D <= 8192u && tg_size == 256u) {
+        const uint d4 = p.D >> 2;
+        const uint gs4 = p.group_size >> 2;
+        const device float4* xr4  = (const device float4*)xr;
+        const device float4* xp4  = (const device float4*)xp;
+        const device half4*  bk04 = (const device half4*)(base_k + bk_base);
+        const device half4*  bk14 = (const device half4*)(base_k + bk_base + p.D);
+        device float4*       hr4  = (device float4*)hr;
+
+        float4 hv[8];
+        float sq = 0.0f;
+        uint n_it = 0u;
+        for (uint i = tid; i < d4; i += 256u) {
+            const uint g = i / gs4;
+            const float d0 = dyn[dyn_base + g];
+            const float d1 = dyn[dyn_base + G + g];
+            const float4 k0 = float4(bk04[i]) + d0;
+            const float4 k1 = float4(bk14[i]) + d1;
+            const float4 cur  = xr4[i];
+            const float4 prev = (row > 0u) ? xp4[i] : float4(0.0f);
+            const float4 hnew = hr4[i] + fma(cur, k0, prev * k1);
+            hr4[i] = hnew;
+            if (do_norm) {
+                hv[n_it] = hnew;
+                sq = fma(hnew.x, hnew.x, fma(hnew.y, hnew.y, fma(hnew.z, hnew.z, fma(hnew.w, hnew.w, sq))));
+            }
+            ++n_it;
+        }
+        if (!do_norm) return;
+
+        sq = simd_sum(sq);
+        threadgroup float smem[32];
+        const uint sg   = tid >> 5;
+        const uint lane = tid & 31u;
+        if (lane == 0u) smem[sg] = sq;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0u) {
+            float tot = (lane < 8u) ? smem[lane] : 0.0f;
+            tot = simd_sum(tot);
+            if (lane == 0u) smem[0] = rsqrt(tot / float(p.D) + p.eps);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float inv_rms = smem[0];
+
+        const device half4* w4  = (const device half4*)norm_w;
+        device half4*       yr4 = (device half4*)(y + (ulong)(row - p.norm_row_start) * p.D);
+        uint it = 0u;
+        for (uint i = tid; i < d4; i += 256u) {
+            yr4[i] = half4(hv[it] * inv_rms * float4(w4[i]));
+            ++it;
+        }
+        return;
+    }
+
+    // General fallback for arbitrary D / group_size / tg_size
+    float sq = 0.0f;
+    for (uint c = tid; c < p.D; c += tg_size) {
+        const uint g = c / p.group_size;
+        const float k0 = float(base_k[bk_base + c])       + dyn[dyn_base + g];
+        const float k1 = float(base_k[bk_base + p.D + c]) + dyn[dyn_base + G + g];
+        const float cur  = xr[c];
+        const float prev = (row > 0u) ? xp[c] : 0.0f;
+        const float hnew = hr[c] + fma(cur, k0, prev * k1);
+        hr[c] = hnew;
+        if (do_norm) sq = fma(hnew, hnew, sq);
+    }
+    if (!do_norm) return;
+
+    sq = simd_sum(sq);
+    threadgroup float smem[32];
+    const uint sg   = tid >> 5;
+    const uint lane = tid & 31u;
+    const uint nsg  = tg_size >> 5;
+    if (lane == 0u) smem[sg] = sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0u) {
+        float tot = (lane < nsg) ? smem[lane] : 0.0f;
+        tot = simd_sum(tot);
+        if (lane == 0u) smem[0] = rsqrt(tot / float(p.D) + p.eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float inv_rms = smem[0];
+
+    device half* yr = y + (ulong)(row - p.norm_row_start) * p.D;
+    for (uint c = tid; c < p.D; c += tg_size) {
+        yr[c] = half(hr[c] * inv_rms * float(norm_w[c]));
+    }
 }
 
 // ============================================================================
@@ -716,10 +845,11 @@ kernel void dflash_attn_bidir_window_p2(
 }
 
 // ============================================================================
-// 6. Exact 2-Pass Top-K (K=16) over FP32 lm_head Logits [M, V]
+// 6. Exact 2-Pass Top-K (K <= 32, typically 16) over FP32 lm_head Logits [M, V]
 //    Deterministic tie-breaking by smallest token ID.
+//    1-barrier per-SG reduction + packed_float4 coalesced loads (32 barriers -> 1).
 //    Pass 1 (dflash_lmhead_topk16_p1):
-//      num_chunks = ceil_div(V, 2048) (= 122 for V=248320)
+//      num_chunks = ceil_div(V, 2048) (= 122 for V=248077/248320)
 //      Grid: (num_chunks, M, 1), TG: (256, 1, 1)
 //    Pass 2 (dflash_lmhead_topk16_p2):
 //      Grid: (1, M, 1), TG: (256, 1, 1) -> outputs flat [M * K] DFlashLogitCand
@@ -733,71 +863,139 @@ kernel void dflash_lmhead_topk16_p1(
     uint  lane                           [[thread_index_in_simdgroup]],
     uint  sg                             [[simdgroup_index_in_threadgroup]]
 ) {
+    (void)tid;
     const uint chunk = tgid.x;
     const uint row   = tgid.y;
-    if (chunk >= p.num_chunks || row >= p.M) return;
+    if (chunk >= p.num_chunks || row >= p.M || p.K == 0u || p.K > 32u) return;
 
     const device float* lrow = logits + (ulong)row * p.V;
-    const uint base = chunk * 2048u;
+    const uint sg_base = chunk * 2048u + sg * 256u;
 
     float vals[8];
+    uint  ids[8];
     float my_v    = -INFINITY;
     uint  my_slot = 0u;
     uint  my_id   = 0xFFFFFFFFu;
 
+    // 2 coalesced 4B-aligned packed_float4 loads per lane (handles non-mult-4 V like 248077 safely!)
+    const uint idx0 = sg_base + lane * 4u;
+    const uint idx1 = sg_base + 128u + lane * 4u;
+    float4 f0 = float4(-INFINITY);
+    float4 f1 = float4(-INFINITY);
+    if (idx0 + 4u <= p.V) {
+        f0 = float4(*(const device packed_float4*)(lrow + idx0));
+    } else {
+        for (uint j = 0u; j < 4u; ++j) if (idx0 + j < p.V) f0[j] = lrow[idx0 + j];
+    }
+    if (idx1 + 4u <= p.V) {
+        f1 = float4(*(const device packed_float4*)(lrow + idx1));
+    } else {
+        for (uint j = 0u; j < 4u; ++j) if (idx1 + j < p.V) f1[j] = lrow[idx1 + j];
+    }
+
+    vals[0] = isnan(f0.x) ? -INFINITY : f0.x; ids[0] = (idx0 + 0u < p.V) ? (idx0 + 0u) : 0xFFFFFFFFu;
+    vals[1] = isnan(f0.y) ? -INFINITY : f0.y; ids[1] = (idx0 + 1u < p.V) ? (idx0 + 1u) : 0xFFFFFFFFu;
+    vals[2] = isnan(f0.z) ? -INFINITY : f0.z; ids[2] = (idx0 + 2u < p.V) ? (idx0 + 2u) : 0xFFFFFFFFu;
+    vals[3] = isnan(f0.w) ? -INFINITY : f0.w; ids[3] = (idx0 + 3u < p.V) ? (idx0 + 3u) : 0xFFFFFFFFu;
+    vals[4] = isnan(f1.x) ? -INFINITY : f1.x; ids[4] = (idx1 + 0u < p.V) ? (idx1 + 0u) : 0xFFFFFFFFu;
+    vals[5] = isnan(f1.y) ? -INFINITY : f1.y; ids[5] = (idx1 + 1u < p.V) ? (idx1 + 1u) : 0xFFFFFFFFu;
+    vals[6] = isnan(f1.z) ? -INFINITY : f1.z; ids[6] = (idx1 + 2u < p.V) ? (idx1 + 2u) : 0xFFFFFFFFu;
+    vals[7] = isnan(f1.w) ? -INFINITY : f1.w; ids[7] = (idx1 + 3u < p.V) ? (idx1 + 3u) : 0xFFFFFFFFu;
+
     #pragma clang loop unroll(full)
     for (uint i = 0u; i < 8u; ++i) {
-        const uint idx = base + i * 256u + tid;
-        float v = (idx < p.V) ? lrow[idx] : -INFINITY;
-        if (isnan(v)) v = -INFINITY;
-        vals[i] = v;
-        if (v > my_v || (v == my_v && idx < my_id && v > -INFINITY)) {
+        const float v = vals[i];
+        const uint id = ids[i];
+        if (v > my_v || (v == my_v && id < my_id && v > -INFINITY)) {
             my_v    = v;
             my_slot = i;
-            my_id   = idx;
+            my_id   = id;
         }
     }
 
-    threadgroup float sm_v[8];
-    threadgroup uint  sm_id[8];
-    threadgroup uint  win_id_tg;
-
-    const ulong out_base = ((ulong)row * p.num_chunks + chunk) * p.K;
+    // Each of the 8 SGs selects its own Top-K purely in warp ops (0 threadgroup_barriers!)
+    threadgroup float sm_v[8][32];
+    threadgroup uint  sm_id[8][32];
 
     for (uint k = 0u; k < p.K; ++k) {
         const float sg_v  = simd_max(my_v);
         const uint  sg_id = simd_min((my_v == sg_v) ? my_id : 0xFFFFFFFFu);
         if (lane == 0u) {
-            sm_v[sg]  = sg_v;
-            sm_id[sg] = sg_id;
+            sm_v[sg][k]  = sg_v;
+            sm_id[sg][k] = sg_id;
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        if (sg == 0u) {
-            const float v  = (lane < 8u) ? sm_v[lane]  : -INFINITY;
-            const uint  id = (lane < 8u) ? sm_id[lane] : 0xFFFFFFFFu;
-            const float mv = simd_max(v);
-            const uint mid = simd_min((v == mv) ? id : 0xFFFFFFFFu);
-            if (lane == 0u) {
-                win_id_tg = mid;
-                part_cands[out_base + k] = DFlashLogitCand{ mv, mid };
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        if (my_id == win_id_tg && my_id != 0xFFFFFFFFu) {
+        if (my_id == sg_id && my_id != 0xFFFFFFFFu) {
             vals[my_slot] = -INFINITY;
+            ids[my_slot]  = 0xFFFFFFFFu;
             my_v    = -INFINITY;
             my_slot = 0u;
             my_id   = 0xFFFFFFFFu;
             #pragma clang loop unroll(full)
             for (uint i = 0u; i < 8u; ++i) {
-                const float v   = vals[i];
-                const uint  idx = base + i * 256u + tid;
-                if (v > my_v || (v == my_v && idx < my_id && v > -INFINITY)) {
+                const float v  = vals[i];
+                const uint  id = ids[i];
+                if (v > my_v || (v == my_v && id < my_id && v > -INFINITY)) {
                     my_v    = v;
                     my_slot = i;
-                    my_id   = idx;
+                    my_id   = id;
+                }
+            }
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // SG 0 merges 8 * K <= 256 candidates into final chunk Top-K (0 barriers!)
+    if (sg == 0u) {
+        const uint total_c = 8u * p.K;
+        float mv_a[8];
+        uint  mi_a[8];
+        float b_v = -INFINITY;
+        uint  b_s = 0u;
+        uint  b_i = 0xFFFFFFFFu;
+
+        #pragma clang loop unroll(full)
+        for (uint i = 0u; i < 8u; ++i) {
+            const uint pos = i * 32u + lane;
+            float v  = -INFINITY;
+            uint  id = 0xFFFFFFFFu;
+            if (pos < total_c) {
+                const uint s_idx = pos / p.K;
+                const uint k_idx = pos - s_idx * p.K;
+                v  = sm_v[s_idx][k_idx];
+                id = sm_id[s_idx][k_idx];
+            }
+            mv_a[i] = v;
+            mi_a[i] = id;
+            if (v > b_v || (v == b_v && id < b_i && v > -INFINITY)) {
+                b_v = v;
+                b_s = i;
+                b_i = id;
+            }
+        }
+
+        const ulong out_base = ((ulong)row * p.num_chunks + chunk) * p.K;
+        for (uint k = 0u; k < p.K; ++k) {
+            const float wv  = simd_max(b_v);
+            const uint  wid = simd_min((b_v == wv) ? b_i : 0xFFFFFFFFu);
+            if (lane == 0u) {
+                part_cands[out_base + k] = DFlashLogitCand{ wv, wid };
+            }
+            if (b_i == wid && b_i != 0xFFFFFFFFu) {
+                mv_a[b_s] = -INFINITY;
+                mi_a[b_s] = 0xFFFFFFFFu;
+                b_v = -INFINITY;
+                b_s = 0u;
+                b_i = 0xFFFFFFFFu;
+                #pragma clang loop unroll(full)
+                for (uint i = 0u; i < 8u; ++i) {
+                    const float v  = mv_a[i];
+                    const uint  id = mi_a[i];
+                    if (v > b_v || (v == b_v && id < b_i && v > -INFINITY)) {
+                        b_v = v;
+                        b_s = i;
+                        b_i = id;
+                    }
                 }
             }
         }
@@ -814,7 +1012,7 @@ kernel void dflash_lmhead_topk16_p2(
     uint  sg                                 [[simdgroup_index_in_threadgroup]]
 ) {
     const uint row = tgid.y;
-    if (row >= p.M) return;
+    if (row >= p.M || p.K == 0u || p.K > 32u) return;
 
     const uint total = p.num_chunks * p.K; // 122 * 16 = 1952 <= 4096
     const device DFlashLogitCand* src = part_cands + (ulong)row * total;
@@ -846,34 +1044,17 @@ kernel void dflash_lmhead_topk16_p2(
         }
     }
 
-    threadgroup float sm_v[8];
-    threadgroup uint  sm_id[8];
-    threadgroup uint  win_id_tg;
-
-    device DFlashLogitCand* dst = out_cands + (ulong)row * p.K;
+    threadgroup float sm_v[8][32];
+    threadgroup uint  sm_id[8][32];
 
     for (uint k = 0u; k < p.K; ++k) {
         const float sg_v  = simd_max(my_v);
         const uint  sg_id = simd_min((my_v == sg_v) ? my_id : 0xFFFFFFFFu);
         if (lane == 0u) {
-            sm_v[sg]  = sg_v;
-            sm_id[sg] = sg_id;
+            sm_v[sg][k]  = sg_v;
+            sm_id[sg][k] = sg_id;
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        if (sg == 0u) {
-            const float v  = (lane < 8u) ? sm_v[lane]  : -INFINITY;
-            const uint  id = (lane < 8u) ? sm_id[lane] : 0xFFFFFFFFu;
-            const float mv = simd_max(v);
-            const uint mid = simd_min((v == mv) ? id : 0xFFFFFFFFu);
-            if (lane == 0u) {
-                win_id_tg = mid;
-                dst[k] = DFlashLogitCand{ mv, mid };
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        if (my_id == win_id_tg && my_id != 0xFFFFFFFFu) {
+        if (my_id == sg_id && my_id != 0xFFFFFFFFu) {
             vals[my_slot] = -INFINITY;
             ids[my_slot]  = 0xFFFFFFFFu;
             my_v    = -INFINITY;
@@ -887,6 +1068,63 @@ kernel void dflash_lmhead_topk16_p2(
                     my_v    = v;
                     my_slot = i;
                     my_id   = id;
+                }
+            }
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (sg == 0u) {
+        const uint total_c = 8u * p.K;
+        float mv_a[8];
+        uint  mi_a[8];
+        float b_v = -INFINITY;
+        uint  b_s = 0u;
+        uint  b_i = 0xFFFFFFFFu;
+
+        #pragma clang loop unroll(full)
+        for (uint i = 0u; i < 8u; ++i) {
+            const uint pos = i * 32u + lane;
+            float v  = -INFINITY;
+            uint  id = 0xFFFFFFFFu;
+            if (pos < total_c) {
+                const uint s_idx = pos / p.K;
+                const uint k_idx = pos - s_idx * p.K;
+                v  = sm_v[s_idx][k_idx];
+                id = sm_id[s_idx][k_idx];
+            }
+            mv_a[i] = v;
+            mi_a[i] = id;
+            if (v > b_v || (v == b_v && id < b_i && v > -INFINITY)) {
+                b_v = v;
+                b_s = i;
+                b_i = id;
+            }
+        }
+
+        device DFlashLogitCand* dst = out_cands + (ulong)row * p.K;
+        for (uint k = 0u; k < p.K; ++k) {
+            const float wv  = simd_max(b_v);
+            const uint  wid = simd_min((b_v == wv) ? b_i : 0xFFFFFFFFu);
+            if (lane == 0u) {
+                dst[k] = DFlashLogitCand{ wv, wid };
+            }
+            if (b_i == wid && b_i != 0xFFFFFFFFu) {
+                mv_a[b_s] = -INFINITY;
+                mi_a[b_s] = 0xFFFFFFFFu;
+                b_v = -INFINITY;
+                b_s = 0u;
+                b_i = 0xFFFFFFFFu;
+                #pragma clang loop unroll(full)
+                for (uint i = 0u; i < 8u; ++i) {
+                    const float v  = mv_a[i];
+                    const uint  id = mi_a[i];
+                    if (v > b_v || (v == b_v && id < b_i && v > -INFINITY)) {
+                        b_v = v;
+                        b_s = i;
+                        b_i = id;
+                    }
                 }
             }
         }

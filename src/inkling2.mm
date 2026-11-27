@@ -21,7 +21,7 @@ namespace mi {
 namespace {
 
 struct QmmParams { uint32_t M, N, K, add_residual; };
-struct EmbedParams { uint32_t M, D; float eps; };
+struct EmbedParams { uint32_t M, D, V; };
 struct InkEmbedParams { uint32_t M, D; float eps; uint32_t V; };
 struct NormParams { uint32_t M, D; float eps; };
 struct AttnResParams {
@@ -200,7 +200,8 @@ Inkling2Model::Inkling2Model(
         }
     }
 
-    // Zero-copy mmap weights (skip vision tower)
+    // Zero-copy mmap weights (skip vision tower; keep aligned copies for any misaligned tensors
+    // since qmm_q8_g64_*/qmm_bf16_*/inkling_embed_bf16_norm require aligned uint*/ushort* pointers)
     store_.load_dir(ctx_.device(), model_dir, {"model.visual."});
 
     const std::string pfx = "model.llm.";
@@ -746,7 +747,7 @@ void Inkling2Model::encode_chunk(
         [enc setBytes:&ep length:sizeof(ep) atIndex:4];
         [enc dispatchThreadgroups:MTLSizeMake(M, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     } else {
-        EmbedParams ep{M, D, rms_eps_};
+        EmbedParams ep{M, D, static_cast<uint32_t>(vocab_size_)};
         [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_embed_q4_];
         [enc setBuffer:(id<MTLBuffer>)embed_.w.buffer offset:embed_.w.offset atIndex:0];
         [enc setBuffer:(id<MTLBuffer>)embed_.s.buffer offset:embed_.s.offset atIndex:1];
@@ -1462,7 +1463,7 @@ void Inkling2Model::encode_mtp_propose(id enc_id, int /*anchor_token*/, int coun
         [enc setBytes:&ep length:sizeof(ep) atIndex:4];
         [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     } else {
-        EmbedParams ep{1u, D, rms_eps_};
+        EmbedParams ep{1u, D, static_cast<uint32_t>(vocab_size_)};
         [enc setComputePipelineState:(id<MTLComputePipelineState>)pso_embed_q4_];
         [enc setBuffer:(id<MTLBuffer>)embed_.w.buffer offset:embed_.w.offset atIndex:0];
         [enc setBuffer:(id<MTLBuffer>)embed_.s.buffer offset:embed_.s.offset atIndex:1];

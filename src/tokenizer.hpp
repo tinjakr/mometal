@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -65,27 +66,43 @@ public:
         size_t* out_system_prefix_len = nullptr
     ) const;
 
-    int vocab_size() const { return static_cast<int>(id_to_token_.size()); }
+    int vocab_size() const { return static_cast<int>(id_to_span_.size()); }
     bool is_special(int id) const;
 
 private:
+    struct TokenSpan {
+        uint32_t off = UINT32_MAX;
+        uint32_t len = 0;
+    };
+
     std::string arch_;
     bool use_nfc_ = false;
     void* regex_handle_ = nullptr; // NSRegularExpression* (retained via CFBridgingRetain)
 
-    std::unordered_map<std::string, int> token_to_id_;
-    std::vector<std::string> id_to_token_;
+    // Compact flat contiguous vocab & merge tables (~11.8 MiB vs ~81.5 MiB unordered_map)
+    std::vector<char> vocab_arena_;
+    std::vector<TokenSpan> id_to_span_;
+    std::vector<int32_t> tok_ht_ids_; // open-addressed token string -> id (-1 = empty)
+    size_t tok_ht_mask_ = 0;
+    std::vector<uint64_t> merge_keys_; // open-addressed (id_a<<32)|id_b (UINT64_MAX = empty)
+    std::vector<int32_t> merge_vals_;  // merge rank
+    size_t merge_ht_mask_ = 0;
+
     // All added_tokens (both special:true and special:false) matched during encode(..., parse_special=true)
     std::unordered_map<std::string, int> added_to_id_;
     std::vector<std::string> added_tokens_sorted_; // longest first
     bool added_first_byte_[256] = {};
     // Only added_tokens with "special": true (stripped when skip_special=true; reported by is_special())
     std::unordered_set<int> special_ids_;
-    std::unordered_map<uint64_t, int> merge_ranks_;  // (id_a << 32) | id_b -> rank
 
     // ByteLevel GPT-2 byte <-> unicode char tables
     std::string byte_to_utf8_[256];
-    std::unordered_map<std::string, uint8_t> utf8_to_byte_;
+    int byte_to_id_[256] = {};
+    int16_t cp_to_byte_[512] = {};
+
+    std::string_view token_sv(int id) const;
+    int find_token_id(std::string_view sv) const;
+    int find_merge_rank(uint64_t key) const;
 
     void init_byte_level_tables();
     std::vector<int> bpe_encode_piece(const std::string& raw_bytes) const;

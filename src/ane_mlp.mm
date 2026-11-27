@@ -87,10 +87,10 @@ std::string detect_tag(const std::string& dir, const std::string& ane_arch, int&
                               (ane_arch.rfind("h13", 0) == 0 ||
                                ane_arch.rfind("h14", 0) == 0 ||
                                ane_arch.rfind("h15", 0) == 0));
-    const char* cands_m4[] = {"hf4", "lut4"};
-    const char* cands_m1[] = {"lut4", "hf4"};
+    const char* cands_m4[] = {"hf4", "nf4", "lut4"};
+    const char* cands_m1[] = {"nf4", "lut4", "hf4"};
     const char* const* cands = prefer_lut4 ? cands_m1 : cands_m4;
-    for (int i = 0; i < 2; ++i) {
+    for (int i = 0; i < 3; ++i) {
         const char* t = cands[i];
         std::string p0 = dir + "/L0_mlp_p0_" + t + ".mlmodelc";
         if (fs::is_directory(p0)) {
@@ -221,6 +221,11 @@ AneMlpEngine::AneMlpEngine(MetalContext& ctx, const std::string& models_dir, int
         grp_[s] = dispatch_group_create();
         slot_rem_[s].store(0, std::memory_order_relaxed);
         slot_done_[s].store(true, std::memory_order_relaxed);
+        for (int sub = 0; sub < MAX_SUBS; ++sub) {
+            for (int k = 0; k < MAX_PIECES; ++k) {
+                call_left_[s][sub][k].store(true, std::memory_order_relaxed);
+            }
+        }
     }
 
     if (!std::filesystem::is_directory(models_dir)) {
@@ -407,7 +412,13 @@ void AneMlpEngine::run_warmup_4deep() {
     @autoreleasepool {
         constexpr int kLanes = MAX_SLOTS * MAX_SUBS; // 4
         dispatch_group_t lane_grp[kLanes];
-        for (int i = 0; i < kLanes; ++i) lane_grp[i] = dispatch_group_create();
+        std::atomic<bool> lane_piece_left[kLanes][MAX_PIECES];
+        for (int i = 0; i < kLanes; ++i) {
+            lane_grp[i] = dispatch_group_create();
+            for (int k = 0; k < MAX_PIECES; ++k) {
+                lane_piece_left[i][k].store(true, std::memory_order_relaxed);
+            }
+        }
 
         for (int L = 0; L < num_layers_; ++L) {
             int lane = L & (kLanes - 1);
@@ -420,19 +431,49 @@ void AneMlpEngine::run_warmup_4deep() {
             }
             dispatch_group_t grp = lane_grp[lane];
             for (int k = 0; k < num_pieces_; ++k) {
-                const PieceCall& pc = layers_[L].calls[s][sub].pieces[k];
+                lane_piece_left[lane][k].store(false, std::memory_order_release);
                 dispatch_group_enter(grp);
-                [(MLModel*)pc.model predictionFromFeatures:pc.provider options:pc.options
-                    completionHandler:^(id<MLFeatureProvider> res, NSError* err) {
-                        if (!res) {
+            }
+            for (int k = 0; k < num_pieces_; ++k) {
+                const PieceCall& pc = layers_[L].calls[s][sub].pieces[k];
+                std::atomic<bool>* lp = &lane_piece_left[lane][k];
+                if (!pc.model || !pc.provider || !pc.options) {
+                    if (!lp->exchange(true, std::memory_order_acq_rel)) {
+                        std::lock_guard<std::mutex> lk(*wmtx_p);
+                        if (werr_p->empty()) {
+                            *werr_p = "ANE warmup nil model/provider on L" + std::to_string(L);
+                        }
+                        dispatch_group_leave(grp);
+                    }
+                    continue;
+                }
+                @try {
+                    [(MLModel*)pc.model predictionFromFeatures:pc.provider options:pc.options
+                        completionHandler:^(id<MLFeatureProvider> res, NSError* err) {
+                            if (!lp->exchange(true, std::memory_order_acq_rel)) {
+                                if (!res) {
+                                    std::lock_guard<std::mutex> lk(*wmtx_p);
+                                    if (werr_p->empty()) {
+                                        *werr_p = "ANE warmup prediction failed on L" + std::to_string(L) + ": " +
+                                                  (err ? [[err localizedDescription] UTF8String] : "unknown");
+                                    }
+                                }
+                                dispatch_group_leave(grp);
+                            }
+                        }];
+                } @catch (NSException* ex) {
+                    if (!lp->exchange(true, std::memory_order_acq_rel)) {
+                        {
                             std::lock_guard<std::mutex> lk(*wmtx_p);
                             if (werr_p->empty()) {
-                                *werr_p = "ANE warmup prediction failed on L" + std::to_string(L) + ": " +
-                                          (err ? [[err localizedDescription] UTF8String] : "unknown");
+                                NSString* reason = ex.reason ?: ex.name ?: @"NSException";
+                                *werr_p = "ANE warmup exception on L" + std::to_string(L) + ": " +
+                                          std::string([reason UTF8String]);
                             }
                         }
                         dispatch_group_leave(grp);
-                    }];
+                    }
+                }
             }
         }
         for (int i = 0; i < kLanes; ++i) {
@@ -475,6 +516,18 @@ id AneMlpEngine::inv1_buffer(int layer) const {
 }
 
 void AneMlpEngine::submit_slot(int layer, int slot, int n_subs) {
+    if (!ready_) {
+        throw std::runtime_error("AneMlpEngine::submit_slot called when engine is not ready");
+    }
+    if (slot < 0 || slot >= MAX_SLOTS) {
+        throw std::out_of_range("AneMlpEngine::submit_slot invalid slot: " + std::to_string(slot));
+    }
+    if (layer < 0 || layer >= num_layers_) {
+        throw std::out_of_range("AneMlpEngine::submit_slot invalid layer: " + std::to_string(layer));
+    }
+    if (n_subs < 0 || n_subs > MAX_SUBS) {
+        throw std::out_of_range("AneMlpEngine::submit_slot invalid n_subs: " + std::to_string(n_subs));
+    }
     if (warmup_started_) wait_warmup();
     const int total_calls = n_subs * num_pieces_;
     last_slot_ = slot;
@@ -496,36 +549,75 @@ void AneMlpEngine::submit_slot(int layer, int slot, int n_subs) {
     std::mutex* emtx_p = &err_mtx_;
     std::string* serr_p = &slot_err_[slot];
 
+    // Pre-enter dispatch group for all calls upfront so fast sub=0 completion can never drop count to 0 early!
+    for (int sub = 0; sub < n_subs; ++sub) {
+        for (int k = 0; k < num_pieces_; ++k) {
+            call_left_[slot][sub][k].store(false, std::memory_order_release);
+            dispatch_group_enter(grp);
+        }
+    }
+
+    auto finish_call_err = [&](std::atomic<bool>* left_p, int sub, int k, const std::string& msg) {
+        if (!left_p->exchange(true, std::memory_order_acq_rel)) {
+            {
+                std::lock_guard<std::mutex> lk(*emtx_p);
+                if (serr_p->empty()) {
+                    *serr_p = "L" + std::to_string(layer) + " sub" + std::to_string(sub) +
+                              " p" + std::to_string(k) + ": " + msg;
+                }
+            }
+            if (rem_p->fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                done_p->store(true, std::memory_order_release);
+            }
+            dispatch_group_leave(grp);
+        }
+    };
+
     @autoreleasepool {
         for (int sub = 0; sub < n_subs; ++sub) {
             for (int k = 0; k < num_pieces_; ++k) {
                 const PieceCall& pc = ld.calls[slot][sub].pieces[k];
-                dispatch_group_enter(grp);
-                [(MLModel*)pc.model predictionFromFeatures:pc.provider options:pc.options
-                    completionHandler:^(id<MLFeatureProvider> res, NSError* err) {
-                        if (!res) {
-                            std::lock_guard<std::mutex> lk(*emtx_p);
-                            if (serr_p->empty()) {
-                                *serr_p = "L" + std::to_string(layer) + " sub" + std::to_string(sub) +
-                                          " p" + std::to_string(k) + ": " +
-                                          (err ? [[err localizedDescription] UTF8String] : "unknown");
+                std::atomic<bool>* left_p = &call_left_[slot][sub][k];
+                if (!pc.model || !pc.provider || !pc.options) {
+                    finish_call_err(left_p, sub, k, "nil model/provider/options");
+                    continue;
+                }
+                @try {
+                    [(MLModel*)pc.model predictionFromFeatures:pc.provider options:pc.options
+                        completionHandler:^(id<MLFeatureProvider> res, NSError* err) {
+                            if (!left_p->exchange(true, std::memory_order_acq_rel)) {
+                                if (!res) {
+                                    std::lock_guard<std::mutex> lk(*emtx_p);
+                                    if (serr_p->empty()) {
+                                        *serr_p = "L" + std::to_string(layer) + " sub" + std::to_string(sub) +
+                                                  " p" + std::to_string(k) + ": " +
+                                                  (err ? [[err localizedDescription] UTF8String] : "unknown");
+                                    }
+                                }
+                                if (rem_p->fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                                    done_p->store(true, std::memory_order_release);
+                                }
+                                dispatch_group_leave(grp);
                             }
-                        }
-                        if (rem_p->fetch_sub(1, std::memory_order_acq_rel) == 1) {
-                            done_p->store(true, std::memory_order_release);
-                        }
-                        dispatch_group_leave(grp);
-                    }];
+                        }];
+                } @catch (NSException* ex) {
+                    NSString* reason = ex.reason ?: ex.name ?: @"NSException";
+                    finish_call_err(left_p, sub, k, std::string([reason UTF8String]));
+                }
             }
         }
     }
 }
 
 bool AneMlpEngine::is_slot_done(int slot) const {
+    if (slot < 0 || slot >= MAX_SLOTS) return true;
     return slot_done_[slot].load(std::memory_order_acquire);
 }
 
 void AneMlpEngine::wait_slot(int slot) {
+    if (slot < 0 || slot >= MAX_SLOTS) {
+        throw std::out_of_range("AneMlpEngine::wait_slot invalid slot: " + std::to_string(slot));
+    }
     dispatch_group_wait((dispatch_group_t)grp_[slot], DISPATCH_TIME_FOREVER);
     std::string err;
     {
@@ -541,6 +633,13 @@ void AneMlpEngine::wait_slot(int slot) {
 }
 
 void AneMlpEngine::drain_all_slots() noexcept {
+    if (warmup_thread_.joinable() && warmup_thread_.get_id() != std::this_thread::get_id()) {
+        try {
+            warmup_thread_.join();
+        } catch (...) {
+        }
+    }
+    warmup_started_ = false;
     for (int s = 0; s < MAX_SLOTS; ++s) {
         if (grp_[s] != nil) {
             dispatch_group_wait((dispatch_group_t)grp_[s], DISPATCH_TIME_FOREVER);

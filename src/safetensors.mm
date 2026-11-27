@@ -91,20 +91,51 @@ void parse_checked_offsets(const Json& info, size_t data_base, size_t file_size,
     out_nbytes = e - s;
 }
 
-id<MTLBuffer> make_aligned_copy_buffer(id<MTLDevice> device, const uint8_t* src, size_t nbytes) {
-    size_t alloc_len = std::max<size_t>(nbytes, 16u);
-    id<MTLBuffer> copy_buf = [device newBufferWithLength:alloc_len
-                                                 options:MTLResourceStorageModeShared];
-    if (!copy_buf) {
-        throw std::runtime_error("Metal aligned copy buffer allocation failed");
+struct PackedCopyItem {
+    size_t tensor_idx = 0;
+    const uint8_t* src = nullptr;
+    size_t nbytes = 0;
+    size_t dst_off = 0;
+};
+
+void materialize_packed_copies(id<MTLDevice> device, std::vector<PackedCopyItem>& items,
+                               size_t total_bytes, ShardLoadResult& out) {
+    if (items.empty()) return;
+    size_t alloc_len = std::max<size_t>(total_bytes, 64u);
+    id<MTLBuffer> packed_buf = [device newBufferWithLength:alloc_len
+                                                   options:MTLResourceStorageModeShared];
+    if (!packed_buf) {
+        throw std::runtime_error("Metal packed aligned copy buffer allocation failed");
     }
-    if (nbytes < alloc_len) {
-        std::memset([copy_buf contents], 0, alloc_len);
+    uint8_t* base = reinterpret_cast<uint8_t*>([packed_buf contents]);
+    std::memset(base, 0, alloc_len);
+    for (const auto& it : items) {
+        if (it.nbytes > 0 && it.src) {
+            std::memcpy(base + it.dst_off, it.src, it.nbytes);
+        }
+        TensorView& tv = out.tensors[it.tensor_idx].second;
+        tv.buffer = packed_buf;
+        tv.offset = it.dst_off;
+        tv.host_ptr = base + it.dst_off;
     }
-    if (nbytes > 0 && src) {
-        std::memcpy([copy_buf contents], src, nbytes);
+    out.aligned_copies.push_back(packed_buf);
+    items.clear();
+}
+
+void enqueue_packed_copy(id<MTLDevice> device, std::vector<PackedCopyItem>& items,
+                         size_t& packed_bytes, ShardLoadResult& out,
+                         size_t tensor_idx, const uint8_t* src, size_t nbytes) {
+    constexpr size_t kPackAlign = 64u;
+    constexpr size_t kMaxChunkBytes = 256ull * 1024ull * 1024ull;
+    const size_t slot_len = std::max<size_t>(nbytes, 16u);
+    size_t dst_off = (packed_bytes + kPackAlign - 1u) & ~(kPackAlign - 1u);
+    if (!items.empty() && (dst_off + slot_len > kMaxChunkBytes)) {
+        materialize_packed_copies(device, items, packed_bytes, out);
+        packed_bytes = 0;
+        dst_off = 0;
     }
-    return copy_buf;
+    items.push_back(PackedCopyItem{tensor_idx, src, nbytes, dst_off});
+    packed_bytes = dst_off + slot_len;
 }
 
 ShardLoadResult load_shard_isolated(id device_id, const std::string& path, const std::string& key_prefix,
@@ -149,6 +180,9 @@ ShardLoadResult load_shard_isolated(id device_id, const std::string& path, const
     }
     std::string_view hdr_sv(reinterpret_cast<const char*>(ptr) + 8, static_cast<size_t>(header_len));
     Json hdr = parse_json(hdr_sv);
+    if (!hdr.is_object()) {
+        throw std::runtime_error("Corrupt safetensors header (not an object): " + path);
+    }
     size_t data_base = 8 + static_cast<size_t>(header_len);
 
     const bool selective = !skip_prefixes.empty() || !include_prefixes.empty();
@@ -229,18 +263,22 @@ ShardLoadResult load_shard_isolated(id device_id, const std::string& path, const
         }
 
         out.tensors.reserve(kept.size());
+        std::vector<PackedCopyItem> packed_items;
+        size_t packed_bytes = 0;
         for (auto& pt : kept) {
             TensorView tv;
             tv.dtype = pt.dtype;
             tv.shape = std::move(pt.shape);
             tv.nbytes = pt.nbytes;
 
+            bool need_packed = false;
+            const uint8_t* copy_src = nullptr;
+            size_t copy_nbytes = 0;
+
             if (pt.nbytes == 0 || out.shard.sub_ranges.empty()) {
-                id<MTLBuffer> dummy_buf = make_aligned_copy_buffer(device, nullptr, 0);
-                out.aligned_copies.push_back(dummy_buf);
-                tv.buffer = dummy_buf;
-                tv.offset = 0;
-                tv.host_ptr = reinterpret_cast<const uint8_t*>([dummy_buf contents]);
+                need_packed = true;
+                copy_src = nullptr;
+                copy_nbytes = 0;
             } else {
                 size_t lo = 0, hi = out.shard.sub_ranges.size();
                 while (lo + 1 < hi) {
@@ -257,15 +295,18 @@ ShardLoadResult load_shard_isolated(id device_id, const std::string& path, const
                 bool skip_copy = (allow_unaligned_q4 && is_unaligned_q4_key(pt.full_key, tv.dtype)) ||
                                  (allow_unaligned_bf16 && tv.dtype == DType::BF16);
                 if (!skip_copy && (tv.offset % req_align != 0)) {
-                    id<MTLBuffer> copy_buf = make_aligned_copy_buffer(device, tv.host_ptr, tv.nbytes);
-                    out.aligned_copies.push_back(copy_buf);
-                    tv.buffer = copy_buf;
-                    tv.offset = 0;
-                    tv.host_ptr = reinterpret_cast<const uint8_t*>([copy_buf contents]);
+                    need_packed = true;
+                    copy_src = tv.host_ptr;
+                    copy_nbytes = tv.nbytes;
                 }
             }
+            size_t tidx = out.tensors.size();
             out.tensors.emplace_back(std::move(pt.full_key), std::move(tv));
+            if (need_packed) {
+                enqueue_packed_copy(device, packed_items, packed_bytes, out, tidx, copy_src, copy_nbytes);
+            }
         }
+        materialize_packed_copies(device, packed_items, packed_bytes, out);
         out.has_shard = true;
         map_guard.release();
         return out;
@@ -291,6 +332,8 @@ ShardLoadResult load_shard_isolated(id device_id, const std::string& path, const
     out.shard.mtl_buffer = mtl_buf;
     out.mapped_bytes = file_size;
 
+    std::vector<PackedCopyItem> packed_items;
+    size_t packed_bytes = 0;
     for (const auto& [k, info] : hdr.as_object()) {
         if (k == "__metadata__") continue;
         std::string full_key = key_prefix.empty() ? k : (key_prefix + k);
@@ -311,15 +354,16 @@ ShardLoadResult load_shard_isolated(id device_id, const std::string& path, const
         size_t req_align = std::max<size_t>(4, dtype_size(tv.dtype));
         bool skip_copy = (allow_unaligned_q4 && is_unaligned_q4_key(full_key, tv.dtype)) ||
                          (allow_unaligned_bf16 && tv.dtype == DType::BF16);
-        if (!skip_copy && (tv.offset % req_align != 0)) {
-            id<MTLBuffer> copy_buf = make_aligned_copy_buffer(device, tv.host_ptr, tv.nbytes);
-            out.aligned_copies.push_back(copy_buf);
-            tv.buffer = copy_buf;
-            tv.offset = 0;
-            tv.host_ptr = reinterpret_cast<const uint8_t*>([copy_buf contents]);
-        }
+        bool need_packed = (!skip_copy && (tv.offset % req_align != 0));
+        const uint8_t* copy_src = tv.host_ptr;
+        size_t copy_nbytes = tv.nbytes;
+        size_t tidx = out.tensors.size();
         out.tensors.emplace_back(std::move(full_key), std::move(tv));
+        if (need_packed) {
+            enqueue_packed_copy(device, packed_items, packed_bytes, out, tidx, copy_src, copy_nbytes);
+        }
     }
+    materialize_packed_copies(device, packed_items, packed_bytes, out);
     out.has_shard = true;
     map_guard.release();
     return out;
@@ -675,6 +719,7 @@ bool CpuMmapQ4Weight::open(const std::string& model_dir, const std::string& pref
             if (hlen > rm->size - 8u) return false;
             size_t data_base = 8u + static_cast<size_t>(hlen);
             Json hdr = parse_json(std::string_view(reinterpret_cast<const char*>(base + 8), static_cast<size_t>(hlen)));
+            if (!hdr.is_object()) return false;
             const auto& obj = hdr.as_object();
             auto it = obj.find(key);
             if (it == obj.end()) return false;

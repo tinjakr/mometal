@@ -3,6 +3,7 @@
 #include "model.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -70,6 +71,7 @@ public:
     explicit PrefixCacheManager(std::string dir) : dir_(std::move(dir)) {
         if (!dir_.empty()) {
             std::filesystem::create_directories(dir_);
+            reap_stale_tmp(std::chrono::seconds(60));
         }
     }
 
@@ -183,22 +185,53 @@ public:
     }
 
 private:
+    static bool is_tmp_cache_file(const std::filesystem::path& p) {
+        if (p.extension() == ".tmp") return true;
+        const std::string fn = p.filename().string();
+        return fn.find(".micache.tmp") != std::string::npos;
+    }
+
+    void reap_stale_tmp(std::chrono::seconds min_age) const {
+        if (dir_.empty()) return;
+        std::error_code ec;
+        const auto now = std::filesystem::file_time_type::clock::now();
+        for (const auto& e : std::filesystem::directory_iterator(dir_, ec)) {
+            if (!e.is_regular_file(ec)) continue;
+            if (!is_tmp_cache_file(e.path())) continue;
+            auto mt = e.last_write_time(ec);
+            if (ec) { ec.clear(); continue; }
+            if (now > mt && (now - mt) >= min_age) {
+                std::filesystem::remove(e.path(), ec);
+                ec.clear();
+            }
+        }
+    }
+
     void evict_lru(uint64_t max_bytes) const {
         std::error_code ec;
+        const auto now = std::filesystem::file_time_type::clock::now();
+        constexpr auto kStaleTmpAge = std::chrono::seconds(60);
         struct Entry { std::filesystem::path p; std::filesystem::file_time_type mtime; uint64_t sz; };
         std::vector<Entry> items;
         uint64_t total = 0;
         for (const auto& e : std::filesystem::directory_iterator(dir_, ec)) {
             if (!e.is_regular_file(ec)) continue;
-            auto ext = e.path().extension();
             uint64_t sz = e.file_size(ec);
             if (ec) { ec.clear(); continue; }
-            if (ext == ".tmp") {
-                // Account for any in-flight .micache.tmp toward the cap without deleting it
+            if (is_tmp_cache_file(e.path())) {
+                // Reap stale .micache.tmp orphans (>60s) so crashed saves never leak the 6 GiB cap;
+                // count fresh in-flight .tmp files toward the cap without deleting them.
+                auto mt = e.last_write_time(ec);
+                if (!ec && now > mt && (now - mt) >= kStaleTmpAge) {
+                    std::filesystem::remove(e.path(), ec);
+                    ec.clear();
+                    continue;
+                }
+                ec.clear();
                 total += sz;
                 continue;
             }
-            if (ext != ".micache") continue;
+            if (e.path().extension() != ".micache") continue;
             auto mt = e.last_write_time(ec);
             if (ec) { ec.clear(); continue; }
             items.push_back({e.path(), mt, sz});

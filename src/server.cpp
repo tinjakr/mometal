@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -34,6 +35,12 @@ constexpr size_t MAX_HEADER_BYTES = 256ull * 1024ull;
 constexpr size_t MAX_BODY_BYTES   = 64ull * 1024ull * 1024ull;
 constexpr size_t MAX_TRAILER_BYTES = 64ull * 1024ull;
 constexpr int    MAX_ACTIVE_CONNS = 32;
+
+std::atomic<bool> g_shutdown_requested{false};
+
+void handle_shutdown_signal(int) {
+    g_shutdown_requested.store(true, std::memory_order_relaxed);
+}
 
 ssize_t recv_some(int fd, char* buf, size_t cap) {
     while (true) {
@@ -532,11 +539,14 @@ struct ServerState {
     std::atomic<int> active_conns{0};
     std::atomic<int> cached_position{0};
     std::atomic<int64_t> last_req_ns{0};
+    std::atomic<uint64_t> req_seq{0};
+    uint64_t server_epoch = 0;
 
     ServerState(Model& m, const Tokenizer& t, const ServerConfig& c, std::string mid)
         : model(m), tok(t), cfg(c), model_id(std::move(mid)), disk_cache(c.cache_dir) {
-        last_req_ns.store(std::chrono::steady_clock::now().time_since_epoch().count(),
-                          std::memory_order_relaxed);
+        int64_t now_ns = std::chrono::steady_clock::now().time_since_epoch().count();
+        last_req_ns.store(now_ns, std::memory_order_relaxed);
+        server_epoch = static_cast<uint64_t>(now_ns) & 0xFFFFFu;
     }
 };
 
@@ -638,10 +648,10 @@ void handle_connection(ServerState& st, int fd) {
 
     const bool is_chat = (route == "/v1/chat/completions");
     const bool stream = req["stream"].as_bool(false);
-    bool include_usage = true;
+    bool include_usage = false;
     if (req.contains("stream_options") && req["stream_options"].is_object() &&
         req["stream_options"].contains("include_usage")) {
-        include_usage = req["stream_options"]["include_usage"].as_bool(true);
+        include_usage = req["stream_options"]["include_usage"].as_bool(false);
     }
 
     int max_tokens = 4096;
@@ -876,15 +886,23 @@ void handle_connection(ServerState& st, int fd) {
             req_images.reserve(pending_images.size());
             req_image_hashes.reserve(pending_images.size());
             for (const auto& ref : pending_images) {
-                auto tv0 = std::chrono::steady_clock::now();
-                EncodedImage enc_img = st.model.encode_image_url(ref.url, 1280);
-                vis_ms += std::chrono::duration<double, std::milli>(
-                    std::chrono::steady_clock::now() - tv0).count();
-                msgs[ref.msg_idx].parts[ref.part_idx].image_tokens = enc_img.num_tokens();
-                req_image_hashes.push_back(enc_img.content_hash);
-                req_images.push_back(std::move(enc_img));
+                try {
+                    auto tv0 = std::chrono::steady_clock::now();
+                    EncodedImage enc_img = st.model.encode_image_url(ref.url, 1280);
+                    vis_ms += std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - tv0).count();
+                    msgs[ref.msg_idx].parts[ref.part_idx].image_tokens = enc_img.num_tokens();
+                    req_image_hashes.push_back(enc_img.content_hash);
+                    req_images.push_back(std::move(enc_img));
+                } catch (const std::exception& ex) {
+                    Json::Object eo;
+                    eo["error"] = std::string("Invalid image input: ") + ex.what();
+                    send_json_response(fd, 400, "Bad Request", Json(std::move(eo)).dump());
+                    return;
+                }
             }
         }
+        const size_t total_req_images = req_images.size();
 
         size_t sys_prefix_len = 0;
         std::vector<int> prompt_ids;
@@ -1015,7 +1033,8 @@ void handle_connection(ServerState& st, int fd) {
         auto t_first = std::chrono::steady_clock::now();
         double ttft_ms = std::chrono::duration<double, std::milli>(t_first - t_req).count() + restore_ms + vis_ms;
 
-        std::string req_id = "chatcmpl-" + std::to_string(sc.seed & 0xFFFFFFFFu);
+        const uint64_t rseq = st.req_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+        std::string req_id = "chatcmpl-" + std::to_string(st.server_epoch) + "-" + std::to_string(rseq);
         int64_t created = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
 
@@ -1163,7 +1182,8 @@ void handle_connection(ServerState& st, int fd) {
             std::string name = sanitize_utf8(raw_name);
             std::string args_json = sanitize_utf8(raw_args_json);
             int tc_idx = static_cast<int>(emitted_tools.size());
-            std::string tc_id = "call_" + std::to_string((sc.seed & 0xFFFFFFu) + tc_idx);
+            std::string tc_id = "call_" + std::to_string(st.server_epoch) + "_" +
+                                std::to_string(rseq) + "_" + std::to_string(tc_idx);
             emitted_tools.push_back(ToolCall{tc_id, name, args_json});
             if (stream) {
                 Json::Object fn;
@@ -1290,6 +1310,8 @@ void handle_connection(ServerState& st, int fd) {
                         std::string fn_name, args_json;
                         if (parse_qwen_tool_call(tool_buf, tool_schemas, fn_name, args_json)) {
                             emit_tool_call(fn_name, args_json);
+                        } else {
+                            emit_content(tool_buf);
                         }
                         tool_buf.clear();
                     }
@@ -1323,13 +1345,18 @@ void handle_connection(ServerState& st, int fd) {
         bool first_emitted = false;
         bool keep_going = (conn_ok && eff_max_tokens > 0) ? emit_tok(next_tok, first_emitted) : false;
         std::vector<int> mtp_batch;
+        const int spec_max_batch = std::max(8, st.model.mtp_depth() + 1);
         while (keep_going) {
+            if (g_shutdown_requested.load(std::memory_order_relaxed)) break;
             if (st.model.position() >= st.model.info().max_seq_len) {
                 finish_reason = "length";
                 break;
             }
             sampler.observe(next_tok);
-            if (sampler.is_greedy() && st.model.has_mtp()) {
+            // Fall back to 1-token AR for the final < spec_max_batch tokens so max_tokens never
+            // overshoots model.position() mid-speculative-batch and wipes the prefix cache!
+            const bool allow_spec = (eff_max_tokens - gen_count) >= spec_max_batch;
+            if (allow_spec && sampler.is_greedy() && st.model.has_mtp()) {
                 mtp_batch.clear();
                 StepStats ms{};
                 st.model.forward_mtp_greedy(next_tok, mtp_batch, &ms);
@@ -1348,7 +1375,7 @@ void handle_connection(ServerState& st, int fd) {
                     if (!keep_going) break;
                 }
                 next_tok = mtp_batch.back();
-            } else if (!sampler.is_greedy() && st.model.supports_mtp_sampled()) {
+            } else if (allow_spec && !sampler.is_greedy() && st.model.supports_mtp_sampled()) {
                 mtp_batch.clear();
                 StepStats ms{};
                 st.model.forward_mtp_sampled(next_tok, sampler, mtp_batch, &ms);
@@ -1385,7 +1412,7 @@ void handle_connection(ServerState& st, int fd) {
             st.state_tokens.clear();
             st.state_image_hashes.clear();
         }
-        st.cached_position.store(st.model.position(), std::memory_order_relaxed);
+        st.cached_position.store(static_cast<int>(st.state_tokens.size()), std::memory_order_relaxed);
 
         if (!hit_stop) {
             if (is_chat && !is_inkling) {
@@ -1414,7 +1441,7 @@ void handle_connection(ServerState& st, int fd) {
         double dec_s = std::chrono::duration<double>(t_dec1 - t_dec0).count();
         double dec_tps = (gen_count > 1 && dec_s > 0.0) ? ((gen_count - 1) / dec_s) : 0.0;
         std::fprintf(stderr, "[req] prompt=%zu (cached=%d, rest=%.1fms, vis=%.1fms, imgs=%zu) gen=%d tools=%zu ttft=%.1fms decode=%.1f tok/s",
-                     prompt_ids.size(), start_idx, restore_ms, vis_ms, st.state_image_hashes.size(),
+                     prompt_ids.size(), start_idx, restore_ms, vis_ms, total_req_images,
                      gen_count, emitted_tools.size(), ttft_ms, dec_tps);
         if (mtp_dft > 0) {
             std::fprintf(stderr, " mtp=%d/%d(%.0f%%,pld=%d)", mtp_acc, mtp_dft, 100.0 * mtp_acc / mtp_dft, pld_hits);
@@ -1538,6 +1565,13 @@ void handle_connection(ServerState& st, int fd) {
 
 void run_http_server(Model& model, const Tokenizer& tok, const ServerConfig& cfg) {
     signal(SIGPIPE, SIG_IGN);
+    g_shutdown_requested.store(false, std::memory_order_relaxed);
+    struct sigaction sa{};
+    sa.sa_handler = handle_shutdown_signal;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0; // No SA_RESTART so poll() wakes immediately on SIGINT/SIGTERM
+    sigaction(SIGINT, &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
 
     int srv = socket(AF_INET, SOCK_STREAM, 0);
     if (srv < 0) throw std::runtime_error("socket() failed");
@@ -1574,23 +1608,29 @@ void run_http_server(Model& model, const Tokenizer& tok, const ServerConfig& cfg
     std::fprintf(stderr, "[mometal] Serving %s (%s) on http://%s:%d\n",
                  model_id.c_str(), model.info().arch.c_str(), cfg.host.c_str(), cfg.port);
 
-    ServerState st(model, tok, cfg, model_id);
-    if (st.disk_cache.enabled()) {
+    auto st = std::make_shared<ServerState>(model, tok, cfg, model_id);
+    if (st->disk_cache.enabled()) {
         std::fprintf(stderr, "[mometal] Disk prefix cache enabled: %s\n", cfg.cache_dir.c_str());
     }
 
-    while (true) {
+    int64_t last_keep_warm_ns = std::chrono::steady_clock::now().time_since_epoch().count();
+    while (!g_shutdown_requested.load(std::memory_order_relaxed)) {
         pollfd pfd{};
         pfd.fd = srv;
         pfd.events = POLLIN;
-        int pr = poll(&pfd, 1, 15000);
+        int pr = poll(&pfd, 1, 1000);
+        if (g_shutdown_requested.load(std::memory_order_relaxed)) break;
         if (pr == 0) {
             int64_t now_ns = std::chrono::steady_clock::now().time_since_epoch().count();
-            int64_t idle_s = (now_ns - st.last_req_ns.load(std::memory_order_relaxed)) / 1000000000ll;
-            if (idle_s < 900) {
-                std::unique_lock<std::mutex> lk(st.infer_mtx, std::try_to_lock);
-                if (lk.owns_lock()) {
-                    st.model.keep_warm();
+            int64_t since_kw_s = (now_ns - last_keep_warm_ns) / 1000000000ll;
+            if (since_kw_s >= 15) {
+                last_keep_warm_ns = now_ns;
+                int64_t idle_s = (now_ns - st->last_req_ns.load(std::memory_order_relaxed)) / 1000000000ll;
+                if (idle_s < 900) {
+                    std::unique_lock<std::mutex> lk(st->infer_mtx, std::try_to_lock);
+                    if (lk.owns_lock()) {
+                        st->model.keep_warm();
+                    }
                 }
             }
             continue;
@@ -1613,17 +1653,26 @@ void run_http_server(Model& model, const Tokenizer& tok, const ServerConfig& cfg
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rtv, sizeof(rtv));
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &stv, sizeof(stv));
 
-        if (st.active_conns.fetch_add(1, std::memory_order_acq_rel) >= MAX_ACTIVE_CONNS) {
-            st.active_conns.fetch_sub(1, std::memory_order_acq_rel);
+        if (st->active_conns.fetch_add(1, std::memory_order_acq_rel) >= MAX_ACTIVE_CONNS) {
+            st->active_conns.fetch_sub(1, std::memory_order_acq_rel);
             send_json_response(fd, 503, "Service Unavailable", "{\"error\":\"too many active connections\"}");
             close(fd);
             continue;
         }
 
-        std::thread([&st, fd]() {
-            handle_connection(st, fd);
+        std::thread([st, fd]() {
+            handle_connection(*st, fd);
         }).detach();
     }
+
+    close(srv);
+    int pending = st->active_conns.load(std::memory_order_acquire);
+    std::fprintf(stderr, "\n[mometal] Shutting down gracefully (%d active connection(s))...\n", pending);
+    while (st->active_conns.load(std::memory_order_acquire) > 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    model.wait_pending_save();
+    std::fprintf(stderr, "[mometal] Shutdown complete.\n");
 }
 
 } // namespace mi

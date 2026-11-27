@@ -282,7 +282,9 @@ void run_candidate_selector(
     float temperature,
     uint64_t seed,
     int* out_draft_ids,
-    DraftDist* out_draft_dists
+    DraftDist* out_draft_dists,
+    int top_k = 0,
+    float top_p = 1.0f
 ) {
     const int n_pos = cfg.block_size - 1;
     const int K = cfg.selector_top_k;
@@ -300,6 +302,7 @@ void run_candidate_selector(
 
     float scores[256];
     float probs[256];
+    int order[256];
     const int K_clamped = std::min(K, 256);
     const size_t row_bytes = static_cast<size_t>(R) * sizeof(uint16_t);
 
@@ -343,12 +346,17 @@ void run_candidate_selector(
         }
 
         // 2. score[k] = unary[p][k] + dot(v, succ_cb[cand[p][k]])
+        //    Strictly filter invalid / sentinel (id >= V, e.g. 0xFFFFFFFFu) or non-finite unary logits!
         const LogitCand* row_cands = topk_cands + static_cast<size_t>(p) * static_cast<size_t>(K);
         for (int k = 0; k < K_clamped; ++k) {
-            const uint32_t cid = (row_cands[k].id < V) ? row_cands[k].id : 0u;
-            const uint8_t* succ_row = succ_cb_bytes + static_cast<size_t>(cid) * row_bytes;
-            if (k + 1 < K_clamped) {
-                const uint32_t next_cid = (row_cands[k + 1].id < V) ? row_cands[k + 1].id : 0u;
+            const uint32_t raw_id = row_cands[k].id;
+            if (raw_id >= V || !std::isfinite(row_cands[k].val)) {
+                scores[k] = -std::numeric_limits<float>::infinity();
+                continue;
+            }
+            const uint8_t* succ_row = succ_cb_bytes + static_cast<size_t>(raw_id) * row_bytes;
+            if (k + 1 < K_clamped && row_cands[k + 1].id < V) {
+                const uint32_t next_cid = row_cands[k + 1].id;
                 const char* pf = reinterpret_cast<const char*>(succ_cb_bytes + static_cast<size_t>(next_cid) * row_bytes);
                 for (size_t off = 0; off < row_bytes; off += 128u) {
                     __builtin_prefetch(pf + off, 0, 1);
@@ -379,81 +387,126 @@ void run_candidate_selector(
             scores[k] = row_cands[k].val + dot;
         }
 
-        // 3. NaN/Inf-safe selection of greedy or sampled token & optional exact DraftDist q(x)
-        int best = 0;
+        // 3. NaN/Inf/sentinel-safe selection of greedy or top_k/top_p/0.85xT-sharpened sampled token & exact DraftDist q(x)
+        int n_valid = 0;
+        int best = -1;
         float max_s = -std::numeric_limits<float>::infinity();
-        bool has_valid = false;
         for (int k = 0; k < K_clamped; ++k) {
+            if (row_cands[k].id >= V) continue;
             float sc = scores[k];
             if (!std::isfinite(sc)) continue;
-            if (!has_valid || sc > max_s) {
+            order[n_valid++] = k;
+            if (best < 0 || sc > max_s || (sc == max_s && row_cands[k].id < row_cands[best].id)) {
                 max_s = sc;
                 best = k;
-                has_valid = true;
             }
         }
 
-        if (!sampled || temperature <= 0.0f) {
-            pred = static_cast<int>(row_cands[best].id);
-            out_draft_ids[p] = pred;
+        if (n_valid == 0) {
+            // All candidates were invalid/NaN/sentinel (0xFFFFFFFFu): clamp safely to token 0 (never -1!)
+            pred = 0;
+            out_draft_ids[p] = 0;
             if (out_draft_dists != nullptr) {
                 DraftDist& dd = out_draft_dists[p];
-                dd.count = static_cast<uint32_t>(K_clamped);
-                dd.sampled_id = static_cast<uint32_t>(pred);
+                dd.count = 1u;
+                dd.sampled_id = 0u;
                 dd.sampled_q = 1.0f;
                 dd.q_top1 = 1.0f;
                 dd.alt_count = 0u;
-                for (int k = 0; k < K_clamped; ++k) {
-                    dd.cands[k].val = (k == best) ? 1.0f : 0.0f;
-                    dd.cands[k].id = row_cands[k].id;
-                }
+                dd.cands[0] = LogitCand{1.0f, 0u};
+            }
+            continue;
+        }
+
+        if (!sampled || temperature <= 0.0f) {
+            const uint32_t chosen_id = row_cands[best].id;
+            pred = static_cast<int>(chosen_id);
+            out_draft_ids[p] = pred;
+            if (out_draft_dists != nullptr) {
+                DraftDist& dd = out_draft_dists[p];
+                dd.count = 1u;
+                dd.sampled_id = chosen_id;
+                dd.sampled_q = 1.0f;
+                dd.q_top1 = 1.0f;
+                dd.alt_count = 0u;
+                dd.cands[0] = LogitCand{1.0f, chosen_id};
             }
         } else {
-            const float inv_t = 1.0f / std::max(temperature, 1e-4f);
+            // Sort valid candidates descending by combined score (deterministic tie-break by smaller token ID)
+            std::sort(order, order + n_valid, [&](int a, int b) {
+                if (scores[a] != scores[b]) return scores[a] > scores[b];
+                return row_cands[a].id < row_cands[b].id;
+            });
+
+            // Apply top_k truncation to proposal distribution q(x) (100% lossless under Leviathan rejection sampling!)
+            int keep = (top_k > 0 && top_k < n_valid) ? top_k : n_valid;
+
+            // 0.85x temperature sharpening reduces tail probability waste on 4-bit draft logits
+            const float eff_temp = std::max(temperature * 0.85f, 1e-4f);
+            const float inv_t = 1.0f / eff_temp;
+            const float top_s = scores[order[0]];
             float sum_q = 0.0f;
-            if (has_valid) {
-                for (int k = 0; k < K_clamped; ++k) {
-                    float w = std::isfinite(scores[k]) ? std::exp((scores[k] - max_s) * inv_t) : 0.0f;
-                    if (!std::isfinite(w)) w = 0.0f;
-                    probs[k] = w;
-                    sum_q += w;
-                }
+            for (int i = 0; i < keep; ++i) {
+                float w = std::exp((scores[order[i]] - top_s) * inv_t);
+                if (!std::isfinite(w)) w = 0.0f;
+                probs[i] = w;
+                sum_q += w;
             }
-            float max_q = 0.0f;
             if (!(sum_q > 0.0f) || !std::isfinite(sum_q)) {
-                for (int k = 0; k < K_clamped; ++k) probs[k] = (k == best) ? 1.0f : 0.0f;
-                max_q = 1.0f;
+                probs[0] = 1.0f;
+                keep = 1;
             } else {
                 const float inv_sum = 1.0f / sum_q;
-                for (int k = 0; k < K_clamped; ++k) {
-                    probs[k] *= inv_sum;
-                    if (probs[k] > max_q) max_q = probs[k];
+                for (int i = 0; i < keep; ++i) probs[i] *= inv_sum;
+
+                // Apply top_p nucleus truncation + exact renormalization
+                if (top_p > 0.0f && top_p < 1.0f && keep > 1) {
+                    float cum = 0.0f;
+                    int keep_p = keep;
+                    for (int i = 0; i < keep; ++i) {
+                        cum += probs[i];
+                        if (cum >= top_p) {
+                            keep_p = i + 1;
+                            break;
+                        }
+                    }
+                    keep = std::max(1, keep_p);
+                    float renorm = 0.0f;
+                    for (int i = 0; i < keep; ++i) renorm += probs[i];
+                    if (!(renorm > 0.0f) || !std::isfinite(renorm)) {
+                        probs[0] = 1.0f;
+                        keep = 1;
+                    } else {
+                        const float inv_r = 1.0f / renorm;
+                        for (int i = 0; i < keep; ++i) probs[i] *= inv_r;
+                    }
                 }
             }
 
             const float u = udist(rng);
             float acc = 0.0f;
-            int chosen = K_clamped - 1;
-            for (int k = 0; k < K_clamped; ++k) {
-                acc += probs[k];
+            int chosen_i = keep - 1;
+            for (int i = 0; i < keep; ++i) {
+                acc += probs[i];
                 if (u <= acc) {
-                    chosen = k;
+                    chosen_i = i;
                     break;
                 }
             }
-            pred = static_cast<int>(row_cands[chosen].id);
+            const uint32_t chosen_id = row_cands[order[chosen_i]].id;
+            pred = static_cast<int>(chosen_id);
             out_draft_ids[p] = pred;
 
             if (out_draft_dists != nullptr) {
                 DraftDist& dd = out_draft_dists[p];
-                dd.count = static_cast<uint32_t>(K_clamped);
-                dd.sampled_id = static_cast<uint32_t>(pred);
-                dd.sampled_q = probs[chosen];
-                dd.q_top1 = max_q;
+                dd.count = static_cast<uint32_t>(keep);
+                dd.sampled_id = chosen_id;
+                dd.sampled_q = probs[chosen_i];
+                dd.q_top1 = probs[0];
                 dd.alt_count = 0u;
-                for (int k = 0; k < K_clamped; ++k) {
-                    dd.cands[k].val = probs[k];
-                    dd.cands[k].id = row_cands[k].id;
+                for (int i = 0; i < keep; ++i) {
+                    dd.cands[i].val = probs[i];
+                    dd.cands[i].id = row_cands[order[i]].id;
                 }
             }
         }
@@ -467,6 +520,58 @@ uint64_t fnv1a_update(uint64_t h, const void* data, size_t n) {
         h *= 1099511628211ull;
     }
     return h;
+}
+
+constexpr size_t kDFlashQ4CacheHeaderBytes = 256u;
+constexpr uint32_t kDFlashQ4CacheVersion = 1u;
+
+struct DFlashQ4CacheHeader {
+    char     magic[8];          // "MIDFQ4\0\1"
+    uint32_t version;           // kDFlashQ4CacheVersion
+    uint32_t header_bytes;      // kDFlashQ4CacheHeaderBytes (256)
+    uint64_t fingerprint;       // DFlashEngine::fingerprint_
+    uint64_t source_file_size;  // exact model.safetensors st.st_size
+    int64_t  source_mtime_sec;  // st.st_mtimespec.tv_sec
+    int64_t  source_mtime_nsec; // st.st_mtimespec.tv_nsec
+    uint64_t arena_bytes;       // exact q4_cursor
+    uint32_t num_q4_jobs;       // number of Q4 weight tensors
+    uint32_t flags;             // 0
+    uint64_t layout_hash;       // FNV-1a over all Q4Job (out_dim, in_dim, offsets, sizes)
+    uint8_t  reserved[kDFlashQ4CacheHeaderBytes - 72u];
+};
+static_assert(sizeof(DFlashQ4CacheHeader) == kDFlashQ4CacheHeaderBytes,
+              "DFlashQ4CacheHeader must be 256 bytes");
+
+std::string dflash_q4_cache_dir() {
+    const char* env_dir = std::getenv("MOMETAL_DFLASH_CACHE_DIR");
+    if (env_dir && env_dir[0] != '\0') return std::string(env_dir);
+    const char* home = std::getenv("HOME");
+    return home ? (std::string(home) + "/.cache/mometal/dflash") : "/tmp/mometal-dflash";
+}
+
+std::string dflash_q4_cache_path(uint64_t fp) {
+    char hex[32];
+    std::snprintf(hex, sizeof(hex), "%016llx.q4bin", static_cast<unsigned long long>(fp));
+    return dflash_q4_cache_dir() + "/" + hex;
+}
+
+bool validate_q4_cache_header(const DFlashQ4CacheHeader& h,
+                              uint64_t exp_fp, uint64_t exp_src_sz,
+                              int64_t exp_mt_sec, int64_t exp_mt_nsec,
+                              uint64_t exp_arena_bytes, uint32_t exp_n_jobs,
+                              uint64_t exp_layout_hash) {
+    static constexpr char kMagic[8] = {'M', 'I', 'D', 'F', 'Q', '4', '\0', '\1'};
+    return std::memcmp(h.magic, kMagic, 8) == 0 &&
+           h.version == kDFlashQ4CacheVersion &&
+           h.header_bytes == static_cast<uint32_t>(kDFlashQ4CacheHeaderBytes) &&
+           h.fingerprint == exp_fp &&
+           h.source_file_size == exp_src_sz &&
+           h.source_mtime_sec == exp_mt_sec &&
+           h.source_mtime_nsec == exp_mt_nsec &&
+           h.arena_bytes == exp_arena_bytes &&
+           h.num_q4_jobs == exp_n_jobs &&
+           h.flags == 0u &&
+           h.layout_hash == exp_layout_hash;
 }
 
 } // namespace
@@ -536,7 +641,7 @@ DFlashEngine::DFlashEngine(MetalContext& ctx, const std::string& dflash_dir) {
             target_slot_lut_[static_cast<size_t>(tid)] = static_cast<int>(s);
         }
 
-        // 2. Read-only mmap of model.safetensors
+        // 2. Read-only page-aligned mmap of model.safetensors (enables zero-copy Metal sub-ranges for native Q4!)
         std::string st_path = dflash_dir + "/model.safetensors";
         if (!fs::is_regular_file(st_path)) {
             throw std::runtime_error("DFlash model.safetensors not found in: " + dflash_dir);
@@ -548,7 +653,15 @@ DFlashEngine::DFlashEngine(MetalContext& ctx, const std::string& dflash_dir) {
             ::close(fd);
             throw std::runtime_error("Invalid DFlash safetensors file: " + st_path);
         }
-        mmap_size_ = static_cast<size_t>(st.st_size);
+        const size_t ps = static_cast<size_t>(getpagesize());
+        auto align_down_ps = [ps](size_t x) -> size_t { return x & ~(ps - 1u); };
+        auto align_up_ps   = [ps](size_t x) -> size_t { return (x + ps - 1u) & ~(ps - 1u); };
+
+        mmap_file_size_ = static_cast<size_t>(st.st_size);
+        mmap_size_ = align_up_ps(mmap_file_size_);
+        const int64_t src_mtime_sec  = static_cast<int64_t>(st.st_mtimespec.tv_sec);
+        const int64_t src_mtime_nsec = static_cast<int64_t>(st.st_mtimespec.tv_nsec);
+
         mmap_ptr_ = ::mmap(nullptr, mmap_size_, PROT_READ, MAP_SHARED, fd, 0);
         if (mmap_ptr_ == MAP_FAILED) {
             mmap_ptr_ = ::mmap(nullptr, mmap_size_, PROT_READ, MAP_PRIVATE, fd, 0);
@@ -556,17 +669,19 @@ DFlashEngine::DFlashEngine(MetalContext& ctx, const std::string& dflash_dir) {
         ::close(fd);
         if (mmap_ptr_ == MAP_FAILED) {
             mmap_ptr_ = nullptr;
+            mmap_size_ = 0;
+            mmap_file_size_ = 0;
             throw std::runtime_error("mmap failed for DFlash weights: " + st_path);
         }
 
         const uint8_t* base = reinterpret_cast<const uint8_t*>(mmap_ptr_);
         uint64_t header_len = 0;
         std::memcpy(&header_len, base, sizeof(uint64_t));
-        if (mmap_size_ < 8u || header_len > mmap_size_ - 8u || header_len > (128ull << 20)) {
+        if (mmap_file_size_ < 8u || header_len > mmap_file_size_ - 8u || header_len > (128ull << 20)) {
             throw std::runtime_error("Corrupt DFlash safetensors header: " + st_path);
         }
         const size_t data_base = 8u + static_cast<size_t>(header_len);
-        const size_t data_avail = mmap_size_ - data_base;
+        const size_t data_avail = mmap_file_size_ - data_base;
         Json hdr = parse_json(std::string_view(reinterpret_cast<const char*>(base + 8), static_cast<size_t>(header_len)));
         if (!hdr.is_object()) {
             throw std::runtime_error("Corrupt DFlash safetensors header JSON (not an object): " + st_path);
@@ -609,8 +724,11 @@ DFlashEngine::DFlashEngine(MetalContext& ctx, const std::string& dflash_dir) {
         auto has_meta = [&](const std::string& key) -> bool {
             return meta.count(key) > 0 || meta.count("model." + key) > 0;
         };
-        if (!has_meta("candidate_selector.predecessor_codebook") ||
-            !has_meta("candidate_selector.successor_codebook") ||
+        auto has_cb_meta = [&](const std::string& key) -> bool {
+            return has_meta(key) || has_meta(key + ".weight");
+        };
+        if (!has_cb_meta("candidate_selector.predecessor_codebook") ||
+            !has_cb_meta("candidate_selector.successor_codebook") ||
             !has_meta("candidate_selector.hidden_projection.weight") ||
             !has_meta("layers.0.attention_conv.base_kernel") ||
             !has_meta("layers.0.attention_conv.kernel_projection.weight")) {
@@ -627,10 +745,14 @@ DFlashEngine::DFlashEngine(MetalContext& ctx, const std::string& dflash_dir) {
             if (it2 != meta.end()) return it2->second;
             throw std::runtime_error("Missing DFlash tensor: " + key);
         };
+        auto find_cb_meta = [&](const std::string& key) -> const RawTensorMeta& {
+            if (has_meta(key)) return find_meta(key);
+            return find_meta(key + ".weight");
+        };
 
         // 3. Bind zero-Metal-wiring CPU mmap BF16 pointers for CandidateSelector codebooks!
-        const RawTensorMeta& m_pred = find_meta("candidate_selector.predecessor_codebook");
-        const RawTensorMeta& m_succ = find_meta("candidate_selector.successor_codebook");
+        const RawTensorMeta& m_pred = find_cb_meta("candidate_selector.predecessor_codebook");
+        const RawTensorMeta& m_succ = find_cb_meta("candidate_selector.successor_codebook");
         if (m_pred.dtype != DType::BF16 || m_succ.dtype != DType::BF16) {
             throw std::runtime_error("DFlash codebooks expected BF16 dtype");
         }
@@ -653,14 +775,14 @@ DFlashEngine::DFlashEngine(MetalContext& ctx, const std::string& dflash_dir) {
         pred_cb_bytes_ = base + m_pred.byte_offset;
         succ_cb_bytes_ = base + m_succ.byte_offset;
 
-        // Deterministic 64-bit checkpoint identity fingerprint (for MICACHE2 prefix cache disambiguation)
+        // Deterministic 64-bit checkpoint identity fingerprint (for MICACHE2 & .q4bin disk cache disambiguation)
         {
             uint64_t fp = 14695981039346656037ull;
             std::error_code ec;
             std::string canon = fs::weakly_canonical(dflash_dir, ec).string();
             if (canon.empty()) canon = dflash_dir;
             fp = fnv1a_update(fp, canon.data(), canon.size());
-            fp = fnv1a_update(fp, &mmap_size_, sizeof(mmap_size_));
+            fp = fnv1a_update(fp, &mmap_file_size_, sizeof(mmap_file_size_));
             fp = fnv1a_update(fp, &header_len, sizeof(header_len));
             fp = fnv1a_update(fp, base + 8, std::min<size_t>(static_cast<size_t>(header_len), 4096u));
             fp = fnv1a_update(fp, &cfg_.num_layers, sizeof(cfg_.num_layers));
@@ -674,16 +796,12 @@ DFlashEngine::DFlashEngine(MetalContext& ctx, const std::string& dflash_dir) {
             fingerprint_ = fp;
         }
 
-        // Kick off kernel sequential read-ahead on both BF16 codebooks (~242.5 MiB) IMMEDIATELY
-        // so SSD -> OS page-cache I/O overlaps 100% with the 12-thread Q4 quantization pass below!
+        // Kick off kernel sequential read-ahead on both BF16 codebooks (~242.5 MiB) IMMEDIATELY!
         // (Zero Metal wired RAM: pages stay clean file-backed OS page cache!)
-        const size_t ps = static_cast<size_t>(getpagesize());
-        auto align_down_ps = [ps](size_t x) -> size_t { return x & ~(ps - 1u); };
-        auto align_up_ps   = [ps](size_t x) -> size_t { return (x + ps - 1u) & ~(ps - 1u); };
         const size_t pred_pg_lo = align_down_ps(m_pred.byte_offset);
-        const size_t pred_pg_hi = std::min(mmap_size_, align_up_ps(m_pred.byte_offset + m_pred.nbytes));
+        const size_t pred_pg_hi = std::min(mmap_file_size_, align_up_ps(m_pred.byte_offset + m_pred.nbytes));
         const size_t succ_pg_lo = align_down_ps(m_succ.byte_offset);
-        const size_t succ_pg_hi = std::min(mmap_size_, align_up_ps(m_succ.byte_offset + m_succ.nbytes));
+        const size_t succ_pg_hi = std::min(mmap_file_size_, align_up_ps(m_succ.byte_offset + m_succ.nbytes));
         if (pred_pg_hi > pred_pg_lo) {
             ::madvise(const_cast<uint8_t*>(base + pred_pg_lo), pred_pg_hi - pred_pg_lo, MADV_WILLNEED);
         }
@@ -691,67 +809,16 @@ DFlashEngine::DFlashEngine(MetalContext& ctx, const std::string& dflash_dir) {
             ::madvise(const_cast<uint8_t*>(base + succ_pg_lo), succ_pg_hi - succ_pg_lo, MADV_WILLNEED);
         }
 
-        // 4. Plan contiguous Q4_AFFINE_G64 and FP16 Metal arenas (256-byte aligned views)
-        struct Q4Job {
-            const RawTensorMeta* src;
-            DFlashQ4Weight* dst;
-            uint32_t out_dim;
-            uint32_t in_dim;
-            size_t w_off;
-            size_t s_off;
-            size_t b_off;
-            size_t w_bytes;
-            size_t sb_bytes;
-        };
+        // 4. Plan small FP16 arena (~3.1 MiB) and Q4 weights (either native MLX Q4 MAP_SHARED or disk-cached .q4bin!)
         struct F16Job {
             const RawTensorMeta* src;
             TensorView* dst;
             size_t numel;
             size_t dst_off;
         };
-
-        std::vector<Q4Job> q4_jobs;
         std::vector<F16Job> f16_jobs;
-        std::vector<std::pair<size_t, size_t>> evict_ranges; // BF16 mmap ranges to MADV_DONTNEED after load
-        size_t q4_cursor = 0;
+        std::vector<std::pair<size_t, size_t>> evict_ranges;
         size_t f16_cursor = 0;
-
-        auto add_q4 = [&](const std::string& key, DFlashQ4Weight& dst) {
-            const RawTensorMeta& rm = find_meta(key);
-            if (rm.shape.size() != 2 || rm.shape[0] <= 0 || rm.shape[1] <= 0) {
-                throw std::runtime_error("DFlash Q4 tensor must be non-empty 2D: " + key);
-            }
-            if (rm.dtype != DType::BF16 && rm.dtype != DType::F16 && rm.dtype != DType::F32) {
-                throw std::runtime_error("DFlash Q4 tensor unsupported source dtype: " + key);
-            }
-            if (rm.shape[0] > UINT32_MAX || rm.shape[1] > UINT32_MAX) {
-                throw std::runtime_error("DFlash Q4 tensor dimensions overflow uint32: " + key);
-            }
-            uint32_t N = static_cast<uint32_t>(rm.shape[0]);
-            uint32_t K = static_cast<uint32_t>(rm.shape[1]);
-            if ((K % 64u) != 0u) {
-                throw std::runtime_error("DFlash Q4 tensor K not divisible by 64: " + key);
-            }
-            const size_t elem_sz = dtype_size(rm.dtype);
-            if (static_cast<size_t>(N) > (std::numeric_limits<size_t>::max() / elem_sz) / static_cast<size_t>(K) ||
-                rm.nbytes != static_cast<size_t>(N) * static_cast<size_t>(K) * elem_sz) {
-                throw std::runtime_error("DFlash Q4 tensor nbytes mismatch with shape: " + key);
-            }
-            size_t w_bytes  = static_cast<size_t>(N) * (K / 8u) * sizeof(uint32_t);
-            size_t sb_bytes = static_cast<size_t>(N) * (K / 64u) * sizeof(uint16_t);
-            Q4Job j{};
-            j.src = &rm;
-            j.dst = &dst;
-            j.out_dim = N;
-            j.in_dim = K;
-            j.w_off = q4_cursor;  q4_cursor += align256(w_bytes);
-            j.s_off = q4_cursor;  q4_cursor += align256(sb_bytes);
-            j.b_off = q4_cursor;  q4_cursor += align256(sb_bytes);
-            j.w_bytes = w_bytes;
-            j.sb_bytes = sb_bytes;
-            q4_jobs.push_back(j);
-            evict_ranges.emplace_back(rm.byte_offset, rm.byte_offset + rm.nbytes);
-        };
 
         auto add_f16 = [&](const std::string& key, TensorView& dst) {
             const RawTensorMeta& rm = find_meta(key);
@@ -783,11 +850,9 @@ DFlashEngine::DFlashEngine(MetalContext& ctx, const std::string& dflash_dir) {
         };
 
         layers_.resize(static_cast<size_t>(cfg_.num_layers));
-        add_q4("fc.weight", fc_);
         add_f16("hidden_norm.weight", hidden_norm_);
         add_f16("norm.weight", norm_);
         add_f16("candidate_selector.hidden_projection.weight", sel_hidden_proj_);
-
         for (int l = 0; l < cfg_.num_layers; ++l) {
             std::string lp = "layers." + std::to_string(l) + ".";
             DFlashLayerWeights& lw = layers_[static_cast<size_t>(l)];
@@ -797,54 +862,10 @@ DFlashEngine::DFlashEngine(MetalContext& ctx, const std::string& dflash_dir) {
             add_f16(lp + "self_attn.k_norm.weight", lw.k_norm);
             add_f16(lp + "attention_conv.base_kernel", lw.attn_base_kernel);
             add_f16(lp + "mlp_conv.base_kernel", lw.mlp_base_kernel);
-
-            add_q4(lp + "attention_conv.kernel_projection.weight", lw.attn_kernel_proj);
-            add_q4(lp + "mlp_conv.kernel_projection.weight", lw.mlp_kernel_proj);
-            add_q4(lp + "self_attn.q_proj.weight", lw.q_proj);
-            add_q4(lp + "self_attn.k_proj.weight", lw.k_proj);
-            add_q4(lp + "self_attn.v_proj.weight", lw.v_proj);
-            add_q4(lp + "self_attn.o_proj.weight", lw.o_proj);
-            add_q4(lp + "mlp.gate_proj.weight", lw.gate_proj);
-            add_q4(lp + "mlp.up_proj.weight", lw.up_proj);
-            add_q4(lp + "mlp.down_proj.weight", lw.down_proj);
         }
 
-        buf_q4_arena_  = ctx.alloc_shared(std::max<size_t>(q4_cursor, 256u));
         buf_f16_arena_ = ctx.alloc_shared(std::max<size_t>(f16_cursor, 256u));
-        gpu_weight_bytes_ = q4_cursor + f16_cursor;
-
-        uint8_t* q4_base  = reinterpret_cast<uint8_t*>([(id<MTLBuffer>)buf_q4_arena_ contents]);
         uint8_t* f16_base = reinterpret_cast<uint8_t*>([(id<MTLBuffer>)buf_f16_arena_ contents]);
-
-        // Populate all TensorView descriptors
-        for (const auto& j : q4_jobs) {
-            DFlashQ4Weight& d = *j.dst;
-            d.out_dim = j.out_dim;
-            d.in_dim  = j.in_dim;
-
-            d.w.buffer   = buf_q4_arena_;
-            d.w.offset   = j.w_off;
-            d.w.nbytes   = j.w_bytes;
-            d.w.host_ptr = q4_base + j.w_off;
-            d.w.dtype    = DType::U32;
-            d.w.shape    = {static_cast<int64_t>(j.out_dim), static_cast<int64_t>(j.in_dim / 8u)};
-
-            d.s.buffer   = buf_q4_arena_;
-            d.s.offset   = j.s_off;
-            d.s.nbytes   = j.sb_bytes;
-            d.s.host_ptr = q4_base + j.s_off;
-            d.s.dtype    = DType::BF16;
-            d.s.shape    = {static_cast<int64_t>(j.out_dim), static_cast<int64_t>(j.in_dim / 64u)};
-
-            d.b.buffer   = buf_q4_arena_;
-            d.b.offset   = j.b_off;
-            d.b.nbytes   = j.sb_bytes;
-            d.b.host_ptr = q4_base + j.b_off;
-            d.b.dtype    = DType::BF16;
-            d.b.shape    = {static_cast<int64_t>(j.out_dim), static_cast<int64_t>(j.in_dim / 64u)};
-        }
-
-        // Convert all small FP16 tensors synchronously (~3.1 MB -> <1 ms)
         for (const auto& j : f16_jobs) {
             uint16_t* dst_ptr = reinterpret_cast<uint16_t*>(f16_base + j.dst_off);
             convert_tensor_to_f16(base + j.src->byte_offset, j.src->dtype, j.numel, dst_ptr);
@@ -857,81 +878,440 @@ DFlashEngine::DFlashEngine(MetalContext& ctx, const std::string& dflash_dir) {
             tv.shape    = j.src->shape;
         }
 
-        // 5. Fine-grained parallel 12-thread ARM64 NEON BF16 -> Q4_AFFINE_G64 quantization (~0.25-0.4s!)
-        struct RowSlice {
-            size_t job_idx;
-            uint32_t row0;
-            uint32_t row1;
-        };
-        constexpr uint32_t ROW_TILE = 128u;
-        std::vector<RowSlice> slices;
-        slices.reserve(4096);
-        for (size_t ji = 0; ji < q4_jobs.size(); ++ji) {
-            const uint32_t N = q4_jobs[ji].out_dim;
-            for (uint32_t r0 = 0; r0 < N; r0 += ROW_TILE) {
-                slices.push_back(RowSlice{ji, r0, std::min(N, r0 + ROW_TILE)});
-            }
-        }
-
         const unsigned hw = std::thread::hardware_concurrency();
         const unsigned n_thr = std::min<unsigned>(12u, std::max<unsigned>(1u, hw ? hw : 8u));
-        std::atomic<size_t> next_slice{0};
-        std::vector<std::thread> workers;
-        workers.reserve(n_thr);
+        const RawTensorMeta& m_fc_probe = find_meta("fc.weight");
+        const bool is_native_q4 = (m_fc_probe.dtype == DType::U32 && has_meta("fc.scales") && has_meta("fc.biases"));
 
-        for (unsigned ti = 0; ti < n_thr; ++ti) {
-            workers.emplace_back([&]() {
-                while (true) {
-                    size_t si = next_slice.fetch_add(1, std::memory_order_relaxed);
-                    if (si >= slices.size()) break;
-                    const RowSlice& sl = slices[si];
-                    const Q4Job& j = q4_jobs[sl.job_idx];
-                    const uint32_t K = j.in_dim;
-                    const size_t src_row_bytes = static_cast<size_t>(K) * dtype_size(j.src->dtype);
-                    const uint8_t* src_base = base + j.src->byte_offset;
-                    uint32_t* w_base = reinterpret_cast<uint32_t*>(q4_base + j.w_off);
-                    uint16_t* s_base = reinterpret_cast<uint16_t*>(q4_base + j.s_off);
-                    uint16_t* b_base = reinterpret_cast<uint16_t*>(q4_base + j.b_off);
-                    const uint32_t w_stride = K >> 3;
-                    const uint32_t g_stride = K >> 6;
+        size_t q4_total_bytes = 0;
+        const char* q4_mode_label = "in-memory";
 
-                    for (uint32_t r = sl.row0; r < sl.row1; ++r) {
-                        quantize_generic_row_q4_g64(
-                            src_base + static_cast<size_t>(r) * src_row_bytes,
-                            j.src->dtype,
-                            K,
-                            w_base + static_cast<size_t>(r) * w_stride,
-                            s_base + static_cast<size_t>(r) * g_stride,
-                            b_base + static_cast<size_t>(r) * g_stride
-                        );
+        if (is_native_q4) {
+            // Validate quantization config if present (must be MLX 4-bit group-64 affine)
+            const Json* qcfg = cfg.contains("quantization") ? &cfg["quantization"]
+                             : (cfg.contains("quantization_config") ? &cfg["quantization_config"] : nullptr);
+            if (qcfg && qcfg->is_object()) {
+                if (qcfg->contains("bits") && qcfg->operator[]("bits").as_int(4) != 4) {
+                    throw std::runtime_error("DFlash native quantized checkpoint requires bits=4");
+                }
+                if (qcfg->contains("group_size") && qcfg->operator[]("group_size").as_int(64) != 64) {
+                    throw std::runtime_error("DFlash native quantized checkpoint requires group_size=64");
+                }
+                if (qcfg->contains("mode") && qcfg->operator[]("mode").is_string() &&
+                    qcfg->operator[]("mode").as_string() != "affine") {
+                    throw std::runtime_error("DFlash native quantized checkpoint requires affine mode");
+                }
+            }
+
+            struct NativeQ4Job {
+                const RawTensorMeta* w;
+                const RawTensorMeta* s;
+                const RawTensorMeta* b;
+                DFlashQ4Weight* dst;
+                uint32_t out_dim;
+                uint32_t in_dim;
+            };
+            std::vector<NativeQ4Job> native_jobs;
+            native_jobs.reserve(1u + static_cast<size_t>(cfg_.num_layers) * 9u);
+            std::vector<std::pair<size_t, size_t>> q4_pg_ranges;
+            q4_pg_ranges.reserve(native_jobs.capacity() * 3u);
+
+            auto add_native_q4 = [&](const std::string& pfx, DFlashQ4Weight& dst) {
+                const RawTensorMeta& mw = find_meta(pfx + ".weight");
+                const RawTensorMeta& ms = find_meta(pfx + ".scales");
+                const RawTensorMeta& mb = find_meta(pfx + ".biases");
+                if (mw.dtype != DType::U32 || ms.dtype != DType::BF16 || mb.dtype != DType::BF16) {
+                    throw std::runtime_error("DFlash native Q4 tensor dtype mismatch (expected U32/BF16/BF16): " + pfx);
+                }
+                if (mw.shape.size() != 2 || ms.shape.size() != 2 || mb.shape.size() != 2 ||
+                    mw.shape[0] <= 0 || mw.shape[1] <= 0 ||
+                    ms.shape != mb.shape || ms.shape[0] != mw.shape[0] || ms.shape[1] <= 0) {
+                    throw std::runtime_error("DFlash native Q4 tensor shape mismatch: " + pfx);
+                }
+                const uint64_t N64 = static_cast<uint64_t>(mw.shape[0]);
+                const uint64_t Kw64 = static_cast<uint64_t>(mw.shape[1]);
+                const uint64_t K64 = Kw64 * 8ull;
+                if (N64 > UINT32_MAX || K64 > UINT32_MAX || (K64 % 64ull) != 0ull ||
+                    static_cast<uint64_t>(ms.shape[1]) != (K64 / 64ull)) {
+                    throw std::runtime_error("DFlash native Q4 tensor dims incompatible with group_size=64: " + pfx);
+                }
+                const size_t exp_w_bytes  = static_cast<size_t>(N64) * static_cast<size_t>(Kw64) * sizeof(uint32_t);
+                const size_t exp_sb_bytes = static_cast<size_t>(N64) * static_cast<size_t>(K64 / 64ull) * sizeof(uint16_t);
+                if (mw.nbytes != exp_w_bytes || ms.nbytes != exp_sb_bytes || mb.nbytes != exp_sb_bytes) {
+                    throw std::runtime_error("DFlash native Q4 tensor nbytes mismatch: " + pfx);
+                }
+                native_jobs.push_back(NativeQ4Job{
+                    &mw, &ms, &mb, &dst, static_cast<uint32_t>(N64), static_cast<uint32_t>(K64)
+                });
+                q4_total_bytes += exp_w_bytes + 2u * exp_sb_bytes;
+                for (const RawTensorMeta* rm : {&mw, &ms, &mb}) {
+                    size_t p0 = align_down_ps(rm->byte_offset);
+                    size_t p1 = std::min(mmap_size_, align_up_ps(rm->byte_offset + rm->nbytes));
+                    if (p1 > p0) q4_pg_ranges.emplace_back(p0, p1);
+                }
+            };
+
+            add_native_q4("fc", fc_);
+            for (int l = 0; l < cfg_.num_layers; ++l) {
+                std::string lp = "layers." + std::to_string(l) + ".";
+                DFlashLayerWeights& lw = layers_[static_cast<size_t>(l)];
+                add_native_q4(lp + "attention_conv.kernel_projection", lw.attn_kernel_proj);
+                add_native_q4(lp + "mlp_conv.kernel_projection", lw.mlp_kernel_proj);
+                add_native_q4(lp + "self_attn.q_proj", lw.q_proj);
+                add_native_q4(lp + "self_attn.k_proj", lw.k_proj);
+                add_native_q4(lp + "self_attn.v_proj", lw.v_proj);
+                add_native_q4(lp + "self_attn.o_proj", lw.o_proj);
+                add_native_q4(lp + "mlp.gate_proj", lw.gate_proj);
+                add_native_q4(lp + "mlp.up_proj", lw.up_proj);
+                add_native_q4(lp + "mlp.down_proj", lw.down_proj);
+            }
+
+            // Merge page-aligned Q4 sub-ranges (keeps 242.5 MiB codebooks strictly OUTSIDE Metal buffers!)
+            std::sort(q4_pg_ranges.begin(), q4_pg_ranges.end());
+            std::vector<std::pair<size_t, size_t>> merged;
+            for (const auto& r : q4_pg_ranges) {
+                if (merged.empty() || r.first > merged.back().second) {
+                    merged.push_back(r);
+                } else if (r.second > merged.back().second) {
+                    merged.back().second = r.second;
+                }
+            }
+
+            id<MTLDevice> dev = (id<MTLDevice>)ctx.device();
+            q4_sub_bufs_.reserve(merged.size());
+            for (const auto& [r_lo, r_hi] : merged) {
+                const size_t r_len = r_hi - r_lo;
+                void* r_ptr = const_cast<uint8_t*>(base + r_lo);
+                ::madvise(r_ptr, r_len, MADV_WILLNEED);
+                id<MTLBuffer> sub_buf = [dev newBufferWithBytesNoCopy:r_ptr
+                                                               length:r_len
+                                                              options:MTLResourceStorageModeShared
+                                                          deallocator:nil];
+                if (!sub_buf) {
+                    throw std::runtime_error("DFlash native Q4 newBufferWithBytesNoCopy failed");
+                }
+                q4_sub_bufs_.push_back(sub_buf);
+            }
+
+            auto bind_sub_tv = [&](const RawTensorMeta& rm, TensorView& tv) {
+                size_t lo = 0, hi = merged.size();
+                while (lo + 1u < hi) {
+                    size_t mid = (lo + hi) >> 1;
+                    if (merged[mid].first <= rm.byte_offset) lo = mid;
+                    else hi = mid;
+                }
+                tv.buffer   = q4_sub_bufs_[lo];
+                tv.offset   = rm.byte_offset - merged[lo].first;
+                tv.nbytes   = rm.nbytes;
+                tv.host_ptr = base + rm.byte_offset;
+                tv.dtype    = rm.dtype;
+                tv.shape    = rm.shape;
+            };
+
+            for (const auto& j : native_jobs) {
+                DFlashQ4Weight& d = *j.dst;
+                d.out_dim = j.out_dim;
+                d.in_dim  = j.in_dim;
+                bind_sub_tv(*j.w, d.w);
+                bind_sub_tv(*j.s, d.s);
+                bind_sub_tv(*j.b, d.b);
+            }
+            q4_mode_label = "native-Q4 MAP_SHARED";
+        } else {
+            // BF16 / F16 / F32 checkpoint -> 256-byte aligned Q4_AFFINE_G64 arena (guaranteed sh==0 fast path!)
+            // Cached atomically to ~/.cache/mometal/dflash/<fp>.q4bin and MAP_SHARED zero-copy bound!
+            struct Q4Job {
+                const RawTensorMeta* src;
+                DFlashQ4Weight* dst;
+                uint32_t out_dim;
+                uint32_t in_dim;
+                size_t w_off;
+                size_t s_off;
+                size_t b_off;
+                size_t w_bytes;
+                size_t sb_bytes;
+            };
+            std::vector<Q4Job> q4_jobs;
+            q4_jobs.reserve(1u + static_cast<size_t>(cfg_.num_layers) * 9u);
+            size_t q4_cursor = 0;
+
+            auto add_q4 = [&](const std::string& key, DFlashQ4Weight& dst) {
+                const RawTensorMeta& rm = find_meta(key);
+                if (rm.shape.size() != 2 || rm.shape[0] <= 0 || rm.shape[1] <= 0) {
+                    throw std::runtime_error("DFlash Q4 tensor must be non-empty 2D: " + key);
+                }
+                if (rm.dtype != DType::BF16 && rm.dtype != DType::F16 && rm.dtype != DType::F32) {
+                    throw std::runtime_error("DFlash Q4 tensor unsupported source dtype: " + key);
+                }
+                if (rm.shape[0] > UINT32_MAX || rm.shape[1] > UINT32_MAX) {
+                    throw std::runtime_error("DFlash Q4 tensor dimensions overflow uint32: " + key);
+                }
+                uint32_t N = static_cast<uint32_t>(rm.shape[0]);
+                uint32_t K = static_cast<uint32_t>(rm.shape[1]);
+                if ((K % 64u) != 0u) {
+                    throw std::runtime_error("DFlash Q4 tensor K not divisible by 64: " + key);
+                }
+                const size_t elem_sz = dtype_size(rm.dtype);
+                if (static_cast<size_t>(N) > (std::numeric_limits<size_t>::max() / elem_sz) / static_cast<size_t>(K) ||
+                    rm.nbytes != static_cast<size_t>(N) * static_cast<size_t>(K) * elem_sz) {
+                    throw std::runtime_error("DFlash Q4 tensor nbytes mismatch with shape: " + key);
+                }
+                size_t w_bytes  = static_cast<size_t>(N) * (K / 8u) * sizeof(uint32_t);
+                size_t sb_bytes = static_cast<size_t>(N) * (K / 64u) * sizeof(uint16_t);
+                Q4Job j{};
+                j.src = &rm;
+                j.dst = &dst;
+                j.out_dim = N;
+                j.in_dim = K;
+                j.w_off = q4_cursor;  q4_cursor += align256(w_bytes);
+                j.s_off = q4_cursor;  q4_cursor += align256(sb_bytes);
+                j.b_off = q4_cursor;  q4_cursor += align256(sb_bytes);
+                j.w_bytes = w_bytes;
+                j.sb_bytes = sb_bytes;
+                q4_jobs.push_back(j);
+                evict_ranges.emplace_back(rm.byte_offset, rm.byte_offset + rm.nbytes);
+            };
+
+            add_q4("fc.weight", fc_);
+            for (int l = 0; l < cfg_.num_layers; ++l) {
+                std::string lp = "layers." + std::to_string(l) + ".";
+                DFlashLayerWeights& lw = layers_[static_cast<size_t>(l)];
+                add_q4(lp + "attention_conv.kernel_projection.weight", lw.attn_kernel_proj);
+                add_q4(lp + "mlp_conv.kernel_projection.weight", lw.mlp_kernel_proj);
+                add_q4(lp + "self_attn.q_proj.weight", lw.q_proj);
+                add_q4(lp + "self_attn.k_proj.weight", lw.k_proj);
+                add_q4(lp + "self_attn.v_proj.weight", lw.v_proj);
+                add_q4(lp + "self_attn.o_proj.weight", lw.o_proj);
+                add_q4(lp + "mlp.gate_proj.weight", lw.gate_proj);
+                add_q4(lp + "mlp.up_proj.weight", lw.up_proj);
+                add_q4(lp + "mlp.down_proj.weight", lw.down_proj);
+            }
+            q4_total_bytes = q4_cursor;
+
+            // Compute deterministic layout hash over all Q4Job descriptors
+            uint64_t layout_hash = 14695981039346656037ull;
+            for (const auto& j : q4_jobs) {
+                layout_hash = fnv1a_update(layout_hash, &j.out_dim, sizeof(j.out_dim));
+                layout_hash = fnv1a_update(layout_hash, &j.in_dim, sizeof(j.in_dim));
+                layout_hash = fnv1a_update(layout_hash, &j.w_off, sizeof(j.w_off));
+                layout_hash = fnv1a_update(layout_hash, &j.s_off, sizeof(j.s_off));
+                layout_hash = fnv1a_update(layout_hash, &j.b_off, sizeof(j.b_off));
+                layout_hash = fnv1a_update(layout_hash, &j.w_bytes, sizeof(j.w_bytes));
+                layout_hash = fnv1a_update(layout_hash, &j.sb_bytes, sizeof(j.sb_bytes));
+            }
+
+            const size_t cache_file_bytes = kDFlashQ4CacheHeaderBytes + q4_cursor;
+            const std::string cache_dir  = dflash_q4_cache_dir();
+            const std::string cache_path = dflash_q4_cache_path(fingerprint_);
+            id<MTLDevice> dev = (id<MTLDevice>)ctx.device();
+
+            auto try_map_q4_cache = [&](const std::string& cpath) -> bool {
+                int cfd = ::open(cpath.c_str(), O_RDONLY);
+                if (cfd < 0) return false;
+                struct stat cst{};
+                if (::fstat(cfd, &cst) != 0 || static_cast<size_t>(cst.st_size) != cache_file_bytes) {
+                    ::close(cfd);
+                    return false;
+                }
+                DFlashQ4CacheHeader ch{};
+                ssize_t nr = ::pread(cfd, &ch, sizeof(ch), 0);
+                if (nr != static_cast<ssize_t>(sizeof(ch)) ||
+                    !validate_q4_cache_header(ch, fingerprint_, static_cast<uint64_t>(mmap_file_size_),
+                                              src_mtime_sec, src_mtime_nsec,
+                                              static_cast<uint64_t>(q4_cursor),
+                                              static_cast<uint32_t>(q4_jobs.size()),
+                                              layout_hash)) {
+                    ::close(cfd);
+                    return false;
+                }
+                const size_t map_len = align_up_ps(cache_file_bytes);
+                void* ptr = ::mmap(nullptr, map_len, PROT_READ, MAP_SHARED, cfd, 0);
+                ::close(cfd);
+                if (ptr == MAP_FAILED) return false;
+                ::madvise(ptr, cache_file_bytes, MADV_WILLNEED);
+                id<MTLBuffer> mbuf = [dev newBufferWithBytesNoCopy:ptr
+                                                            length:map_len
+                                                           options:MTLResourceStorageModeShared
+                                                       deallocator:nil];
+                if (!mbuf) {
+                    ::munmap(ptr, map_len);
+                    return false;
+                }
+                q4_mmap_ptr_  = ptr;
+                q4_mmap_size_ = map_len;
+                buf_q4_arena_ = mbuf;
+                return true;
+            };
+
+            auto run_parallel_quantize = [&](uint8_t* dst_arena_base) {
+                struct RowSlice {
+                    size_t job_idx;
+                    uint32_t row0;
+                    uint32_t row1;
+                };
+                constexpr uint32_t ROW_TILE = 128u;
+                std::vector<RowSlice> slices;
+                slices.reserve(4096);
+                for (size_t ji = 0; ji < q4_jobs.size(); ++ji) {
+                    const uint32_t N = q4_jobs[ji].out_dim;
+                    for (uint32_t r0 = 0; r0 < N; r0 += ROW_TILE) {
+                        slices.push_back(RowSlice{ji, r0, std::min(N, r0 + ROW_TILE)});
                     }
                 }
-            });
-        }
-        for (auto& th : workers) th.join();
+                std::atomic<size_t> next_slice{0};
+                std::vector<std::thread> workers;
+                workers.reserve(n_thr);
+                for (unsigned ti = 0; ti < n_thr; ++ti) {
+                    workers.emplace_back([&]() {
+                        while (true) {
+                            size_t si = next_slice.fetch_add(1, std::memory_order_relaxed);
+                            if (si >= slices.size()) break;
+                            const RowSlice& sl = slices[si];
+                            const Q4Job& j = q4_jobs[sl.job_idx];
+                            const uint32_t K = j.in_dim;
+                            const size_t src_row_bytes = static_cast<size_t>(K) * dtype_size(j.src->dtype);
+                            const uint8_t* src_base = base + j.src->byte_offset;
+                            uint32_t* w_base = reinterpret_cast<uint32_t*>(dst_arena_base + j.w_off);
+                            uint16_t* s_base = reinterpret_cast<uint16_t*>(dst_arena_base + j.s_off);
+                            uint16_t* b_base = reinterpret_cast<uint16_t*>(dst_arena_base + j.b_off);
+                            const uint32_t w_stride = K >> 3;
+                            const uint32_t g_stride = K >> 6;
+                            for (uint32_t r = sl.row0; r < sl.row1; ++r) {
+                                quantize_generic_row_q4_g64(
+                                    src_base + static_cast<size_t>(r) * src_row_bytes,
+                                    j.src->dtype,
+                                    K,
+                                    w_base + static_cast<size_t>(r) * w_stride,
+                                    s_base + static_cast<size_t>(r) * g_stride,
+                                    b_base + static_cast<size_t>(r) * g_stride
+                                );
+                            }
+                        }
+                    });
+                }
+                for (auto& th : workers) th.join();
+            };
 
-        // 6. Drop quantized BF16 source pages ONLY (strictly excluding codebook pages!),
-        //    then parallel pre-fault every 16 KB page of pred_cb + succ_cb into CPU PTEs (~2-5 ms)
-        //    so CandidateSelector has ZERO major/minor page-fault spikes (stays 7-20 us on 100% of rounds!).
-        for (const auto& [lo_off, hi_off] : evict_ranges) {
-            size_t p_lo = align_up_ps(lo_off);
-            size_t p_hi = align_down_ps(hi_off);
-            if (p_hi <= p_lo) continue;
-            // Defensive: never evict any page intersecting pred_cb or succ_cb!
-            if (p_lo < pred_pg_hi && p_hi > pred_pg_lo) {
-                if (p_lo < pred_pg_lo) ::madvise(const_cast<uint8_t*>(base + p_lo), pred_pg_lo - p_lo, MADV_DONTNEED);
-                if (p_hi > pred_pg_hi) ::madvise(const_cast<uint8_t*>(base + pred_pg_hi), p_hi - pred_pg_hi, MADV_DONTNEED);
-                continue;
+            size_t q4_data_offset = 0;
+            bool mapped_cache = try_map_q4_cache(cache_path);
+            if (mapped_cache) {
+                q4_data_offset = kDFlashQ4CacheHeaderBytes;
+                q4_mode_label  = "disk-cache MAP_SHARED hit";
+            } else {
+                // Cache miss: try quantizing directly into an atomic .q4bin.tmp.<pid> file (0 extra anonymous RAM!)
+                bool built_cache = false;
+                std::error_code ec_dir;
+                fs::create_directories(cache_dir, ec_dir);
+                if (!ec_dir) {
+                    std::string tmp_path = cache_path + ".tmp." + std::to_string(::getpid());
+                    int tfd = ::open(tmp_path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+                    if (tfd >= 0) {
+                        bool wr_ok = (::ftruncate(tfd, static_cast<off_t>(cache_file_bytes)) == 0);
+                        void* tptr = MAP_FAILED;
+                        if (wr_ok) {
+                            tptr = ::mmap(nullptr, cache_file_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, tfd, 0);
+                            if (tptr == MAP_FAILED) wr_ok = false;
+                        }
+                        if (wr_ok) {
+                            // Zero-initialize header + alignment padding via OS sparse zero pages; quantize directly into [256..]
+                            uint8_t* tbytes = reinterpret_cast<uint8_t*>(tptr);
+                            run_parallel_quantize(tbytes + kDFlashQ4CacheHeaderBytes);
+
+                            DFlashQ4CacheHeader ch{};
+                            static constexpr char kMagic[8] = {'M', 'I', 'D', 'F', 'Q', '4', '\0', '\1'};
+                            std::memcpy(ch.magic, kMagic, 8);
+                            ch.version           = kDFlashQ4CacheVersion;
+                            ch.header_bytes      = static_cast<uint32_t>(kDFlashQ4CacheHeaderBytes);
+                            ch.fingerprint       = fingerprint_;
+                            ch.source_file_size  = static_cast<uint64_t>(mmap_file_size_);
+                            ch.source_mtime_sec  = src_mtime_sec;
+                            ch.source_mtime_nsec = src_mtime_nsec;
+                            ch.arena_bytes       = static_cast<uint64_t>(q4_cursor);
+                            ch.num_q4_jobs       = static_cast<uint32_t>(q4_jobs.size());
+                            ch.flags             = 0u;
+                            ch.layout_hash       = layout_hash;
+                            std::memcpy(tbytes, &ch, sizeof(ch));
+                        }
+                        if (tptr != MAP_FAILED) {
+                            ::munmap(tptr, cache_file_bytes);
+                        }
+                        ::close(tfd);
+                        if (wr_ok) {
+                            std::error_code ec_rn;
+                            fs::rename(tmp_path, cache_path, ec_rn);
+                            if (!ec_rn && try_map_q4_cache(cache_path)) {
+                                built_cache    = true;
+                                q4_data_offset = kDFlashQ4CacheHeaderBytes;
+                                q4_mode_label  = "disk-cache MAP_SHARED built";
+                            }
+                        }
+                        if (!built_cache) {
+                            std::error_code ec_rm;
+                            fs::remove(tmp_path, ec_rm);
+                        }
+                    }
+                }
+
+                if (!built_cache) {
+                    // Clean fallback if cache directory isn't writable or disk is full
+                    buf_q4_arena_  = ctx.alloc_shared(std::max<size_t>(q4_cursor, 256u));
+                    q4_data_offset = 0;
+                    uint8_t* q4_dst = reinterpret_cast<uint8_t*>([(id<MTLBuffer>)buf_q4_arena_ contents]);
+                    run_parallel_quantize(q4_dst);
+                    q4_mode_label = "in-memory alloc_shared";
+                }
+
+                // Drop quantized BF16 source pages ONLY (strictly excluding codebook pages!)
+                for (const auto& [lo_off, hi_off] : evict_ranges) {
+                    size_t p_lo = align_up_ps(lo_off);
+                    size_t p_hi = align_down_ps(hi_off);
+                    if (p_hi <= p_lo) continue;
+                    if (p_lo < pred_pg_hi && p_hi > pred_pg_lo) {
+                        if (p_lo < pred_pg_lo) ::madvise(const_cast<uint8_t*>(base + p_lo), pred_pg_lo - p_lo, MADV_DONTNEED);
+                        if (p_hi > pred_pg_hi) ::madvise(const_cast<uint8_t*>(base + pred_pg_hi), p_hi - pred_pg_hi, MADV_DONTNEED);
+                        continue;
+                    }
+                    if (p_lo < succ_pg_hi && p_hi > succ_pg_lo) {
+                        if (p_lo < succ_pg_lo) ::madvise(const_cast<uint8_t*>(base + p_lo), succ_pg_lo - p_lo, MADV_DONTNEED);
+                        if (p_hi > succ_pg_hi) ::madvise(const_cast<uint8_t*>(base + succ_pg_hi), p_hi - succ_pg_hi, MADV_DONTNEED);
+                        continue;
+                    }
+                    ::madvise(const_cast<uint8_t*>(base + p_lo), p_hi - p_lo, MADV_DONTNEED);
+                }
             }
-            if (p_lo < succ_pg_hi && p_hi > succ_pg_lo) {
-                if (p_lo < succ_pg_lo) ::madvise(const_cast<uint8_t*>(base + p_lo), succ_pg_lo - p_lo, MADV_DONTNEED);
-                if (p_hi > succ_pg_hi) ::madvise(const_cast<uint8_t*>(base + succ_pg_hi), p_hi - succ_pg_hi, MADV_DONTNEED);
-                continue;
+
+            const uint8_t* q4_buf_base = reinterpret_cast<const uint8_t*>([(id<MTLBuffer>)buf_q4_arena_ contents]);
+            for (const auto& j : q4_jobs) {
+                DFlashQ4Weight& d = *j.dst;
+                d.out_dim = j.out_dim;
+                d.in_dim  = j.in_dim;
+
+                d.w.buffer   = buf_q4_arena_;
+                d.w.offset   = q4_data_offset + j.w_off;
+                d.w.nbytes   = j.w_bytes;
+                d.w.host_ptr = q4_buf_base + d.w.offset;
+                d.w.dtype    = DType::U32;
+                d.w.shape    = {static_cast<int64_t>(j.out_dim), static_cast<int64_t>(j.in_dim / 8u)};
+
+                d.s.buffer   = buf_q4_arena_;
+                d.s.offset   = q4_data_offset + j.s_off;
+                d.s.nbytes   = j.sb_bytes;
+                d.s.host_ptr = q4_buf_base + d.s.offset;
+                d.s.dtype    = DType::BF16;
+                d.s.shape    = {static_cast<int64_t>(j.out_dim), static_cast<int64_t>(j.in_dim / 64u)};
+
+                d.b.buffer   = buf_q4_arena_;
+                d.b.offset   = q4_data_offset + j.b_off;
+                d.b.nbytes   = j.sb_bytes;
+                d.b.host_ptr = q4_buf_base + d.b.offset;
+                d.b.dtype    = DType::BF16;
+                d.b.shape    = {static_cast<int64_t>(j.out_dim), static_cast<int64_t>(j.in_dim / 64u)};
             }
-            ::madvise(const_cast<uint8_t*>(base + p_lo), p_hi - p_lo, MADV_DONTNEED);
         }
 
-        // Parallel 1-byte-per-page PTE warmup over pred_cb + succ_cb (0 B Metal wired RAM, race-free!)
+        gpu_weight_bytes_ = q4_total_bytes + f16_cursor;
+
+        // 5. Parallel 1-byte-per-page PTE warmup over pred_cb + succ_cb (0 B Metal wired RAM, race-free!)
         {
             const std::pair<size_t, size_t> cb_ranges[2] = {
                 {pred_pg_lo, pred_pg_hi},
@@ -961,18 +1341,26 @@ DFlashEngine::DFlashEngine(MetalContext& ctx, const std::string& dflash_dir) {
         load_time_ms_ = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         std::fprintf(stderr,
             "[dflash] Loaded %d-layer DFlash2 drafter (block=%d, win=%d, H=%d, Hq=%d/%d, D=%d, rank=%d, topk=%d) | "
-            "Q4=%.1f MiB + F16=%.1f MiB (codebooks CPU-mmap 0B Metal) in %.1f ms (%u threads)\n",
+            "Q4=%.1f MiB (%s) + F16=%.1f MiB (codebooks CPU-mmap 0B Metal) in %.1f ms (%u threads)\n",
             cfg_.num_layers, cfg_.block_size, cfg_.sliding_window, cfg_.hidden_size,
             cfg_.num_heads, cfg_.num_kv_heads, cfg_.head_dim, cfg_.selector_rank, cfg_.selector_top_k,
-            q4_cursor / (1024.0 * 1024.0), f16_cursor / (1024.0 * 1024.0), load_time_ms_, n_thr);
+            q4_total_bytes / (1024.0 * 1024.0), q4_mode_label, f16_cursor / (1024.0 * 1024.0), load_time_ms_, n_thr);
     } catch (...) {
+        // Release ALL Metal buffers BEFORE unmapping backing mmaps!
         buf_q4_arena_ = nil;
+        q4_sub_bufs_.clear();
         buf_f16_arena_ = nil;
+        if (q4_mmap_ptr_ && q4_mmap_ptr_ != MAP_FAILED) {
+            ::munmap(q4_mmap_ptr_, q4_mmap_size_);
+        }
+        q4_mmap_ptr_ = nullptr;
+        q4_mmap_size_ = 0;
         if (mmap_ptr_ && mmap_ptr_ != MAP_FAILED) {
             ::munmap(mmap_ptr_, mmap_size_);
         }
         mmap_ptr_ = nullptr;
         mmap_size_ = 0;
+        mmap_file_size_ = 0;
         pred_cb_bytes_ = nullptr;
         succ_cb_bytes_ = nullptr;
         ready_ = false;
@@ -981,13 +1369,21 @@ DFlashEngine::DFlashEngine(MetalContext& ctx, const std::string& dflash_dir) {
 }
 
 DFlashEngine::~DFlashEngine() {
+    // Release ALL Metal buffers BEFORE unmapping backing mmaps!
     buf_q4_arena_ = nil;
+    q4_sub_bufs_.clear();
     buf_f16_arena_ = nil;
+    if (q4_mmap_ptr_ && q4_mmap_ptr_ != MAP_FAILED) {
+        ::munmap(q4_mmap_ptr_, q4_mmap_size_);
+    }
+    q4_mmap_ptr_ = nullptr;
+    q4_mmap_size_ = 0;
     if (mmap_ptr_ && mmap_ptr_ != MAP_FAILED) {
         ::munmap(mmap_ptr_, mmap_size_);
     }
     mmap_ptr_ = nullptr;
     mmap_size_ = 0;
+    mmap_file_size_ = 0;
     pred_cb_bytes_ = nullptr;
     succ_cb_bytes_ = nullptr;
 }
@@ -1005,7 +1401,7 @@ void DFlashEngine::select_greedy(int anchor_token,
                                  int* out_draft_ids) const {
     run_candidate_selector(cfg_, pred_cb_bytes_, succ_cb_bytes_, anchor_token,
                            topk_cands, sel_h_f16, nullptr, false, 0.0f, 0ull,
-                           out_draft_ids, nullptr);
+                           out_draft_ids, nullptr, 0, 1.0f);
 }
 
 void DFlashEngine::select_sampled(int anchor_token,
@@ -1014,10 +1410,12 @@ void DFlashEngine::select_sampled(int anchor_token,
                                   float temperature,
                                   uint64_t seed,
                                   int* out_draft_ids,
-                                  DraftDist* out_draft_dists) const {
+                                  DraftDist* out_draft_dists,
+                                  int top_k,
+                                  float top_p) const {
     run_candidate_selector(cfg_, pred_cb_bytes_, succ_cb_bytes_, anchor_token,
                            topk_cands, sel_h_f16, nullptr, true, temperature, seed,
-                           out_draft_ids, out_draft_dists);
+                           out_draft_ids, out_draft_dists, top_k, top_p);
 }
 
 void DFlashEngine::select_greedy_f32(int anchor_token,
@@ -1026,7 +1424,7 @@ void DFlashEngine::select_greedy_f32(int anchor_token,
                                      int* out_draft_ids) const {
     run_candidate_selector(cfg_, pred_cb_bytes_, succ_cb_bytes_, anchor_token,
                            topk_cands, nullptr, sel_h_f32, false, 0.0f, 0ull,
-                           out_draft_ids, nullptr);
+                           out_draft_ids, nullptr, 0, 1.0f);
 }
 
 void DFlashEngine::select_sampled_f32(int anchor_token,
@@ -1035,10 +1433,12 @@ void DFlashEngine::select_sampled_f32(int anchor_token,
                                       float temperature,
                                       uint64_t seed,
                                       int* out_draft_ids,
-                                      DraftDist* out_draft_dists) const {
+                                      DraftDist* out_draft_dists,
+                                      int top_k,
+                                      float top_p) const {
     run_candidate_selector(cfg_, pred_cb_bytes_, succ_cb_bytes_, anchor_token,
                            topk_cands, nullptr, sel_h_f32, true, temperature, seed,
-                           out_draft_ids, out_draft_dists);
+                           out_draft_ids, out_draft_dists, top_k, top_p);
 }
 
 } // namespace mi

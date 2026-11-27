@@ -19,6 +19,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <malloc/malloc.h>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -285,6 +286,7 @@ int main(int argc, char** argv) {
             model = load_model(*ctx_ptr, model_dir, max_seq, exact_nvfp4_act, mtp_dir, mtp_depth, enable_pld,
                                ane_models_dir, ane_tag, kv_bits, kv_bits_explicit, ane_share_layers, sparse_kv_budget, dflash_dir);
         }
+        malloc_zone_pressure_relief(nullptr, 0);
         MetalContext& ctx = *ctx_ptr;
         const ModelInfo& info = model->info();
 
@@ -655,6 +657,7 @@ int main(int argc, char** argv) {
                              n_files, n_toks, s_ms);
             }
         }
+        malloc_zone_pressure_relief(nullptr, 0);
 
         if (cmd == "serve") {
             ServerConfig srv_cfg;
@@ -731,6 +734,7 @@ int main(int argc, char** argv) {
                 bool keep = (max_tokens > 0) ? emit_tok(next_tok) : false;
                 std::vector<int> batch;
                 while (keep) {
+                    if (model->position() >= info.max_seq_len) break;
                     sampler.observe(next_tok);
                     if (sampler.is_greedy() && model->has_mtp()) {
                         batch.clear();
@@ -862,9 +866,12 @@ int main(int argc, char** argv) {
                     bool first_emitted = false;
                     bool keep = (max_tokens > 0) ? emit_chat(next_tok, first_emitted) : false;
                     std::vector<int> batch;
+                    const int spec_max_batch = std::max(8, model->mtp_depth() + 1);
                     while (keep) {
+                        if (model->position() >= info.max_seq_len) break;
                         sampler.observe(next_tok);
-                        if (sampler.is_greedy() && model->has_mtp()) {
+                        const bool allow_spec = (max_tokens - gen) >= spec_max_batch;
+                        if (allow_spec && sampler.is_greedy() && model->has_mtp()) {
                             batch.clear();
                             StepStats ms{};
                             model->forward_mtp_greedy(next_tok, batch, &ms);
@@ -879,7 +886,7 @@ int main(int argc, char** argv) {
                                 if (!keep) break;
                             }
                             next_tok = batch.back();
-                        } else if (!sampler.is_greedy() && model->supports_mtp_sampled()) {
+                        } else if (allow_spec && !sampler.is_greedy() && model->supports_mtp_sampled()) {
                             batch.clear();
                             StepStats ms{};
                             model->forward_mtp_sampled(next_tok, sampler, batch, &ms);

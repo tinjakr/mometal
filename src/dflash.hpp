@@ -101,9 +101,9 @@ public:
                        int* out_draft_ids) const;
 
     // Sampled CandidateSelector (T > 0):
-    //   Samples n_pos draft tokens autoregressively via softmax(score / temperature) over each row's
-    //   top_k candidates, writing out_draft_ids[0..n_pos-1] and (if non-null) filling
-    //   out_draft_dists[0..n_pos-1] with exact q(x) probabilities ready for
+    //   Samples n_pos draft tokens autoregressively via top_k/top_p-filtered, 0.85x-sharpened
+    //   softmax(score / (0.85 * temperature)) over each row's candidates, writing out_draft_ids[0..n_pos-1]
+    //   and (if non-null) filling out_draft_dists[0..n_pos-1] with exact q(x) probabilities ready for
     //   Sampler::sample_or_accept_draft_dist().
     void select_sampled(int anchor_token,
                         const LogitCand* topk_cands,
@@ -111,7 +111,9 @@ public:
                         float temperature,
                         uint64_t seed,
                         int* out_draft_ids,
-                        DraftDist* out_draft_dists = nullptr) const;
+                        DraftDist* out_draft_dists = nullptr,
+                        int top_k = 0,
+                        float top_p = 1.0f) const;
 
     // Optional FP32 sel_h overloads in case caller outputs float32 from hidden_proj
     void select_greedy_f32(int anchor_token,
@@ -124,15 +126,21 @@ public:
                             float temperature,
                             uint64_t seed,
                             int* out_draft_ids,
-                            DraftDist* out_draft_dists = nullptr) const;
+                            DraftDist* out_draft_dists = nullptr,
+                            int top_k = 0,
+                            float top_p = 1.0f) const;
 
 private:
     bool ready_ = false;
     DFlashConfig cfg_;
     std::vector<int> target_slot_lut_; // [max_target_layer + 1] -> capture slot or -1
 
-    // Backing Metal arenas (single Q4 arena + single FP16 arena -> zero fragmentation!)
+    // Backing Metal arenas:
+    //   - Native MLX Q4 checkpoint: q4_sub_bufs_ (zero-copy MAP_SHARED sub-ranges over mmap_ptr_, 0 B dirty Q4!)
+    //   - BF16 checkpoint w/ disk cache: buf_q4_arena_ (zero-copy MAP_SHARED over q4_mmap_ptr_, 0 B dirty Q4!)
+    //   - Fallback (unwritable cache dir): buf_q4_arena_ (in-memory alloc_shared)
     id buf_q4_arena_ = nil;
+    std::vector<id> q4_sub_bufs_;
     id buf_f16_arena_ = nil;
     size_t gpu_weight_bytes_ = 0;
     double load_time_ms_ = 0.0;
@@ -143,10 +151,14 @@ private:
     TensorView sel_hidden_proj_;
     std::vector<DFlashLayerWeights> layers_;
 
-    // Read-only CPU mmap of model.safetensors kept alive ONLY for zero-Metal-wiring BF16 codebooks!
-    // (All quantized BF16 projection ranges are MADV_DONTNEED'd immediately after load.)
+    // Read-only CPU mmap of model.safetensors (page-aligned length for zero-copy Metal sub-range binding).
+    // BF16 projection ranges are MADV_DONTNEED'd when using cached/in-memory Q4; codebooks stay 0 B Metal wired!
     void* mmap_ptr_ = nullptr;
-    size_t mmap_size_ = 0;
+    size_t mmap_size_ = 0;      // page-aligned mmap length
+    size_t mmap_file_size_ = 0; // exact file st.st_size
+    // Optional read-only MAP_SHARED mmap of disk-cached 256B-aligned Q4 arena (~/.cache/mometal/dflash/*.q4bin)
+    void* q4_mmap_ptr_ = nullptr;
+    size_t q4_mmap_size_ = 0;
     const uint8_t* pred_cb_bytes_ = nullptr; // [vocab_size, selector_rank] BF16 (unaligned-safe byte ptr)
     const uint8_t* succ_cb_bytes_ = nullptr; // [vocab_size, selector_rank] BF16 (unaligned-safe byte ptr)
     uint64_t fingerprint_ = 0;

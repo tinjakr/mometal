@@ -1231,6 +1231,61 @@ inline float eval_nf4_err_f16(const __fp16* rn, uint32_t K, float sc, float rati
     return s * (sc * sc);
 }
 
+// 100% register-resident pairwise 2-candidate FP16 + vqtbl2q_u8 + FMLAL NF4 MSE evaluator!
+// Halves L1 row loads (4 passes vs 8) and exposes 2x independent ILP with <=24 NEON regs (0 spills!).
+inline void eval_nf4_err_2p_f16(const __fp16* rn, uint32_t K,
+                                float sc0, float ratio0,
+                                float sc1, float ratio1,
+                                const Nf4Tables& tbl,
+                                float& e0, float& e1) {
+    float16x8_t vr0  = vdupq_n_f16(static_cast<float16_t>(ratio0));
+    float16x8_t vr1  = vdupq_n_f16(static_cast<float16_t>(ratio1));
+    float16x8_t vm7  = vdupq_n_f16(tbl.mid_h[7]);
+    float16x8_t vm3  = vdupq_n_f16(tbl.mid_h[3]);
+    float16x8_t vm11 = vdupq_n_f16(tbl.mid_h[11]);
+    uint8x16_t lv2_tbl = vld1q_u8(reinterpret_cast<const uint8_t*>(tbl.lv2_f16));
+    uint8x16_t lv3_tbl = vld1q_u8(reinterpret_cast<const uint8_t*>(tbl.lv3_f16));
+    uint8x16x2_t lut_tbl2;
+    lut_tbl2.val[0] = vld1q_u8(reinterpret_cast<const uint8_t*>(tbl.lut_f16));
+    lut_tbl2.val[1] = vld1q_u8(reinterpret_cast<const uint8_t*>(tbl.lut_f16 + 8));
+    uint16x8_t v0100 = vdupq_n_u16(0x0100u);
+    uint16x8_t v0202 = vdupq_n_u16(0x0202u);
+    uint16x8_t v0404 = vdupq_n_u16(0x0404u);
+
+    float32x4_t a0l = vdupq_n_f32(0.0f), a0h = vdupq_n_f32(0.0f);
+    float32x4_t a1l = vdupq_n_f32(0.0f), a1h = vdupq_n_f32(0.0f);
+
+    uint32_t k = 0;
+    for (; k + 8u <= K; k += 8u) {
+        float16x8_t x = vld1q_f16(rn + k);
+        float16x8_t wn0 = vmulq_f16(x, vr0);
+        float16x8_t wn1 = vmulq_f16(x, vr1);
+        uint16x8_t idx0 = nf4_classify8_f16(wn0, vm7, vm3, vm11, lv2_tbl, lv3_tbl, v0100, v0202, v0404);
+        uint16x8_t idx1 = nf4_classify8_f16(wn1, vm7, vm3, vm11, lv2_tbl, lv3_tbl, v0100, v0202, v0404);
+        float16x8_t q0 = vreinterpretq_f16_u8(vqtbl2q_u8(lut_tbl2, vreinterpretq_u8_u16(vorrq_u16(idx0, v0100))));
+        float16x8_t q1 = vreinterpretq_f16_u8(vqtbl2q_u8(lut_tbl2, vreinterpretq_u8_u16(vorrq_u16(idx1, v0100))));
+        float16x8_t d0 = vsubq_f16(wn0, q0);
+        float16x8_t d1 = vsubq_f16(wn1, q1);
+        a0l = vfmlalq_low_f16(a0l, d0, d0);
+        a0h = vfmlalq_high_f16(a0h, d0, d0);
+        a1l = vfmlalq_low_f16(a1l, d1, d1);
+        a1h = vfmlalq_high_f16(a1h, d1, d1);
+    }
+    float s0 = vaddvq_f32(vaddq_f32(a0l, a0h));
+    float s1 = vaddvq_f32(vaddq_f32(a1l, a1h));
+    for (; k < K; ++k) {
+        float xv = static_cast<float>(rn[k]);
+        float wn0 = xv * ratio0;
+        float wn1 = xv * ratio1;
+        float d0 = wn0 - tbl.lut_f32[nf4_nearest_scalar(wn0, tbl.mid_f32)];
+        float d1 = wn1 - tbl.lut_f32[nf4_nearest_scalar(wn1, tbl.mid_f32)];
+        s0 += d0 * d0;
+        s1 += d1 * d1;
+    }
+    e0 = s0 * (sc0 * sc0);
+    e1 = s1 * (sc1 * sc1);
+}
+
 // 100% register-resident 16-weight -> 8-byte NF4 packer (zero stack spills!)
 inline void pack_nf4_row_neon(const float* wr, uint32_t K, float inv_sc, const Nf4Tables& tbl, uint8_t* dst) {
     float32x4_t vinv = vdupq_n_f32(inv_sc);
@@ -1310,22 +1365,51 @@ void quantize_slice_nf4(const RawWeightRef& wref, uint32_t row0, uint32_t O,
 #if defined(__aarch64__) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC) && defined(__ARM_FEATURE_FP16_FML)
             build_norm_f16(wr, K, 1.0f / amax0, rn);
             uint16_t last_sch = 0xFFFFu;
-            for (int ci = 0; ci < 6; ++ci) {
-                float p = kCoarseP[ci];
-                uint16_t sc_h = f32_to_f16_bits(std::max(amax0 * p, 1e-6f));
-                if (sc_h == last_sch) continue;
-                last_sch = sc_h;
-                float sc = std::max(f16_bits_to_f32(sc_h), 1e-6f);
-                float err = eval_nf4_err_f16(rn, K, sc, amax0 / sc, tbl);
-                if (err < best_err) { best_err = err; best_p = p; best_sc_h = sc_h; best_sc = sc; }
+            for (int ci = 0; ci < 6; ci += 2) {
+                float p0 = kCoarseP[ci], p1 = kCoarseP[ci + 1];
+                uint16_t sch0 = f32_to_f16_bits(std::max(amax0 * p0, 1e-6f));
+                uint16_t sch1 = f32_to_f16_bits(std::max(amax0 * p1, 1e-6f));
+                bool need0 = (sch0 != last_sch);
+                bool need1 = (sch1 != sch0 && sch1 != last_sch);
+                last_sch = sch1;
+                if (need0 && need1) {
+                    float sc0 = std::max(f16_bits_to_f32(sch0), 1e-6f);
+                    float sc1 = std::max(f16_bits_to_f32(sch1), 1e-6f);
+                    float e0 = 0.0f, e1 = 0.0f;
+                    eval_nf4_err_2p_f16(rn, K, sc0, amax0 / sc0, sc1, amax0 / sc1, tbl, e0, e1);
+                    if (e0 < best_err) { best_err = e0; best_p = p0; best_sc_h = sch0; best_sc = sc0; }
+                    if (e1 < best_err) { best_err = e1; best_p = p1; best_sc_h = sch1; best_sc = sc1; }
+                } else if (need0) {
+                    float sc0 = std::max(f16_bits_to_f32(sch0), 1e-6f);
+                    float e0 = eval_nf4_err_f16(rn, K, sc0, amax0 / sc0, tbl);
+                    if (e0 < best_err) { best_err = e0; best_p = p0; best_sc_h = sch0; best_sc = sc0; }
+                } else if (need1) {
+                    float sc1 = std::max(f16_bits_to_f32(sch1), 1e-6f);
+                    float e1 = eval_nf4_err_f16(rn, K, sc1, amax0 / sc1, tbl);
+                    if (e1 < best_err) { best_err = e1; best_p = p1; best_sc_h = sch1; best_sc = sc1; }
+                }
             }
-            float fine_p[2] = { std::clamp(best_p - 0.04f, 0.55f, 1.00f), std::clamp(best_p + 0.04f, 0.55f, 1.00f) };
-            for (int fi = 0; fi < 2; ++fi) {
-                uint16_t sc_h = f32_to_f16_bits(std::max(amax0 * fine_p[fi], 1e-6f));
-                if (sc_h == best_sc_h) continue;
-                float sc = std::max(f16_bits_to_f32(sc_h), 1e-6f);
-                float err = eval_nf4_err_f16(rn, K, sc, amax0 / sc, tbl);
-                if (err < best_err) { best_err = err; best_sc_h = sc_h; best_sc = sc; }
+            float fp0 = std::clamp(best_p - 0.04f, 0.55f, 1.00f);
+            float fp1 = std::clamp(best_p + 0.04f, 0.55f, 1.00f);
+            uint16_t sch0 = f32_to_f16_bits(std::max(amax0 * fp0, 1e-6f));
+            uint16_t sch1 = f32_to_f16_bits(std::max(amax0 * fp1, 1e-6f));
+            bool need0 = (sch0 != best_sc_h);
+            bool need1 = (sch1 != best_sc_h && sch1 != sch0);
+            if (need0 && need1) {
+                float sc0 = std::max(f16_bits_to_f32(sch0), 1e-6f);
+                float sc1 = std::max(f16_bits_to_f32(sch1), 1e-6f);
+                float e0 = 0.0f, e1 = 0.0f;
+                eval_nf4_err_2p_f16(rn, K, sc0, amax0 / sc0, sc1, amax0 / sc1, tbl, e0, e1);
+                if (e0 < best_err) { best_err = e0; best_sc_h = sch0; best_sc = sc0; }
+                if (e1 < best_err) { best_err = e1; best_sc_h = sch1; best_sc = sc1; }
+            } else if (need0) {
+                float sc0 = std::max(f16_bits_to_f32(sch0), 1e-6f);
+                float e0 = eval_nf4_err_f16(rn, K, sc0, amax0 / sc0, tbl);
+                if (e0 < best_err) { best_err = e0; best_sc_h = sch0; best_sc = sc0; }
+            } else if (need1) {
+                float sc1 = std::max(f16_bits_to_f32(sch1), 1e-6f);
+                float e1 = eval_nf4_err_f16(rn, K, sc1, amax0 / sc1, tbl);
+                if (e1 < best_err) { best_err = e1; best_sc_h = sch1; best_sc = sc1; }
             }
 #else
             for (int ci = 0; ci < 6; ++ci) {
@@ -1656,7 +1740,7 @@ std::string resolve_ane_build_format(const std::string& format) {
     std::string arch = AneMlpEngine::detect_ane_arch();
     if (!arch.empty() &&
         (arch.rfind("h13", 0) == 0 || arch.rfind("h14", 0) == 0 || arch.rfind("h15", 0) == 0)) {
-        return "lut4";
+        return "nf4";
     }
     return "hf4";
 }

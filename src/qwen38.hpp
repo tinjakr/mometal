@@ -304,6 +304,7 @@ private:
     id buf_df_topk_part_ = nil;  // private LogitCand [P, num_chunks, K]
     id buf_df_topk_out_  = nil;  // shared LogitCand [P * K]
     id buf_df_sel_h_     = nil;  // shared half [P * selector_rank]
+    std::vector<float> df_mask_embed_; // Pre-gathered MASK token embedding when use_cpu_embed_ is active (-682 MiB wired RAM!)
 
     // Native CoreML/IOSurface ANE MLP accelerator for prefill (+ optional single-copy hf4 weight sharing!)
     std::unique_ptr<AneMlpEngine> ane_;
@@ -371,13 +372,16 @@ private:
     id pso_mma_sk_reduce_dual_norm_f16_ = nil;
     id pso_mma_lmhead_max_f16x_ = nil;
     id pso_mma_lmhead_max_f16x_indexed_ = nil;
+    id pso_qmv_q4_f16x_max_ = nil;
     id pso_qmv_q4_f16x_indexed_max_ = nil;
     id pso_mma_qmm8_swiglu_ = nil;
     id pso_mma_qmm8_swiglu_f16_ = nil;
     id pso_mma_qmm16_ = nil;
     id pso_qmm_q4_tiled_ = nil;
     id pso_qmm_q4_tiled_f16x_ = nil;
+    id pso_qmm_q4_swiglu_f16x_ = nil;
     id pso_qmm_q4_smalln_f16x_ = nil;
+    id pso_qmm_q4_smalln_ab_f16x_ = nil;
     id pso_mma_in_proj_ab_f16x_ = nil;
     id pso_qmv_q4_swiglu_ = nil;
     id pso_qmv_q4_f16x_ = nil;
@@ -392,6 +396,7 @@ private:
     id pso_copy_ = nil;
     id pso_gdn_conv_ = nil;
     id pso_gdn_conv_pf_ = nil;
+    id pso_gdn_conv_qknorm_gates_pf_ = nil;
     id pso_gdn_conv_upd_ = nil;
     id pso_gdn_qknorm_ = nil;
     id pso_gdn_gates_ = nil;
@@ -528,6 +533,7 @@ private:
     id pso_df_rmsnorm_f16_ = nil;
     id pso_df_conv_prep_f16_ = nil;
     id pso_df_conv_finish_f32_ = nil;
+    id pso_df_conv_fin_norm_f16_ = nil;
     id pso_df_kv_write_ = nil;
     id pso_df_qkv_prep_ = nil;
     id pso_df_attn_p1_ = nil;

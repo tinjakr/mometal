@@ -108,6 +108,7 @@ private:
     id grp_[MAX_SLOTS] = {nil, nil}; // dispatch_group_t under ARC
     std::atomic<int> slot_rem_[MAX_SLOTS];
     std::atomic<bool> slot_done_[MAX_SLOTS];
+    std::atomic<bool> call_left_[MAX_SLOTS][MAX_SUBS][MAX_PIECES];
     std::mutex err_mtx_;
     std::string slot_err_[MAX_SLOTS];
     int last_slot_ = 0;

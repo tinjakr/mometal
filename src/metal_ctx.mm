@@ -8,6 +8,7 @@
 #include <cctype>
 #include <cstdio>
 #include <cstring>
+#include <dlfcn.h>
 #include <filesystem>
 #include <mach-o/dyld.h>
 #include <stdexcept>
@@ -17,6 +18,42 @@ namespace fs = std::filesystem;
 namespace mi {
 
 namespace {
+
+// Read exact hardware GPU core count from public IOKit IOAccelerator ("gpu-core-count") via dlopen
+// (zero extra link dependency; accurately distinguishes binned SKUs like 30c M3 Max / 32c M4 Max / 14c Pro / 60c Ultra!)
+int query_ioreg_gpu_cores() {
+    void* iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_LAZY);
+    if (!iokit) return 0;
+    using MatchingFn = CFMutableDictionaryRef (*)(const char*);
+    using GetMatchingFn = uint32_t (*)(uint32_t, CFDictionaryRef);
+    using CreatePropFn = CFTypeRef (*)(uint32_t, CFStringRef, CFAllocatorRef, uint32_t);
+    using ReleaseFn = int (*)(uint32_t);
+
+    auto fn_match = reinterpret_cast<MatchingFn>(dlsym(iokit, "IOServiceMatching"));
+    auto fn_get   = reinterpret_cast<GetMatchingFn>(dlsym(iokit, "IOServiceGetMatchingService"));
+    auto fn_prop  = reinterpret_cast<CreatePropFn>(dlsym(iokit, "IORegistryEntryCreateCFProperty"));
+    auto fn_rel   = reinterpret_cast<ReleaseFn>(dlsym(iokit, "IOObjectRelease"));
+    if (!fn_match || !fn_get || !fn_prop || !fn_rel) return 0;
+
+    CFMutableDictionaryRef matching = fn_match("IOAccelerator");
+    if (!matching) return 0;
+    uint32_t svc = fn_get(0u /* kIOMainPortDefault */, matching); // consumes `matching`
+    if (svc == 0u) return 0;
+
+    int cores = 0;
+    CFTypeRef val = fn_prop(svc, CFSTR("gpu-core-count"), kCFAllocatorDefault, 0u);
+    if (val) {
+        if (CFGetTypeID(val) == CFNumberGetTypeID()) {
+            int32_t n = 0;
+            if (CFNumberGetValue(static_cast<CFNumberRef>(val), kCFNumberSInt32Type, &n) && n > 0 && n <= 512) {
+                cores = static_cast<int>(n);
+            }
+        }
+        CFRelease(val);
+    }
+    fn_rel(svc);
+    return cores;
+}
 
 std::string executable_dir() {
     uint32_t sz = 0;
@@ -79,6 +116,14 @@ void estimate_chip_specs(const std::string& dev_name, bool apple9, bool apple8, 
         // Conservative fallback for unrecognized Apple Silicon SKUs
         out_cores = is_ultra ? 64 : (is_max ? 32 : (is_pro ? 16 : 10));
         out_bw    = is_ultra ? 800.0 : (is_max ? 400.0 : (is_pro ? 200.0 : 100.0));
+    }
+
+    // Override heuristic core count with exact hardware IORegistry gpu-core-count (and refine binned Max BW)
+    const int hw_cores = query_ioreg_gpu_cores();
+    if (hw_cores > 0) {
+        out_cores = hw_cores;
+        if (is_m4 && is_max && hw_cores <= 34) out_bw = 410.0;
+        else if (is_m3 && is_max && hw_cores <= 32) out_bw = 300.0;
     }
 }
 
